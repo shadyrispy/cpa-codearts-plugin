@@ -88,7 +88,7 @@ curl -H "Authorization: Bearer $ADMIN_KEY" \
   http://localhost:8317/v0/management/plugin-store
 
 curl -X POST -H "Authorization: Bearer $ADMIN_KEY" \
-  http://localhost:8317/v0/management/plugin-store/codearts/install
+  http://localhost:8317/v0/management/plugin-store/codearts-provider/install
 ```
 
 Installing writes the dynamic library and sets that plugin's `enabled: true`, but
