@@ -43,6 +43,9 @@ type Config struct {
 	ModelMap map[string]string `yaml:"model_map" json:"model_map"`
 	// Models is the static model list advertised to CLIProxyAPI.
 	Models []ModelConfig `yaml:"models" json:"models"`
+	// DiscoverModels queries the signed Agent Center detail endpoints per account.
+	DiscoverModels bool     `yaml:"discover_models" json:"discover_models"`
+	ModelAgentIDs  []string `yaml:"model_agent_ids" json:"model_agent_ids"`
 	// RequestTimeoutSeconds bounds a single upstream request.
 	RequestTimeoutSeconds int `yaml:"request_timeout_seconds" json:"request_timeout_seconds"`
 	// LoginTimeoutSeconds bounds the interactive browser login flow.
@@ -181,6 +184,7 @@ type ModelConfig struct {
 	Description     string `yaml:"description" json:"description"`
 	ContextLength   int64  `yaml:"context_length" json:"context_length"`
 	MaxOutputTokens int64  `yaml:"max_output_tokens" json:"max_output_tokens"`
+	SupportsImages  bool   `yaml:"supports_images" json:"supports_images"`
 }
 
 // defaultConfig returns the built-in defaults. The upstream model list is
@@ -200,6 +204,7 @@ func defaultConfig() *Config {
 		LoginTimeoutSeconds:   300,
 		Heartbeat:             true,
 		Models:                defaultModels(),
+		DiscoverModels:        true,
 	}
 }
 

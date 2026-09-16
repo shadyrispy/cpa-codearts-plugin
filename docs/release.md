@@ -5,23 +5,33 @@ Work through it top to bottom; every command is copy-pasteable from Git Bash.
 
 ## TL;DR
 
+On Windows, `release.bat` validates the repository and performs the commit,
+`master` push, annotated tag and tag push. Double-click it for the version in
+`main.go`, or preview without changing anything using:
+
+```bat
+release.bat 0.1.1 --dry-run
+```
+
+Use `release.bat 0.1.1 --yes` to skip its confirmation prompt.
+
 ```bash
 # 1. Build the assets (tag and version must agree)
-./tools/package-release.sh 0.1.0
+bash tools/package-release.sh 0.1.1
 
 # 2. Commit the source, tag it, push both
-git add -A && git commit -m "release: v0.1.0"
-git tag v0.1.0
+git add -A && git commit -m "release: v0.1.1"
+git tag v0.1.1
 git push origin master
-git push origin v0.1.0
+git push origin v0.1.1
 
 # 3. Create the GitHub release and attach the assets
-gh release create v0.1.0 --title "v0.1.0" --notes "Initial release." \
-  release-assets/*.zip release-assets/checksums.txt
+gh release create v0.1.1 --title "v0.1.1" --notes "Initial release." \
+  release-assets/codearts-provider_0.1.1_*.zip release-assets/checksums.txt
 ```
 
 Without `gh`, use the web UI: **Releases → Draft a new release → choose the tag
-`v0.1.0` → attach every `.zip` plus `checksums.txt` → Publish**.
+`v0.1.1` → attach every `.zip` plus `checksums.txt` → Publish**.
 
 ## Why the naming matters
 
@@ -31,8 +41,8 @@ published but fails to install.
 
 | Requirement | Value here | What breaks otherwise |
 | --- | --- | --- |
-| Release tag | `v0.1.0` (leading `v`, dotted numeric) | The store derives the version from the tag; a non-numeric tag invalidates the entry. |
-| Asset name | `codearts-provider_0.1.0_windows_amd64.zip` — version **without** `v` | The installer builds the expected name from the tag and finds nothing. |
+| Release tag | `v0.1.1` (leading `v`, dotted numeric) | The store derives the version from the tag; a non-numeric tag invalidates the entry. |
+| Asset name | `codearts-provider_0.1.1_windows_amd64.zip` — version **without** `v` | The installer builds the expected name from the tag and finds nothing. |
 | Zip contents | `codearts-provider.dll` at the **root**, nothing else | Nested libraries, extra files, absolute paths and zip-slip entries are rejected. |
 | Checksums | `checksums.txt`, `<sha256>␣␣<bare-filename>` | A `./` prefix parses but then fails lookup with "checksum not found". |
 
@@ -47,10 +57,10 @@ The plugin ABI is a C ABI, so **CGO and a C toolchain are required**.
 cd /c/Users/zjj/Downloads/huaweicloud.vscode-codebot-26.3.6/cpa-codearts-plugin
 
 # Windows only (MinGW-w64 gcc must be on PATH, or set CC):
-PLATFORMS="windows/amd64" ./tools/package-release.sh 0.1.0
+PLATFORMS="windows/amd64" bash tools/package-release.sh 0.1.1
 
 # All platforms you have toolchains for:
-./tools/package-release.sh 0.1.0
+bash tools/package-release.sh 0.1.1
 ```
 
 The version argument must match the tag you are about to create, minus the `v`.
@@ -60,15 +70,43 @@ producing a broken archive, so a partial build is safe but check the output:
 
 ```
 release assets in .../release-assets:
-  codearts-provider_0.1.0_windows_amd64.zip
+  codearts-provider_0.1.1_windows_amd64.zip
   checksums.txt
 ```
 
 Cross-compiling needs a matching C compiler. Set a per-platform override:
 
 ```bash
-CC_linux_amd64=x86_64-linux-gnu-gcc PLATFORMS="linux/amd64" ./tools/package-release.sh 0.1.0
+CC_linux_amd64=x86_64-linux-gnu-gcc PLATFORMS="linux/amd64" bash tools/package-release.sh 0.1.1
 ```
+
+**The Linux artifact must match the libc of the target container**, because
+CLIProxyAPI `dlopen()`s the library into its own process. The official
+CLIProxyAPI `Dockerfile` runs on Debian, so the release asset is a glibc build;
+an Alpine deployment needs the musl build instead.
+
+```bash
+# glibc (default; zig cc is only needed when cross-compiling from another OS)
+CC_linux_amd64="zig cc -target x86_64-linux-gnu.2.17" \
+  PLATFORMS="linux/amd64" bash tools/package-release.sh 0.1.1
+
+# musl / Alpine — ship it out of band or under its own tag: the store derives one
+# asset name per GOOS/GOARCH from the release tag.
+CC_linux_amd64="zig cc -target x86_64-linux-musl" \
+  OUT_NAME=codearts-provider-musl.so bash build.sh linux amd64
+```
+
+Check the result before publishing:
+
+```bash
+readelf -d codearts-provider.so | grep NEEDED   # libc.so.6 => glibc, libc.so => musl
+objdump -T codearts-provider.so | grep cliproxy # the four ABI exports must be present
+```
+
+Packaging is additive: `tools/package-release.sh` only writes this version's
+archives and regenerates `checksums.txt` for this version. Earlier archives stay
+in `release-assets/` but are not uploaded with the new release. Set
+`PRUNE_ASSETS=1` if you do want older archives removed.
 
 On Windows the practical answer is to build `windows/amd64` locally and let CI
 build the rest (see below).
@@ -78,7 +116,7 @@ build the rest (see below).
 ```bash
 cd release-assets
 sha256sum -c checksums.txt        # or: shasum -a 256 -c checksums.txt
-unzip -l codearts-provider_0.1.0_windows_amd64.zip
+unzip -l codearts-provider_0.1.1_windows_amd64.zip
 ```
 
 The zip listing must show exactly one entry, at the root:
@@ -91,16 +129,16 @@ The zip listing must show exactly one entry, at the root:
 
 ```bash
 git add -A
-git commit -m "release: v0.1.0"
-git tag v0.1.0
+git commit -m "release: v0.1.1"
+git tag v0.1.1
 git push origin master
-git push origin v0.1.0
+git push origin v0.1.1
 ```
 
 If you already pushed the tag and need to move it:
 
 ```bash
-git tag -f v0.1.0 && git push -f origin v0.1.0
+git tag -f v0.1.1 && git push -f origin v0.1.1
 ```
 
 Force-moving a tag on a published release is disruptive for anyone who already
@@ -111,10 +149,10 @@ installed it; prefer a new version.
 ### With the GitHub CLI
 
 ```bash
-gh release create v0.1.0 \
-  --title "v0.1.0" \
+gh release create v0.1.1 \
+  --title "v0.1.1" \
   --notes "Initial release." \
-  release-assets/*.zip release-assets/checksums.txt
+  release-assets/codearts-provider_0.1.1_*.zip release-assets/checksums.txt
 ```
 
 Use `--notes-file release-notes.md` instead of `--notes` to pull the description
@@ -123,9 +161,9 @@ from a file. Add `--draft` to stage it privately, then publish from the UI.
 ### With the web UI
 
 1. Open `https://github.com/zyxzjyzjj/cpa-codearts-plugin/releases/new`
-2. **Choose a tag** → `v0.1.0` (create it if you did not push it in step 3)
-3. Title `v0.1.0`, add description
-4. Drag in **every** `release-assets/*.zip` plus `release-assets/checksums.txt`
+2. **Choose a tag** → `v0.1.1` (create it if you did not push it in step 3)
+3. Title `v0.1.1`, add description
+4. Drag in `release-assets/codearts-provider_0.1.1_*.zip` plus `release-assets/checksums.txt`
 5. **Publish release**
 
 A release without `checksums.txt` or without a zip for the user's platform cannot
@@ -138,7 +176,7 @@ curl -s https://api.github.com/repos/zyxzjyzjj/cpa-codearts-plugin/releases/late
   | grep -E '"(tag_name|name)"'
 ```
 
-`tag_name` must be `v0.1.0`. Confirm the asset names in the same response:
+`tag_name` must be `v0.1.1`. Confirm the asset names in the same response:
 
 ```bash
 curl -s https://api.github.com/repos/zyxzjyzjj/cpa-codearts-plugin/releases/latest \
@@ -152,11 +190,11 @@ change when you ship an update — only when metadata like the description does.
 
 ```bash
 # bump the version in code, then:
-./tools/package-release.sh 0.1.1
+bash tools/package-release.sh 0.1.1
 git add -A && git commit -m "release: v0.1.1"
 git tag v0.1.1 && git push origin master && git push origin v0.1.1
 gh release create v0.1.1 --title "v0.1.1" --notes "Fixes ..." \
-  release-assets/*.zip release-assets/checksums.txt
+  release-assets/codearts-provider_0.1.1_*.zip release-assets/checksums.txt
 ```
 
 Installing the update through the gateway:
@@ -171,36 +209,17 @@ you restart the gateway to finish.
 
 ## Building the other platforms in CI
 
-Building every platform locally needs several C toolchains. A GitHub Actions
-workflow triggered on tag push is the usual approach:
+The repository includes
+[`/.github/workflows/release.yml`](../.github/workflows/release.yml). Pushing a
+tag such as `v0.1.1` runs tests, builds Linux/glibc amd64 and Windows amd64,
+checks both ABIs and archives, then creates the GitHub Release with the two zips
+and `checksums.txt`. The workflow can also be rerun manually with an existing
+tag; existing assets are replaced with the rebuilt copies.
 
-```yaml
-name: release
-on:
-  push:
-    tags: ["v*"]
-jobs:
-  build:
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-go@v5
-        with: { go-version: "1.26" }
-      # C toolchains: gcc is preinstalled on ubuntu runners; mingw-w64 and osxcross
-      # are needed for the Windows and macOS targets.
-      - run: sudo apt-get update && sudo apt-get install -y gcc-mingw-w64-x86-64 zip
-      - name: Build assets
-        env:
-          CC_windows_amd64: x86_64-w64-mingw32-gcc
-          PLATFORMS: "linux/amd64 windows/amd64"
-        run: ./tools/package-release.sh "${GITHUB_REF_NAME#v}"
-      - name: Publish release
-        uses: softprops/action-gh-release@v2
-        with:
-          files: |
-            release-assets/*.zip
-            release-assets/checksums.txt
-```
+The job requests only `contents: write` and uses GitHub's built-in token.
+Protected environments and personal access tokens are not required. If an
+organization policy blocks write-capable workflow tokens, allow this repository
+to create releases under Settings → Actions → General.
 
 macOS targets (`darwin/amd64`, `darwin/arm64`) require a macOS runner because
 cross-compiling cgo for Darwin from Linux needs osxcross and the Apple SDK.

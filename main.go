@@ -83,7 +83,7 @@ import (
 // normalizes provider identifiers.
 const providerID = "codearts-provider"
 
-const pluginVersion = "0.1.0"
+const pluginVersion = "0.1.1"
 
 var (
 	// currentConfig holds the last configuration delivered by the host. It is
@@ -201,17 +201,21 @@ func handleMethod(method string, request []byte) ([]byte, error) {
 		// Quiesce runs while the host runtime is still healthy, so it is the
 		// safe place to stop background work.
 		shutdownScheduler()
+		stopLoginSessions()
 		closeAllActiveStreams()
 		return okEnvelope(map[string]any{})
 
 	case pluginabi.MethodPluginShutdown:
+		stopLoginSessions()
 		closeAllActiveStreams()
 		return okEnvelope(map[string]any{})
 
 	case pluginabi.MethodModelRegister:
 		return okEnvelope(modelRegistration())
-	case pluginabi.MethodModelStatic, pluginabi.MethodModelForAuth:
+	case pluginabi.MethodModelStatic:
 		return okEnvelope(staticModels())
+	case pluginabi.MethodModelForAuth:
+		return modelsForAuth(request)
 	case pluginabi.MethodAuthIdentifier, pluginabi.MethodExecutorIdentifier:
 		return okEnvelope(map[string]string{"identifier": providerID})
 	case pluginabi.MethodAuthParse:
@@ -260,7 +264,38 @@ func handleMethod(method string, request []byte) ([]byte, error) {
 // ---------------------------------------------------------------------------
 
 // hostCall invokes one host callback and unwraps the JSON RPC envelope.
+//
+// The implementation lives behind an atomic slot rather than in a plain variable
+// because plugin background goroutines (stream pumps, login pollers, scheduled
+// tasks) call it for as long as they run, and callers such as tests replace the
+// implementation while those goroutines may still be in flight.
+type hostCallFunc func(string, any) (json.RawMessage, error)
+
+var hostCallSlot atomic.Value
+
 func hostCall(method string, request any) (json.RawMessage, error) {
+	fn, _ := hostCallSlot.Load().(hostCallFunc)
+	if fn == nil {
+		fn = callHostABI
+	}
+	return fn(method, request)
+}
+
+// setHostCall installs a host callback implementation and returns a function
+// that restores the previous one.
+func setHostCall(fn hostCallFunc) func() {
+	previous, _ := hostCallSlot.Load().(hostCallFunc)
+	if previous == nil {
+		previous = callHostABI
+	}
+	if fn == nil {
+		fn = callHostABI
+	}
+	hostCallSlot.Store(fn)
+	return func() { hostCallSlot.Store(previous) }
+}
+
+func callHostABI(method string, request any) (json.RawMessage, error) {
 	payload, errMarshal := json.Marshal(request)
 	if errMarshal != nil {
 		return nil, fmt.Errorf("marshal host request %s: %w", method, errMarshal)

@@ -191,7 +191,7 @@ func TestAggregatorAgentModePassthrough(t *testing.T) {
 		``,
 	}, "\n")
 
-	renderer := newStreamRenderer(&Config{APIMode: "agent"}, "m")
+	renderer := newStreamRenderer(&Config{APIMode: "agent"}, "m", protocolOpenAI)
 	aggregator := newAggregator("", "m")
 	for _, frame := range renderer.feed([]byte(body)) {
 		aggregator.addFrame(frame)

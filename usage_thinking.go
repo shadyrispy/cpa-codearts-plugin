@@ -95,6 +95,9 @@ func usageHandle(request []byte) ([]byte, error) {
 			return okEnvelope(map[string]any{})
 		}
 	}
+	if record.Provider != "" && normalizeProvider(record.Provider) != providerID {
+		return okEnvelope(map[string]any{})
+	}
 	usage.observe(record)
 	return okEnvelope(map[string]any{})
 }

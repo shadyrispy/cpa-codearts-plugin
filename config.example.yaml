@@ -37,6 +37,11 @@ plugins:
       # Upstream protocol.
       #   agent  - OpenAI-compatible POST /api/v2/chat/completions
       #   native - proprietary POST /v1/chat/chat with CodeArts SSE framing
+      #
+      # native is text-only: requests carrying tools, tool_choice, functions,
+      # function_call, tool-role messages or non-text content parts are rejected
+      # with HTTP 400 rather than silently dropped. Use agent for tool use,
+      # images and Claude Code.
       api_mode: "agent"
 
       # CodeArts web console used to start the browser sign-in flow.
@@ -76,6 +81,15 @@ plugins:
           description: "Huawei CodeArts Doer chat model."
           context_length: 128000
           max_output_tokens: 8192
+
+      # Ask the upstream Agent Center for this account's model list on
+      # model.for_auth instead of advertising the static list above. Results are
+      # cached per account for 5 minutes; any failure falls back to `models`.
+      discover_models: true
+
+      # Agent IDs queried for discovery. Empty uses the extension's own Act and
+      # Plan agents. Set these when your tenant uses different agents.
+      model_agent_ids: []
 
       # ---------------------------------------------------------------------
       # Transport / signing

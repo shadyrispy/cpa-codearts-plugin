@@ -1,0 +1,773 @@
+package main
+
+import (
+	"bytes"
+	"encoding/json"
+	"fmt"
+	"net/http"
+	"net/http/httptest"
+	"net/url"
+	"strings"
+	"sync/atomic"
+	"testing"
+	"time"
+
+	"github.com/router-for-me/CLIProxyAPI/v7/sdk/pluginapi"
+)
+
+func testEnvelopeResult[T any](t *testing.T, raw []byte, err error) T {
+	t.Helper()
+	if err != nil {
+		t.Fatal(err)
+	}
+	var env envelope
+	if err := json.Unmarshal(raw, &env); err != nil {
+		t.Fatal(err)
+	}
+	if !env.OK {
+		t.Fatalf("RPC failed: %+v", env.Error)
+	}
+	var out T
+	if err := json.Unmarshal(env.Result, &out); err != nil {
+		t.Fatal(err)
+	}
+	return out
+}
+
+func testHost(t *testing.T, fn func(string, any) (json.RawMessage, error)) {
+	t.Helper()
+	t.Cleanup(setHostCall(fn))
+}
+
+func TestCredentialPersistReloadAndRenew(t *testing.T) {
+	cred := credential{AccessKeyID: "fake-ak", SecretAccessKey: "fake-sk", SecurityToken: "fake-sts", DomainID: "tenant", UserName: "user", UserID: "id", LoginType: "WEB"}
+	doc, err := buildAuthFileDocument(cred)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, payload := range [][]byte{doc, []byte(`{"accessKeyId":"fake-ak","secretAccessKey":"fake-sk","accessToken":"fake-sts"}`)} {
+		req, _ := json.Marshal(pluginapi.AuthParseRequest{Provider: providerID, FileName: "account.json", RawJSON: payload})
+		raw, err := authParse(req)
+		parsed := testEnvelopeResult[pluginapi.AuthParseResponse](t, raw, err)
+		if !parsed.Handled {
+			t.Fatal("persisted/imported credential was not handled")
+		}
+		stored, err := credentialFromStorage(parsed.Auth.StorageJSON)
+		if err != nil || !stored.valid() || stored.SecurityToken != cred.SecurityToken {
+			t.Fatal("credential did not round trip")
+		}
+	}
+	testHost(t, func(method string, request any) (json.RawMessage, error) {
+		if method != "host.http.do" {
+			return json.RawMessage(`{}`), nil
+		}
+		req := request.(map[string]any)
+		if !strings.HasSuffix(req["url"].(string), "/token/renew") {
+			t.Fatal("wrong renew endpoint")
+		}
+		return json.Marshal(hostHTTPResponse{StatusCode: 200, Body: []byte(`{"credential":{"access":"renewed-ak","secret":"renewed-sk","securitytoken":"renewed-sts","expires_at":"2030-01-01T00:00:00Z"}}`)})
+	})
+	req, _ := json.Marshal(pluginapi.AuthRefreshRequest{StorageJSON: doc})
+	raw, err := authRefresh(req)
+	renewed := testEnvelopeResult[pluginapi.AuthRefreshResponse](t, raw, err)
+	newDoc, err := mergeCredentialFile(doc, renewed.Auth.StorageJSON)
+	if err != nil {
+		t.Fatal(err)
+	}
+	req, _ = json.Marshal(pluginapi.AuthParseRequest{Provider: providerID, FileName: "account.json", RawJSON: newDoc})
+	raw, err = authParse(req)
+	parsed := testEnvelopeResult[pluginapi.AuthParseResponse](t, raw, err)
+	stored, _ := credentialFromStorage(parsed.Auth.StorageJSON)
+	if !parsed.Handled || stored.AccessKeyID != "renewed-ak" || stored.UserID != "id" {
+		t.Fatal("renewed credential/identity lost on reload")
+	}
+}
+
+func TestLoginCallbackUsesWebSecret(t *testing.T) {
+	s := &loginSession{expires: time.Now().Add(time.Minute)}
+	r := httptest.NewRequest("GET", "http://127.0.0.1/authentication?secret=web-generated-secret", nil)
+	w := httptest.NewRecorder()
+	s.handleCallback(w, r)
+	if w.Code != 200 || s.secret != "web-generated-secret" || !s.received {
+		t.Fatalf("callback rejected: %d", w.Code)
+	}
+	w = httptest.NewRecorder()
+	s.handleCallback(w, httptest.NewRequest("GET", "http://localhost/authentication?secret=other", nil))
+	if w.Code != 403 {
+		t.Fatal("a second callback replaced the secret")
+	}
+	s.expires = time.Now().Add(-time.Minute)
+	w = httptest.NewRecorder()
+	s.handleCallback(w, r)
+	if w.Code != 410 {
+		t.Fatal("expired callback accepted")
+	}
+}
+
+func TestLoginTicketExchangeBindsTicketAndSecret(t *testing.T) {
+	s := &loginSession{ticketID: "test-ticket", secret: "web-secret"}
+	testHost(t, func(method string, request any) (json.RawMessage, error) {
+		req := request.(map[string]any)
+		u, _ := url.Parse(req["url"].(string))
+		if u.Query().Get("ticket_id") != s.ticketID || u.Query().Get("secret") != s.secret {
+			t.Fatal("ticket/secret mismatch")
+		}
+		return json.Marshal(hostHTTPResponse{StatusCode: 200, Body: []byte(`{"credential":{"access":"a","secret":"s","securitytoken":"t"},"user_id":"user"}`)})
+	})
+	cred, retry, err := s.exchangeTicket(defaultConfig())
+	if err != nil || retry || !cred.valid() || cred.UserID != "user" {
+		t.Fatalf("exchange failed: %v", err)
+	}
+	if _, err := decodeCredentialResponse([]byte(`{"credential":{"access":"a"}}`)); err == nil {
+		t.Fatal("incomplete renewal accepted")
+	}
+}
+
+func TestAccountModelDiscoveryIsolation(t *testing.T) {
+	cfg := defaultConfig()
+	cfg.ModelAgentIDs = []string{"agent"}
+	cfg.BaseURL = "https://discovery.test"
+	requests := 0
+	testHost(t, func(method string, request any) (json.RawMessage, error) {
+		requests++
+		req := request.(map[string]any)
+		u, _ := url.Parse(req["url"].(string))
+		if u.Path != "/v1/agent-center/agents/detail" || u.Query().Get("agent_id") != "agent" {
+			t.Fatal("wrong discovery contract")
+		}
+		if req["host_callback_id"] != "callback" {
+			t.Fatal("callback context lost")
+		}
+		headers := req["headers"].(map[string][]string)
+		model := "tenant-a"
+		if strings.Contains(headers["Authorization"][0], "Access=account-b") {
+			model = "tenant-b"
+		}
+		return json.Marshal(hostHTTPResponse{StatusCode: http.StatusOK, Body: []byte(`{"gpts":{"models":[{"model_alias":"` + model + `","model_id":"internal-id","model_name":"Test","model_parameters":{"enabled":true,"supports_images":true,"context_window":200000,"max_tokens":16000}},{"model_alias":"disabled","model_parameters":{"enabled":false}}]}}`)})
+	})
+	a := &credential{AccessKeyID: "account-a", SecretAccessKey: "test"}
+	b := &credential{AccessKeyID: "account-b", SecretAccessKey: "test"}
+	first, err := discoverAccountModels(cfg, a, "callback")
+	if err != nil {
+		t.Fatal(err)
+	}
+	second, err := discoverAccountModels(cfg, b, "callback")
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, err = discoverAccountModels(cfg, a, "callback")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if requests != 2 || len(first) != 1 || first[0].ID != "tenant-a" || second[0].ID != "tenant-b" || !first[0].SupportsImages {
+		t.Fatal("discovery did not isolate accounts, cache, or preserve model aliases")
+	}
+}
+
+func TestNativeAggregateRetainsFinalUsage(t *testing.T) {
+	cfg := defaultConfig()
+	cfg.APIMode = "native"
+	body := []byte("data: {\"delta\":{\"content\":\"hello\"}}\r\n\r\ndata: {\"prompt_tokens\":11,\"completion_tokens\":7,\"total_tokens\":18}")
+	raw, err := aggregateUpstream(cfg, "model", body)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var result openAICompletion
+	if err := json.Unmarshal(raw, &result); err != nil {
+		t.Fatal(err)
+	}
+	if result.Usage == nil || result.Usage.TotalTokens != 18 || result.Choices[0].Message.Content != "hello" {
+		t.Fatalf("lost final content/usage: %s", raw)
+	}
+}
+
+func TestAgentCRLFSplitAndSingleDone(t *testing.T) {
+	r := newStreamRenderer(defaultConfig(), "model", protocolOpenAI)
+	var output []byte
+	for _, part := range []string{"data: {\"choices\":[]}\r", "\n\r", "\ndata: [DONE]\r\n\r\n"} {
+		for _, frame := range r.feed([]byte(part)) {
+			output = append(output, frame...)
+		}
+	}
+	for _, frame := range r.finish() {
+		output = append(output, frame...)
+	}
+	if strings.Count(string(output), "[DONE]") != 1 || !strings.Contains(string(output), `"choices"`) {
+		t.Fatalf("bad stream: %s", output)
+	}
+}
+
+func TestHostStreamUsesJSONChunks(t *testing.T) {
+	var emitted [][]byte
+	testHost(t, func(method string, request any) (json.RawMessage, error) {
+		if method != "host.stream.emit" {
+			t.Fatalf("unexpected callback %s", method)
+		}
+		emitted = append(emitted, request.(map[string]any)["payload"].([]byte))
+		return json.RawMessage(`{}`), nil
+	})
+	renderer := newStreamRenderer(defaultConfig(), "model", protocolOpenAI)
+	upstream := "data: {\"choices\":[]}\n\ndata: [DONE]\n\n:heartbeat\n\n"
+	for _, frame := range renderer.feed([]byte(upstream)) {
+		if err := hostStreamEmit("test", renderer.hostPayload(frame)); err != nil {
+			t.Fatal(err)
+		}
+	}
+	for _, frame := range renderer.finish() {
+		if err := hostStreamEmit("test", renderer.hostPayload(frame)); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if len(emitted) != 1 || !json.Valid(emitted[0]) {
+		t.Fatalf("CPA requires bare JSON chunks for chat completions, got %q", emitted)
+	}
+}
+
+// claudeEvent is one decoded Anthropic SSE event.
+type claudeEvent struct {
+	Name string
+	Data map[string]any
+}
+
+// parseClaudeEvents decodes an Anthropic SSE stream, failing on any malformed
+// block so a partially written frame cannot pass unnoticed.
+func parseClaudeEvents(t *testing.T, stream []byte) []claudeEvent {
+	t.Helper()
+	var events []claudeEvent
+	for _, block := range strings.Split(string(stream), "\n\n") {
+		block = strings.TrimSpace(block)
+		if block == "" {
+			continue
+		}
+		var name, data string
+		for _, line := range strings.Split(block, "\n") {
+			line = strings.TrimSpace(line)
+			switch {
+			case strings.HasPrefix(line, "event:"):
+				name = strings.TrimSpace(strings.TrimPrefix(line, "event:"))
+			case strings.HasPrefix(line, "data:"):
+				data = strings.TrimSpace(strings.TrimPrefix(line, "data:"))
+			}
+		}
+		if name == "" || data == "" {
+			t.Fatalf("malformed SSE block: %q", block)
+		}
+		payload := map[string]any{}
+		if err := json.Unmarshal([]byte(data), &payload); err != nil {
+			t.Fatalf("invalid JSON in %s event: %v", name, err)
+		}
+		if payload["type"] != name && name != "error" {
+			t.Fatalf("event name %q does not match payload type %v", name, payload["type"])
+		}
+		events = append(events, claudeEvent{Name: name, Data: payload})
+	}
+	return events
+}
+
+func eventByType(events []claudeEvent, name string) []claudeEvent {
+	var out []claudeEvent
+	for _, event := range events {
+		if event.Name == name {
+			out = append(out, event)
+		}
+	}
+	return out
+}
+
+func nestedMap(t *testing.T, value any, key string) map[string]any {
+	t.Helper()
+	object, ok := value.(map[string]any)
+	if !ok {
+		t.Fatalf("value is not an object: %#v", value)
+	}
+	nested, ok := object[key].(map[string]any)
+	if !ok {
+		t.Fatalf("key %q is not an object: %#v", key, object)
+	}
+	return nested
+}
+
+func TestClaudeStreamFramesAreSelfContainedSSE(t *testing.T) {
+	var emitted [][]byte
+	testHost(t, func(method string, request any) (json.RawMessage, error) {
+		if method != "host.stream.emit" {
+			t.Fatalf("unexpected callback %s", method)
+		}
+		emitted = append(emitted, request.(map[string]any)["payload"].([]byte))
+		return json.RawMessage(`{}`), nil
+	})
+	renderer := newStreamRenderer(defaultConfig(), "model", protocolClaude)
+	upstream := strings.Join([]string{
+		`data: {"id":"chatcmpl-9","object":"chat.completion.chunk","model":"m","choices":[{"index":0,"delta":{"role":"assistant","content":"hello"},"finish_reason":null}]}`,
+		``,
+		`data: {"id":"chatcmpl-9","object":"chat.completion.chunk","model":"m","choices":[{"index":0,"delta":{},"finish_reason":"stop"}]}`,
+		``,
+		`data: {"id":"chatcmpl-9","object":"chat.completion.chunk","model":"m","choices":[],"usage":{"prompt_tokens":11,"completion_tokens":7,"total_tokens":18}}`,
+		``,
+		`data: [DONE]`,
+		``,
+	}, "\n")
+	for _, frame := range renderer.feed([]byte(upstream)) {
+		if err := hostStreamEmit("test", renderer.hostPayload(frame)); err != nil {
+			t.Fatal(err)
+		}
+	}
+	for _, frame := range renderer.finish() {
+		if err := hostStreamEmit("test", renderer.hostPayload(frame)); err != nil {
+			t.Fatal(err)
+		}
+	}
+	stream := bytes.Join(emitted, nil)
+	if strings.Contains(string(stream), "data: [DONE]") || strings.Contains(string(stream), `"object":"chat.completion.chunk"`) {
+		t.Fatalf("openai framing leaked into the claude stream:\n%s", stream)
+	}
+	events := parseClaudeEvents(t, stream)
+	if len(events) == 0 || events[0].Name != "message_start" {
+		t.Fatalf("stream must open with message_start: %s", stream)
+	}
+	if last := events[len(events)-1].Name; last != "message_stop" {
+		t.Fatalf("stream must end with message_stop, got %s: %s", last, stream)
+	}
+	if count := len(eventByType(events, "message_start")); count != 1 {
+		t.Fatalf("message_start emitted %d times: %s", count, stream)
+	}
+	message := nestedMap(t, events[0].Data["message"], "usage")
+	if message["input_tokens"] != float64(0) {
+		t.Fatalf("unexpected message_start usage: %s", stream)
+	}
+	textSeen := false
+	for _, event := range eventByType(events, "content_block_delta") {
+		delta := nestedMap(t, event.Data, "delta")
+		if delta["type"] == "text_delta" && delta["text"] == "hello" {
+			textSeen = true
+		}
+	}
+	if !textSeen {
+		t.Fatalf("text delta missing: %s", stream)
+	}
+	stops := eventByType(events, "content_block_stop")
+	if len(stops) != 1 {
+		t.Fatalf("expected exactly one content_block_stop: %s", stream)
+	}
+	deltas := eventByType(events, "message_delta")
+	if len(deltas) != 1 {
+		t.Fatalf("expected exactly one message_delta: %s", stream)
+	}
+	delta := nestedMap(t, deltas[0].Data, "delta")
+	if delta["stop_reason"] != "end_turn" {
+		t.Fatalf("unexpected stop_reason: %s", stream)
+	}
+	usage := nestedMap(t, deltas[0].Data, "usage")
+	if usage["input_tokens"] != float64(11) || usage["output_tokens"] != float64(7) {
+		t.Fatalf("usage was not carried into message_delta: %s", stream)
+	}
+}
+
+// TestClaudeStreamToolCallBlocks checks that streamed tool calls become
+// sequential tool_use content blocks with their arguments delivered once.
+func TestClaudeStreamToolCallBlocks(t *testing.T) {
+	renderer := newStreamRenderer(defaultConfig(), "model", protocolClaude)
+	upstream := strings.Join([]string{
+		`data: {"id":"c1","model":"m","choices":[{"index":0,"delta":{"role":"assistant","tool_calls":[{"index":0,"id":"call1","type":"function","function":{"name":"lookup","arguments":"{\"q\":"}}]},"finish_reason":null}]}`,
+		``,
+		`data: {"id":"c1","model":"m","choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"function":{"arguments":"\"hi\"}"}}]},"finish_reason":null}]}`,
+		``,
+		`data: {"id":"c1","model":"m","choices":[{"index":0,"delta":{},"finish_reason":"tool_calls"}]}`,
+		``,
+		`data: {"id":"c1","model":"m","choices":[],"usage":{"prompt_tokens":4,"completion_tokens":2,"total_tokens":6}}`,
+		``,
+		`data: [DONE]`,
+		``,
+	}, "\n")
+	var output []byte
+	for _, frame := range renderer.feed([]byte(upstream)) {
+		output = append(output, frame...)
+	}
+	for _, frame := range renderer.finish() {
+		output = append(output, frame...)
+	}
+	events := parseClaudeEvents(t, output)
+	starts := eventByType(events, "content_block_start")
+	if len(starts) != 1 {
+		t.Fatalf("expected one content_block_start: %s", output)
+	}
+	block := nestedMap(t, starts[0].Data, "content_block")
+	if block["type"] != "tool_use" || block["id"] != "call1" || block["name"] != "lookup" {
+		t.Fatalf("unexpected tool block: %s", output)
+	}
+	if input, ok := block["input"].(map[string]any); !ok || len(input) != 0 {
+		t.Fatalf("tool block must start with an empty input object: %s", output)
+	}
+	argumentsSeen := false
+	for _, event := range eventByType(events, "content_block_delta") {
+		delta := nestedMap(t, event.Data, "delta")
+		if delta["type"] != "input_json_delta" {
+			continue
+		}
+		if delta["partial_json"] != `{"q":"hi"}` {
+			t.Fatalf("tool arguments were not reassembled: %s", output)
+		}
+		argumentsSeen = true
+	}
+	if !argumentsSeen {
+		t.Fatalf("tool arguments were never delivered: %s", output)
+	}
+	if len(eventByType(events, "content_block_stop")) != 1 {
+		t.Fatalf("expected one content_block_stop: %s", output)
+	}
+	deltas := eventByType(events, "message_delta")
+	if len(deltas) != 1 || nestedMap(t, deltas[0].Data, "delta")["stop_reason"] != "tool_use" {
+		t.Fatalf("expected stop_reason=tool_use: %s", output)
+	}
+}
+
+// TestClaudeStreamErrorFrameIsAnthropicShaped keeps upstream failures readable
+// for Anthropic clients instead of leaking an OpenAI error object.
+func TestClaudeStreamErrorFrameIsAnthropicShaped(t *testing.T) {
+	renderer := newStreamRenderer(defaultConfig(), "model", protocolClaude)
+	output := renderer.feed([]byte("data: {\"error\":{\"message\":\"boom\",\"type\":\"server_error\"}}\n\ndata: [DONE]\n\n"))
+	if len(output) != 1 {
+		t.Fatalf("error frame produced %d events", len(output))
+	}
+	events := parseClaudeEvents(t, output[0])
+	if len(events) != 1 || events[0].Name != "error" {
+		t.Fatalf("unexpected error event: %s", output[0])
+	}
+	detail := nestedMap(t, events[0].Data, "error")
+	if detail["message"] != "boom" {
+		t.Fatalf("unexpected error payload: %s", output[0])
+	}
+}
+
+func TestAnthropicMessageFromCompletion(t *testing.T) {
+	body := []byte(`{"id":"chatcmpl-1","object":"chat.completion","model":"m","choices":[{"index":0,"message":{"role":"assistant","content":"hi","reasoning_content":"think","tool_calls":[{"index":0,"id":"call1","type":"function","function":{"name":"lookup","arguments":"{\"q\":1}"}}]},"finish_reason":"tool_calls"}],"usage":{"prompt_tokens":10,"completion_tokens":4,"total_tokens":14,"prompt_tokens_details":{"cached_tokens":6}}}`)
+	raw, err := anthropicMessageFromCompletion(body)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var message struct {
+		Type    string `json:"type"`
+		Role    string `json:"role"`
+		Content []struct {
+			Type     string          `json:"type"`
+			Text     string          `json:"text"`
+			Thinking string          `json:"thinking"`
+			ID       string          `json:"id"`
+			Name     string          `json:"name"`
+			Input    json.RawMessage `json:"input"`
+		} `json:"content"`
+		StopReason string `json:"stop_reason"`
+		Usage      struct {
+			InputTokens      int64 `json:"input_tokens"`
+			OutputTokens     int64 `json:"output_tokens"`
+			CacheReadTokens  int64 `json:"cache_read_input_tokens"`
+			CacheWriteTokens int64 `json:"cache_creation_input_tokens"`
+		} `json:"usage"`
+	}
+	if err := json.Unmarshal(raw, &message); err != nil {
+		t.Fatal(err)
+	}
+	if message.Type != "message" || message.Role != "assistant" || message.StopReason != "tool_use" {
+		t.Fatalf("unexpected envelope: %s", raw)
+	}
+	if len(message.Content) != 3 || message.Content[0].Type != "thinking" || message.Content[1].Text != "hi" {
+		t.Fatalf("unexpected content blocks: %s", raw)
+	}
+	tool := message.Content[2]
+	if tool.Type != "tool_use" || tool.Name != "lookup" || string(tool.Input) != `{"q":1}` {
+		t.Fatalf("unexpected tool block: %s", raw)
+	}
+	// Anthropic input_tokens exclude cache reads.
+	if message.Usage.InputTokens != 4 || message.Usage.OutputTokens != 4 || message.Usage.CacheReadTokens != 6 {
+		t.Fatalf("unexpected usage: %s", raw)
+	}
+	if !strings.Contains(string(raw), `"content":[`) {
+		t.Fatalf("content must always be an array: %s", raw)
+	}
+}
+
+func TestUsageIgnoresOtherProviders(t *testing.T) {
+	before := usage.snapshot()["requests"]
+	raw, err := usageHandle([]byte(`{"Provider":"other-provider","Model":"unrelated","Detail":{"TotalTokens":999}}`))
+	_ = testEnvelopeResult[map[string]any](t, raw, err)
+	if usage.snapshot()["requests"] != before {
+		t.Fatal("other subscriptions were counted as CodeArts usage")
+	}
+}
+
+func TestAgentPreservesToolConversationAndImages(t *testing.T) {
+	input := `{"messages":[{"role":"user","content":[{"type":"image_url","image_url":{"url":"data:image/png;base64,test"}}]},{"role":"assistant","content":null,"tool_calls":[{"id":"call1","type":"function","function":{"name":"lookup","arguments":"{}"}}]},{"role":"tool","tool_call_id":"call1","content":"ok"}],"tools":[{"type":"function","function":{"name":"lookup","parameters":{"type":"object"}}}],"tool_choice":"auto"}`
+	req := executorRequest{}
+	req.Model = "model"
+	req.Payload = []byte(input)
+	body, err := buildAgentBody(defaultConfig(), req, true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var before, after map[string]json.RawMessage
+	json.Unmarshal([]byte(input), &before)
+	json.Unmarshal(body, &after)
+	for _, key := range []string{"messages", "tools", "tool_choice"} {
+		var a, b any
+		json.Unmarshal(before[key], &a)
+		json.Unmarshal(after[key], &b)
+		ja, _ := json.Marshal(a)
+		jb, _ := json.Marshal(b)
+		if string(ja) != string(jb) {
+			t.Fatalf("agent changed %s", key)
+		}
+	}
+	if _, err := buildNativeBody(defaultConfig(), req, true); err == nil {
+		t.Fatal("native silently discarded tools/images")
+	}
+}
+
+func TestStreamRejectsUpstreamBeforeAccepting(t *testing.T) {
+	for _, status := range []int{401, 403, 429, 503} {
+		t.Run(http.StatusText(status), func(t *testing.T) {
+			closed := false
+			testHost(t, func(method string, request any) (json.RawMessage, error) {
+				switch method {
+				case "host.http.do_stream":
+					return json.Marshal(hostHTTPStreamOpen{StatusCode: status, StreamID: "upstream"})
+				case "host.http.stream_close":
+					closed = true
+					return json.RawMessage(`{}`), nil
+				default:
+					t.Fatalf("unexpected async callback %s", method)
+					return nil, nil
+				}
+			})
+			req := executorRequest{StreamID: "client"}
+			req.Model = "model"
+			req.Payload = []byte(`{"messages":[{"role":"user","content":"hi"}]}`)
+			req.StorageJSON = []byte(`{"access_key_id":"fake","secret_access_key":"fake"}`)
+			request, _ := json.Marshal(req)
+			raw, err := executorExecuteStream(request)
+			if err != nil {
+				t.Fatal(err)
+			}
+			var env envelope
+			json.Unmarshal(raw, &env)
+			if env.OK || env.Error == nil || env.Error.HTTPStatus != status || !closed {
+				t.Fatalf("lost HTTP %d: %s", status, raw)
+			}
+		})
+	}
+}
+
+// TestStreamTimeoutTerminatesOnce covers the lifecycle of a stream that times
+// out while its reader is also failing: CPA must see exactly one error frame and
+// one close, not a duplicate pair.
+func TestStreamTimeoutTerminatesOnce(t *testing.T) {
+	previous := currentConfig.Load()
+	short := defaultConfig()
+	short.RequestTimeoutSeconds = 1
+	short.BaseURL = "https://timeout.test"
+	currentConfig.Store(short)
+	t.Cleanup(func() {
+		if previous != nil {
+			currentConfig.Store(previous)
+			return
+		}
+		currentConfig.Store(defaultConfig())
+	})
+
+	var errorEmits, streamCloses, upstreamCloses atomic.Int32
+	upstreamClosed := make(chan struct{})
+	testHost(t, func(method string, request any) (json.RawMessage, error) {
+		switch method {
+		case "host.http.do_stream":
+			return json.Marshal(hostHTTPStreamOpen{StatusCode: http.StatusOK, StreamID: "upstream"})
+		case "host.http.stream_read":
+			// The real host unblocks the reader with an error once the stream is
+			// closed, which is what the timeout path does to it.
+			<-upstreamClosed
+			return nil, fmt.Errorf("stream closed")
+		case "host.http.stream_close":
+			if upstreamCloses.Add(1) == 1 {
+				close(upstreamClosed)
+			}
+			return json.RawMessage(`{}`), nil
+		case "host.stream.emit":
+			if _, hasError := request.(map[string]any)["error"]; hasError {
+				errorEmits.Add(1)
+			}
+			return json.RawMessage(`{}`), nil
+		case "host.stream.close":
+			streamCloses.Add(1)
+			return json.RawMessage(`{}`), nil
+		default:
+			t.Fatalf("unexpected callback %s", method)
+			return nil, nil
+		}
+	})
+
+	req := executorRequest{StreamID: "client"}
+	req.Model = "model"
+	req.Payload = []byte(`{"messages":[{"role":"user","content":"hi"}]}`)
+	req.StorageJSON = []byte(`{"access_key_id":"fake","secret_access_key":"fake","security_token":"fake"}`)
+	raw, err := executorExecuteStream(mustMarshal(t, req))
+	if err != nil {
+		t.Fatal(err)
+	}
+	var env envelope
+	if err := json.Unmarshal(raw, &env); err != nil || !env.OK {
+		t.Fatalf("stream was not accepted: %s", raw)
+	}
+
+	deadline := time.Now().Add(10 * time.Second)
+	for time.Now().Before(deadline) && streamCloses.Load() < 1 {
+		time.Sleep(50 * time.Millisecond)
+	}
+	// Give a duplicate close/error a chance to appear before asserting.
+	time.Sleep(250 * time.Millisecond)
+	if got := upstreamCloses.Load(); got != 1 {
+		t.Fatalf("upstream stream closed %d times, want 1", got)
+	}
+	if got := streamCloses.Load(); got != 1 {
+		t.Fatalf("client stream closed %d times, want 1", got)
+	}
+	if got := errorEmits.Load(); got != 1 {
+		t.Fatalf("error frames emitted %d times, want 1", got)
+	}
+	if active, _ := activeStreams.Load("client"); active != nil {
+		t.Fatal("stream was left registered after it ended")
+	}
+}
+
+func mustMarshal(t *testing.T, value any) []byte {
+	t.Helper()
+	raw, err := json.Marshal(value)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return raw
+}
+
+// TestLoginSessionsAreBounded checks that abandoned login flows cannot grow the
+// session table without limit, and that the newest flow stays addressable.
+func TestLoginSessionsAreBounded(t *testing.T) {
+	stopLoginSessions()
+	t.Cleanup(stopLoginSessions)
+
+	var last pluginapi.AuthLoginStartResponse
+	for i := 0; i < maxLoginSessions+4; i++ {
+		raw, err := authLoginStart([]byte(`{}`))
+		last = testEnvelopeResult[pluginapi.AuthLoginStartResponse](t, raw, err)
+	}
+	loginMu.Lock()
+	size := len(loginSessions)
+	_, newestPresent := loginSessions[last.State]
+	loginMu.Unlock()
+	if size > maxLoginSessions {
+		t.Fatalf("login table holds %d sessions, want at most %d", size, maxLoginSessions)
+	}
+	if !newestPresent {
+		t.Fatal("the newest login flow was evicted")
+	}
+	raw, err := authLoginPoll(mustMarshal(t, pluginapi.AuthLoginPollRequest{State: last.State}))
+	polled := testEnvelopeResult[pluginapi.AuthLoginPollResponse](t, raw, err)
+	if polled.Status != pluginapi.AuthLoginStatusPending {
+		t.Fatalf("newest flow is not pollable: %+v", polled)
+	}
+}
+
+// TestModelDiscoveryFallsBackToConfiguredModels covers the failure and empty
+// result paths the Agent Center endpoint can produce.
+func TestModelDiscoveryFallsBackToConfiguredModels(t *testing.T) {
+	cfg := defaultConfig()
+	cfg.DiscoverModels = true
+	cfg.Models = []ModelConfig{{ID: "configured-model", Name: "configured-model", ContextLength: 128000, MaxOutputTokens: 8192}}
+	cfg.ModelAgentIDs = []string{"agent-a", "agent-b"}
+	saved := currentConfig.Load()
+	currentConfig.Store(cfg)
+	t.Cleanup(func() {
+		if saved != nil {
+			currentConfig.Store(saved)
+			return
+		}
+		currentConfig.Store(defaultConfig())
+	})
+	discoveredModels.Lock()
+	discoveredModels.entries = map[string]modelCacheEntry{}
+	discoveredModels.Unlock()
+
+	storage, err := json.Marshal(map[string]any{storageKey: credential{AccessKeyID: "ak", SecretAccessKey: "sk", SecurityToken: "sts"}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	request := mustMarshal(t, map[string]any{
+		"AuthProvider": providerID,
+		"AuthID":       "codearts-provider-test.json",
+		"StorageJSON":  storage,
+	})
+
+	t.Run("every agent fails", func(t *testing.T) {
+		testHost(t, func(method string, request any) (json.RawMessage, error) {
+			if method != "host.http.do" {
+				t.Fatalf("unexpected callback %s", method)
+			}
+			return nil, fmt.Errorf("gateway unreachable")
+		})
+		raw, err := modelsForAuth(request)
+		response := testEnvelopeResult[pluginapi.ModelResponse](t, raw, err)
+		if len(response.Models) != 1 || response.Models[0].ID != "configured-model" {
+			t.Fatalf("discovery failure did not fall back to configured models: %+v", response.Models)
+		}
+	})
+
+	t.Run("agent returns no usable model", func(t *testing.T) {
+		testHost(t, func(method string, request any) (json.RawMessage, error) {
+			if method != "host.http.do" {
+				t.Fatalf("unexpected callback %s", method)
+			}
+			return json.Marshal(hostHTTPResponse{StatusCode: http.StatusOK, Body: []byte(`{"gpts":{"models":[{"model_alias":"off","model_parameters":{"enabled":false}}]}}`)})
+		})
+		raw, err := modelsForAuth(request)
+		response := testEnvelopeResult[pluginapi.ModelResponse](t, raw, err)
+		if len(response.Models) != 1 || response.Models[0].ID != "configured-model" {
+			t.Fatalf("empty discovery did not fall back to configured models: %+v", response.Models)
+		}
+	})
+
+	t.Run("one agent fails and one succeeds", func(t *testing.T) {
+		var calls atomic.Int32
+		testHost(t, func(method string, request any) (json.RawMessage, error) {
+			if method != "host.http.do" {
+				t.Fatalf("unexpected callback %s", method)
+			}
+			if calls.Add(1) == 1 {
+				return nil, fmt.Errorf("first agent unavailable")
+			}
+			return json.Marshal(hostHTTPResponse{StatusCode: http.StatusOK, Body: []byte(`{"gpts":{"models":[{"model_alias":"partial-model","model_name":"Partial","model_parameters":{"enabled":true,"context_window":1000,"max_tokens":100}}]}}`)})
+		})
+		raw, err := modelsForAuth(request)
+		response := testEnvelopeResult[pluginapi.ModelResponse](t, raw, err)
+		if len(response.Models) != 1 || response.Models[0].ID != "partial-model" {
+			t.Fatalf("partial discovery did not use the reachable agent: %+v", response.Models)
+		}
+	})
+}
+
+// TestRefreshDeadlineScheduling documents when the host is asked to renew.
+func TestRefreshDeadlineScheduling(t *testing.T) {
+	permanent := &credential{AccessKeyID: "ak", SecretAccessKey: "sk"}
+	if deadline := refreshDeadline(permanent); time.Until(deadline) < 29*24*time.Hour {
+		t.Fatalf("permanent key pair was scheduled for renewal at %s", deadline)
+	}
+	expired := &credential{AccessKeyID: "ak", SecretAccessKey: "sk", SecurityToken: "sts", ExpiresAt: time.Now().Add(-time.Hour).Format(time.RFC3339)}
+	if deadline := refreshDeadline(expired); time.Until(deadline) > 10*time.Minute {
+		t.Fatalf("an already expired credential was not renewed promptly: %s", deadline)
+	}
+	fresh := &credential{AccessKeyID: "ak", SecretAccessKey: "sk", SecurityToken: "sts", ExpiresAt: time.Now().Add(24 * time.Hour).Format(time.RFC3339)}
+	until := time.Until(refreshDeadline(fresh))
+	if until < 22*time.Hour || until > 23*time.Hour {
+		t.Fatalf("a 24h credential should be renewed about an hour before expiry, got %s", until)
+	}
+	unparsable := &credential{AccessKeyID: "ak", SecretAccessKey: "sk", SecurityToken: "sts", ExpiresAt: "2030-01-01 00:00:00"}
+	until = time.Until(refreshDeadline(unparsable))
+	if until < 55*time.Minute || until > time.Hour {
+		t.Fatalf("an unparsable expiry should fall back to hourly renewal, got %s", until)
+	}
+}

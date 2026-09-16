@@ -13,8 +13,8 @@ plugin C ABI.
 | Capability | Purpose |
 | --- | --- |
 | `auth_provider` | Browser-ticket sign-in plus AK/SK renewal, matching the extension's own login flow. |
-| `model_provider` | Advertises the configured model list to the CLIProxyAPI registry. |
-| `executor` | Transports chat completions to the CodeArts gateway, streaming and non-streaming. |
+| `model_provider` | Advertises the configured model list, and the per-account models discovered from the Agent Center. |
+| `executor` | Transports chat completions to the CodeArts gateway, streaming and non-streaming, and serves OpenAI Chat Completions, Anthropic Messages and OpenAI Responses clients. |
 | `quota_provider` | Serves the subscription/quota snapshot in CLIProxyAPI's normalised quota shape. |
 | `usage_plugin` | Collects the host's exact per-request token records into a rollup. |
 | `thinking_applier` | Maps validated thinking config onto `reasoning_effort`. |
@@ -64,6 +64,38 @@ pinned exactly. `X-Security-Token` and `X-Domain-Id` are added as signed
 headers. Note that the extension does **not** sign `host`; set `sign_host: true`
 only if your gateway requires it.
 
+### Client protocols
+
+CLIProxyAPI routes three client protocols to an executor. All three work:
+
+| Client protocol | Route | Who frames the response |
+| --- | --- | --- |
+| OpenAI Chat Completions | `POST /v1/chat/completions` | Host. The plugin sends bare JSON chunks; the host writes `data: <chunk>\n\n` and the final `data: [DONE]`. |
+| Anthropic Messages | `POST /v1/messages`, `POST /v1/messages/count_tokens` | Plugin. The plugin renders complete Anthropic SSE events (`message_start`, `content_block_*`, `message_delta`, `message_stop`) and non-streaming Anthropic message bodies. |
+| OpenAI Responses | `POST /v1/responses` | Host, from the plugin's Chat Completions chunks. |
+
+The split matters and is easy to get wrong, so it is worth stating why. A plugin
+executor declares `executor_input_formats` and `executor_output_formats`, and the
+host uses that declaration twice: to translate requests into a declared input
+format, and to decide who frames the response. When the client protocol is
+*declared* the host forwards the plugin's frames unchanged; when it is not, the
+host translates them with its own OpenAI→target translator.
+
+For Anthropic clients the host's translator only accepts frames that already
+carry a `data:` prefix, while the Chat Completions handler adds that prefix
+itself — the two requirements are mutually exclusive, and `ExecutorRequest` does
+not carry the original client protocol (`SourceFormat` is overwritten with the
+format the host selected, which is `openai` for both an OpenAI and an Anthropic
+client). This plugin therefore declares `claude` as an output format as well, so
+the host hands Anthropic traffic over with an explicit signal
+(`ExecutorRequest.Format == "claude"`) and the plugin renders the Anthropic
+protocol itself. See [`claude_output.go`](claude_output.go) for the full
+rationale and the event mapping.
+
+What this means in practice: the same CodeArts account serves Claude Code
+(`/v1/messages`), OpenAI-compatible clients (`/v1/chat/completions`) and
+Responses clients (`/v1/responses`), with tool calls and usage preserved.
+
 ## Install
 
 1. **Build the library.** CGO and a C toolchain are required, because the plugin
@@ -74,7 +106,7 @@ only if your gateway requires it.
    build.bat
 
    # Linux / macOS
-   ./build.sh
+   bash build.sh
    ```
 
    Or directly:
@@ -83,6 +115,36 @@ only if your gateway requires it.
    CGO_ENABLED=1 go build -buildmode=c-shared -o codearts-provider.dll .
    ```
 
+   **Linux/Docker amd64.** The plugin is `dlopen()`ed into the CLIProxyAPI
+   process, so it must match the libc of the container that runs the gateway, not
+   the machine that builds it. The official `Dockerfile` in CLIProxyAPI builds and
+   runs on Debian (`debian:bookworm`), so a **glibc** build is the default target:
+
+   ```bash
+   # zig cc is only needed as a cross compiler; on Linux, plain gcc works too.
+   export ZIG=/path/to/zig
+   CC="$ZIG cc -target x86_64-linux-gnu.2.17" bash build.sh linux amd64
+   ```
+
+   For an Alpine (musl) image, build the musl flavour instead:
+
+   ```bash
+   CC="$ZIG cc -target x86_64-linux-musl" \
+     OUT_NAME=codearts-provider-musl.so bash build.sh linux amd64
+   ```
+
+   Both flavours are prebuilt in this repository: `plugins/linux/amd64/codearts-provider.so`
+   (glibc, needs no symbol newer than `GLIBC_2.3.2`) and
+   `plugins/linux/amd64/codearts-provider-musl.so` (musl). Verify a build with:
+
+   ```bash
+   readelf -d codearts-provider.so | grep NEEDED     # => libc.so.6 for glibc, libc.so for musl
+   objdump -T codearts-provider.so | grep cliproxy   # => the four ABI exports
+   ```
+
+   A wrong-libc build fails at load time with `libc.so.6: cannot open shared
+   object file` (or `libc.so` on glibc), so check `NEEDED` before deploying.
+
 2. **Place the library** where CLIProxyAPI searches for plugins, and keep the
    file name as the plugin ID:
 
@@ -90,6 +152,18 @@ only if your gateway requires it.
    plugins/windows/amd64/codearts-provider.dll
    plugins/linux/amd64/codearts-provider.so
    plugins/darwin/arm64/codearts-provider.dylib
+   ```
+
+   In Docker, mount it read-only at `plugins/linux/amd64/codearts-provider.so`
+   inside the gateway container:
+
+   ```yaml
+   # docker-compose.yml fragment
+   services:
+     cli-proxy-api:
+       volumes:
+         - ./plugins:/CLIProxyAPI/plugins:ro
+         - ./config.yaml:/CLIProxyAPI/config.yaml:ro
    ```
 
 3. **Enable plugins** in `config.yaml`. Merge the block from
@@ -132,9 +206,25 @@ only if your gateway requires it.
      Open the returned `url`, sign in, and wait for the tab to report completion.
      CLIProxyAPI polls the flow and stores the credential.
 
+     *Remote / containerised gateways* cannot receive the browser's
+     `127.0.0.1` redirect. The callback URL the browser lands on is a plain URL —
+     copy it out of the address bar and submit it over the authenticated
+     management channel instead:
+
+     ```bash
+     curl -X POST -H "Authorization: Bearer $ADMIN_KEY" -H "Content-Type: application/json" \
+       -d '{"state":"<state from step 1>","callback_url":"<the full http://127.0.0.1:PORT/authentication?secret=... URL>"}' \
+       http://localhost:8317/v0/management/codearts-provider/login/callback
+     ```
+
+     The route validates that the URL points at the loopback listener this login
+     attempt opened, and then completes the flow exactly as the browser would.
+     The dashboard on `/panel` exposes the same control.
+
    - *Credential file* — drop a JSON file into the auth directory. The file name
      is up to you; the auto-generated name for a browser sign-in is
-     `codearts-provider-<user>.json`:
+     `codearts-provider-<user>-<identity digest>.json` (the digest keeps two
+     accounts with the same display name apart):
 
      ```json
      {
@@ -155,15 +245,38 @@ only if your gateway requires it.
      (`POST /v3.0/OS-CREDENTIAL/securitytokens`) if you prefer to mint one
      yourself.
 
-6. **Use a model.** The advertised model IDs are whatever you list under
-   `models`; `model_map` rewrites them to upstream `model_id` values:
+6. **Acceptance checks.** Confirm the models are visible, then call each client
+   protocol:
 
    ```bash
-   curl http://localhost:8317/v1/chat/completions \
-     -H "Authorization: Bearer $CLIENT_KEY" \
-     -H "Content-Type: application/json" \
-     -d '{"model":"PanguDev_COM_QC2","stream":true,"messages":[{"role":"user","content":"hi"}]}'
+   # 1. the account's models, as discovered from the Agent Center
+   curl -s -H "Authorization: Bearer $CLIENT_KEY" http://localhost:8317/v1/models
+   #    -> each CodeArts model appears with owned_by "codearts-provider"
+
+   # 2. Chat Completions (streaming)
+   curl -sN http://localhost:8317/v1/chat/completions \
+     -H "Authorization: Bearer $CLIENT_KEY" -H "Content-Type: application/json" \
+     -d '{"model":"PanguDev_COM_QC2","stream":true,"stream_options":{"include_usage":true},
+          "messages":[{"role":"user","content":"hi"}]}'
+   #    -> OpenAI SSE chunks, one "data: [DONE]", final chunk carries "usage"
+
+   # 3. Anthropic Messages (streaming) — what Claude Code sends
+   curl -sN http://localhost:8317/v1/messages \
+     -H "Authorization: Bearer $CLIENT_KEY" -H "Content-Type: application/json" \
+     -d '{"model":"PanguDev_COM_QC2","max_tokens":64,"stream":true,
+          "messages":[{"role":"user","content":"hi"}]}'
+   #    -> event: message_start / content_block_start / content_block_delta(text_delta)
+   #       / content_block_stop / message_delta(stop_reason, usage) / message_stop
+
+   # 4. OpenAI Responses (streaming)
+   curl -sN http://localhost:8317/v1/responses \
+     -H "Authorization: Bearer $CLIENT_KEY" -H "Content-Type: application/json" \
+     -d '{"model":"PanguDev_COM_QC2","input":"hi","stream":true}'
    ```
+
+   A CodeArts account also answers `POST /v1/messages` with
+   `tools`/`input_schema` as Anthropic `tool_use` blocks, and
+   `/v1/messages/count_tokens` with an `input_tokens` estimate.
 
 ## Daily check-in (签到 / 积分领取)
 
@@ -383,9 +496,34 @@ A documentation gap worth knowing: the published development docs do not list
 the v7.3.4 SDK and host do implement them. This plugin uses `quota_provider` and
 leaves the other two undeclared as explained above.
 
+### Model discovery
+
+The upstream model catalogue is tenant-specific, so the plugin asks the Agent
+Center for it per account instead of guessing. `model.for_auth` is answered from
+`GET /v1/agent-center/agents/detail?agent_id=...`, whose `gpts.models[]` carries
+`model_alias` (the ID the chat endpoint expects), `model_name`, and
+`model_parameters.{enabled,context_window,max_tokens,supports_images}`.
+Disabled entries are skipped, `model_alias` wins over `model_id`, and image
+support is only advertised in `agent` mode because the native endpoint has no
+image request contract.
+
+- The two agent IDs the extension hard-codes (Act and Plan) are the defaults.
+  Override them with `model_agent_ids`, or set `discover_models: false` to
+  advertise only the configured `models`.
+- Discovery is cached for 5 minutes, keyed by `base_url` + account identity +
+  agent IDs, so accounts never see each other's catalogue and a `for_auth`
+  storm does not hammer the gateway.
+- Any failure — unreachable gateway, non-200, unparsable body, or a catalogue
+  with no enabled model — falls back to the configured `models` and logs a
+  warning. A partial failure (one agent unreachable) still uses whatever the
+  reachable agents returned.
+- Reverse mapping stays intact: a configured client-facing ID listed in
+  `model_map` is re-advertised alongside the discovered aliases when it maps
+  onto one of them, so existing client configurations keep working.
+
 ### Adaptation notes
 
-Two things were needed to fit the host's model rather than fight it:
+Three things were needed to fit the host's model rather than fight it:
 
 1. **The scheduler is self-driven.** The plugin ABI has no timer, so `schedule`
    is implemented with `robfig/cron` inside the plugin. Nothing in the host
@@ -394,6 +532,11 @@ Two things were needed to fit the host's model rather than fight it:
    non-streaming variant, so `executor.execute` buffers and aggregates a stream
    internally. From the host's perspective it is an ordinary non-streaming
    executor.
+3. **The plugin renders Anthropic output itself.** Declaring `claude` in
+   `executor_output_formats` is what lets the host route Anthropic traffic to the
+   plugin unframed; the plugin then owns the Anthropic event sequence. See
+   [Client protocols](#client-protocols) for why the alternative — letting the
+   host translate — cannot work for both client protocols at once.
 
 ## Configuration reference
 
@@ -414,6 +557,8 @@ example.
 | `default_model_id` | `PanguDev_COM_QC2` | Upstream model_id fallback. |
 | `model_map` | `{}` | Client-facing ID → upstream model_id. |
 | `models` | one Pangu entry | Models advertised to CLIProxyAPI. |
+| `discover_models` | `true` | Ask the Agent Center for this account's model list on `model.for_auth`. |
+| `model_agent_ids` | Act/Plan agent UUIDs | Agent IDs queried for discovery; empty uses the extension's Act and Plan agents. |
 | `heartbeat` | `true` | Request upstream SSE heartbeat frames. |
 | `sign_host` | `false` | Include `host` in `SignedHeaders`. |
 | `is_confidential` | `false` | Send the `is_confidential` header. |
@@ -444,18 +589,19 @@ Publish this code to your own GitHub repository, then:
 
 ```bash
 # The tag MUST be v<dotted numeric version>.
-git tag v0.1.0
-git push origin v0.1.0
+git tag v0.1.1
+git push origin v0.1.1
 
 # Build the per-platform zips and checksums.txt into ./release-assets/
-./tools/package-release.sh 0.1.0
+# (existing assets are kept; add PRUNE_ASSETS=1 to drop older archives)
+CC_linux_amd64="zig cc -target x86_64-linux-gnu.2.17" bash tools/package-release.sh 0.1.1
 ```
 
 Asset names use the version **without** the leading `v`:
 
 ```text
-codearts-provider_0.1.0_windows_amd64.zip
-codearts-provider_0.1.0_linux_amd64.zip
+codearts-provider_0.1.1_windows_amd64.zip
+codearts-provider_0.1.1_linux_amd64.zip
 checksums.txt
 ```
 
@@ -465,11 +611,13 @@ extra files, absolute paths and zip-slip entries are rejected by the installer.
 
 `checksums.txt` uses `<sha256>  <filename>` with **bare file names**. The host's
 parser splits on whitespace and strips a leading `*` (GNU binary-mode marker) but
-*not* a `./` prefix, so a line like `./codearts-provider_0.1.0_windows_amd64.zip` would parse
+*not* a `./` prefix, so a line like `./codearts-provider_0.1.1_windows_amd64.zip` would parse
 yet fail lookup with "checksum not found". `tools/package-release.sh` emits the
 correct form and works whether or not `zip(1)`/`sha256sum(1)` are installed.
 
-Attach every zip plus `checksums.txt` to the release.
+Attach the current version's zips plus `checksums.txt` to the release. Older
+archives may remain in the local `release-assets` directory, but are not part of
+the new GitHub release.
 
 ### 2. Get into the official store
 
@@ -503,11 +651,19 @@ Store approval is not required to use your own build. Either place the library i
 the plugin directory yourself (see *Install* above), or publish your own
 `registry.json` and point the gateway at it:
 
+This repository contains a ready-to-publish [`registry.json`](registry.json).
+After it is committed and pushed to the current `master` branch, its source URL
+is:
+
+```text
+https://raw.githubusercontent.com/zyxzjyzjj/cpa-codearts-plugin/master/registry.json
+```
+
 ```yaml
 plugins:
   enabled: true
   store-sources:
-    - "https://raw.githubusercontent.com/OWNER/REPO/main/registry.json"
+    - "https://raw.githubusercontent.com/zyxzjyzjj/cpa-codearts-plugin/master/registry.json"
 ```
 
 The official store is always consulted first and cannot be removed. A source ID is
@@ -535,9 +691,19 @@ naming rules the store enforces and a CI recipe for the other platforms — see
 
 ## Building and testing
 
+Pushing a version tag such as `v0.1.1` runs
+[the release workflow](.github/workflows/release.yml): tests, Linux/Windows
+builds, ABI/archive verification, checksums and GitHub Release publication.
+On Windows, run [`release.bat`](release.bat) to validate, commit, push and create
+the tag in one guided step; add `--dry-run` as the second argument to preview it.
+
 ```bash
-# unit tests (signer reference vector, SSE translation)
+# unit tests (signer reference vector, SSE translation, Anthropic rendering,
+# login lifecycle, model discovery, credential renewal)
 go test ./...
+
+# the same suite under the race detector (stream pumps, login sessions, cron)
+go test -race ./...
 
 # static checks
 go vet ./...
@@ -553,18 +719,54 @@ The ABI smoke test verifies the exported symbols
 `cliproxyPluginShutdown`), registration, config decoding, model registration,
 the management resource and error envelopes.
 
+### Integration test against a real CLIProxyAPI
+
+`TestCPAIntegration` builds nothing itself; it drives a real CGO-enabled
+CLIProxyAPI binary with the built library, a temporary auth/config directory, and
+a local HTTP fixture standing in for the CodeArts gateway. Credential import,
+per-account model discovery, streaming and non-streaming calls for all three
+client protocols, tool calls, usage, a restart, the browser login flow and
+upstream `429` propagation all run through the gateway's own code paths.
+
+```bash
+CGO_ENABLED=1 go build -o /tmp/cpa-test ./cmd/server   # in a CLIProxyAPI checkout
+export CODEARTS_CPA_EXE=/tmp/cpa-test
+export CODEARTS_PLUGIN_DLL=$PWD/plugins/linux/amd64/codearts-provider.so
+go test -run TestCPAIntegration -v -count=1 -timeout 180s .
+```
+
+Rebuild the library before running it: the test loads the file named by
+`CODEARTS_PLUGIN_DLL`, so a stale build is what gets tested.
+
+### What has been verified, and against what
+
+| Level | Status |
+| --- | --- |
+| Unit tests (`go test ./...`, `-race`) | Passing, including the Anthropic renderer, login/session lifecycle, credential renewal and discovery fallbacks. |
+| Real CLIProxyAPI + local upstream fixture | `TestCPAIntegration` passing: real DLL load, credential import, discovery, all three client protocols streamed and non-streamed, tool calls, usage, restart persistence, browser login, `429` passthrough. |
+| Real Huawei subscription | **Not verified here.** No real account, gateway or credential was used at any point; every upstream in the test suite is a local fixture. Expect to validate the account, the regional `base_url`, the model catalogue and the browser sign-in against your own subscription. |
+| Linux amd64 binary | **Built, not executed.** The `.so` is a cross-compiled ELF that exports the four ABI symbols and depends on `libc.so.6`/`libpthread.so.0`/`libresolv.so.2` (glibc flavour, nothing newer than `GLIBC_2.3.2`). No Linux host or container was available to load it. |
+
 ## Known limitations
 
-- **The model catalogue is not discovered automatically.** The upstream model
-  list is tenant-specific and the IDE plugin fetches it from the Agent Center
-  (`GET /v1/agent-center/agents/useragents`); this plugin advertises the
-  configured `models` list instead. Adjust it to match your account.
+- **Model discovery can be switched off.** The catalogue comes from the Agent
+  Center per account (see [Model discovery](#model-discovery)); if your tenant's
+  agents are not the extension's Act/Plan pair, set `model_agent_ids`, or disable
+  discovery and list the models yourself. A failed discovery never fails the
+  request — it falls back to the configured `models`.
+- **`native` mode is text-only.** The proprietary `/v1/chat/chat` endpoint has no
+  verified contract for tools or images, so `native` mode **rejects** requests
+  that carry `tools`, `tool_choice`, `functions`, `function_call`, tool-role
+  messages, or non-text content parts, with a `400` that names the field. It
+  never silently drops them. Use `api_mode: agent` for tool use, images and
+  Claude Code.
 - **Code completion is not exposed.** The extension's inline-completion
   protocol (`/v1/code/complete`) has a different request and response shape from
   chat completions and is not part of this plugin.
 - **Token counting is estimated.** CodeArts Doer exposes no token-counting
   endpoint, so `executor.count_tokens` returns a labelled local estimate rather
-  than a real count. It is deliberately not claimed as exact.
+  than a real count. It is deliberately not claimed as exact. The same estimate
+  is reported as `input_tokens` for Anthropic clients.
 - **Daily check-in is configuration, not a built-in call.** The claim UI is a
   server-hosted page and the extension performs no claim request, so there is no
   endpoint to hard-code. The `checkin` task type drives a request you capture
@@ -572,7 +774,10 @@ the management resource and error envelopes.
   update the config rather than the plugin.
 - **The plugin schedules its own work.** The plugin ABI has no timer, so
   recurring tasks stop when the process stops. There is no catch-up run for ticks
-  missed while CLIProxyAPI was down.
+  missed while CLIProxyAPI was down. Credential renewal is therefore doubly
+  covered: the host's own `NextRefreshAfter` schedule (hourly for a temporary
+  AK/SK, parked 30 days out for a permanent key pair) plus `schedule.tasks`
+  `token_renew` when you enable the plugin's cron.
 - **`/delete` removes the file directly.** The ABI has no `host.auth.delete`, so
   deletion is performed on disk under strict guards: the path must be absolute,
   free of traversal segments, end in `.json`, and sit inside the auth directory.
@@ -591,9 +796,16 @@ the management resource and error envelopes.
 - **The agent ID and agent UUIDs are build-specific.** Values such as
   `Pangu_Doer_in_CodeArts` and the hardcoded agent UUIDs come from this VSIX
   version (26.3.6) and may change upstream.
-- **`GET /v0/management/codearts-provider-auth-url` requires a reachable loopback.**
-  The plugin binds `127.0.0.1:0` to receive the browser callback, the same
-  approach the extension uses. If CLIProxyAPI runs in a container, publish the
-  ephemeral port or use the credential-file path instead.
+- **The browser callback needs a loopback the *browser* can reach.** The plugin
+  binds `127.0.0.1:0` to receive the callback, exactly as the extension does. When
+  CLIProxyAPI runs elsewhere (container, remote host) use
+  `POST /v0/management/codearts-provider/login/callback` or the panel button to
+  submit the callback URL, or use the credential-file path instead. Each login
+  flow holds a loopback listener and two goroutines, so at most 8 concurrent
+  flows are kept; starting a 9th drops the flow closest to expiry. The callback
+  binds the first secret it receives for that ticket and rejects a different one
+  afterwards, and the upstream ticket exchange rejects a secret that does not
+  belong to the ticket — an unrelated page that probes the loopback port cannot
+  complete a login, but it can force the flow to be restarted.
 - **Resource pages are unauthenticated by design.** The status page therefore
   never exposes credential material.

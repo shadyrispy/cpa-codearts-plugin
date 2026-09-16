@@ -1,0 +1,120 @@
+name: Build and publish release
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Existing tag to build and publish (for example v0.1.1)"
+        required: true
+        type: string
+
+permissions:
+  contents: write
+
+concurrency:
+  group: release-${{ github.event_name == 'workflow_dispatch' && inputs.tag || github.ref_name }}
+  cancel-in-progress: false
+
+jobs:
+  release:
+    name: Test, build, and publish
+    runs-on: ubuntu-latest
+    env:
+      RELEASE_TAG: ${{ github.event_name == 'workflow_dispatch' && inputs.tag || github.ref_name }}
+    steps:
+      - name: Check out the release tag
+        uses: actions/checkout@v7
+        with:
+          ref: ${{ env.RELEASE_TAG }}
+          fetch-depth: 0
+
+      - name: Set up Go
+        uses: actions/setup-go@v7
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: Validate tag and repository versions
+        id: version
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [[ ! "$RELEASE_TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+([.-][0-9A-Za-z.-]+)?$ ]]; then
+            echo "invalid release tag: $RELEASE_TAG" >&2
+            exit 1
+          fi
+          version="${RELEASE_TAG#v}"
+          source_version="$(sed -n 's/^const pluginVersion = "\([^"]*\)"/\1/p' main.go)"
+          registry_version="$(jq -r '.plugins[] | select(.id == "codearts-provider") | .version' registry.json)"
+          entry_version="$(jq -r '.version' registry-entry.json)"
+          for item in "source:$source_version" "registry:$registry_version" "entry:$entry_version"; do
+            if [ "${item#*:}" != "$version" ]; then
+              echo "version mismatch ($item, tag:$version)" >&2
+              exit 1
+            fi
+          done
+          git rev-parse --verify "refs/tags/$RELEASE_TAG^{commit}" >/dev/null
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+
+      - name: Install C toolchains and archive tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends gcc gcc-mingw-w64-x86-64 binutils jq zip unzip
+
+      - name: Test
+        run: |
+          go test -race ./...
+          go vet ./...
+          test -z "$(gofmt -l -- *.go)"
+
+      - name: Build release archives
+        env:
+          CC_linux_amd64: gcc
+          CC_windows_amd64: x86_64-w64-mingw32-gcc
+          PLATFORMS: "linux/amd64 windows/amd64"
+          PRUNE_ASSETS: "1"
+        run: bash tools/package-release.sh "${{ steps.version.outputs.version }}"
+
+      - name: Verify archives and ABI
+        shell: bash
+        run: |
+          set -euo pipefail
+          version="${{ steps.version.outputs.version }}"
+          cd release-assets
+          sha256sum -c checksums.txt
+          test "$(wc -l < checksums.txt)" -eq 2
+          test "$(unzip -Z1 "codearts-provider_${version}_linux_amd64.zip" | wc -l)" -eq 1
+          test "$(unzip -Z1 "codearts-provider_${version}_windows_amd64.zip" | wc -l)" -eq 1
+          test "$(unzip -Z1 "codearts-provider_${version}_linux_amd64.zip")" = "codearts-provider.so"
+          test "$(unzip -Z1 "codearts-provider_${version}_windows_amd64.zip")" = "codearts-provider.dll"
+          unzip -p "codearts-provider_${version}_linux_amd64.zip" codearts-provider.so > /tmp/codearts-provider.so
+          unzip -p "codearts-provider_${version}_windows_amd64.zip" codearts-provider.dll > /tmp/codearts-provider.dll
+          for symbol in cliproxy_plugin_init cliproxyPluginCall cliproxyPluginFree cliproxyPluginShutdown; do
+            nm -D --defined-only /tmp/codearts-provider.so | grep -Eq "[[:space:]]${symbol}$"
+            x86_64-w64-mingw32-objdump -p /tmp/codearts-provider.dll | grep -Eq "[[:space:]]${symbol}$"
+          done
+          objdump -p /tmp/codearts-provider.so | grep -F 'NEEDED' | grep -F 'libc.so.6'
+
+      - name: Create or update GitHub Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          version="${{ steps.version.outputs.version }}"
+          assets=(
+            "release-assets/codearts-provider_${version}_linux_amd64.zip"
+            "release-assets/codearts-provider_${version}_windows_amd64.zip"
+            "release-assets/checksums.txt"
+          )
+          if gh release view "$RELEASE_TAG" >/dev/null 2>&1; then
+            gh release upload "$RELEASE_TAG" "${assets[@]}" --clobber
+          else
+            gh release create "$RELEASE_TAG" "${assets[@]}" \
+              --verify-tag \
+              --title "$RELEASE_TAG" \
+              --generate-notes
+          fi

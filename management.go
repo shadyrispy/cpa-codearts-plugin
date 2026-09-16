@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"net/http"
+	"net/url"
 	"sort"
 	"strings"
 	"time"
@@ -24,6 +25,7 @@ const managementBasePath = "/v0/management"
 // the operator has already stored in the management UI.
 func managementRoutes() []map[string]any {
 	return []map[string]any{
+		{"Method": http.MethodPost, "Path": "/codearts-provider/login/callback", "Description": "Submit the browser callback URL when CPA runs on a different machine."},
 		{
 			"Method":      http.MethodGet,
 			"Path":        "/codearts-provider/accounts",
@@ -135,6 +137,8 @@ func managementHandle(request []byte) ([]byte, error) {
 		return okEnvelope(htmlResponse(panelHTML()))
 	case route == "/accounts" && method == http.MethodGet:
 		return okEnvelope(handleAccounts())
+	case route == "/login/callback" && method == http.MethodPost:
+		return okEnvelope(handleLoginCallback(req))
 	case route == "/quota" && method == http.MethodGet:
 		return okEnvelope(handleQuotaGet(req.Query))
 	case route == "/quota/refresh" && method == http.MethodPost:
@@ -165,6 +169,40 @@ func managementHandle(request []byte) ([]byte, error) {
 		"method": method,
 	})
 	return okEnvelope(jsonResponse(http.StatusNotFound, body))
+}
+
+// Remote CPA deployments cannot receive a browser's localhost redirect. The
+// operator can submit that URL over the authenticated management channel.
+func handleLoginCallback(req pluginapi.ManagementRequest) pluginapi.ManagementResponse {
+	var body struct {
+		State       string `json:"state"`
+		CallbackURL string `json:"callback_url"`
+	}
+	if json.Unmarshal(req.Body, &body) != nil {
+		return errorJSON(400, "invalid callback request")
+	}
+	loginMu.Lock()
+	session := loginSessions[body.State]
+	loginMu.Unlock()
+	if session == nil || time.Now().After(session.expires) {
+		return errorJSON(400, "unknown or expired login state")
+	}
+	u, err := url.Parse(body.CallbackURL)
+	if err != nil || u.Scheme != "http" || u.Hostname() != "127.0.0.1" || u.Path != "/authentication" || u.Host != session.listener.Addr().String() {
+		return errorJSON(400, "paste the localhost callback URL from this login attempt")
+	}
+	secret := strings.TrimSpace(u.Query().Get("secret"))
+	if secret == "" {
+		return errorJSON(400, "callback URL contains no secret")
+	}
+	session.mu.Lock()
+	defer session.mu.Unlock()
+	if session.received && session.secret != secret {
+		return errorJSON(409, "callback already received")
+	}
+	session.secret = secret
+	session.received = true
+	return jsonResponse(200, []byte(`{"success":true}`))
 }
 
 // managementRouteSuffix strips the management or resource prefix and the plugin
@@ -504,15 +542,16 @@ func handleImport(req pluginapi.ManagementRequest) pluginapi.ManagementResponse 
 	if errUnmarshal := json.Unmarshal(req.Body, &body); errUnmarshal != nil {
 		return errorJSON(http.StatusBadRequest, "invalid body: "+errUnmarshal.Error())
 	}
-	cred := credential{
-		AccessKeyID:     strings.TrimSpace(body.AccessKeyID),
-		SecretAccessKey: strings.TrimSpace(body.SecretAccessKey),
-		SecurityToken:   strings.TrimSpace(body.SecurityToken),
-		DomainID:        strings.TrimSpace(body.DomainID),
-		UserName:        strings.TrimSpace(body.UserName),
-		UserID:          strings.TrimSpace(body.UserID),
-		ExpiresAt:       strings.TrimSpace(body.ExpiresAt),
-		LoginType:       firstNonEmptyString(strings.TrimSpace(body.LoginType), "AKSK"),
+	parsed, errParse := credentialFromStorage(req.Body)
+	if errParse != nil || !parsed.valid() {
+		return errorJSON(400, "access_key_id and secret_access_key are both required")
+	}
+	cred := *parsed
+	if cred.LoginType == "" {
+		cred.LoginType = "AKSK"
+		if cred.SecurityToken != "" {
+			cred.LoginType = "WEB"
+		}
 	}
 	if !cred.valid() {
 		return errorJSON(http.StatusBadRequest, "access_key_id and secret_access_key are both required")
@@ -520,8 +559,7 @@ func handleImport(req pluginapi.ManagementRequest) pluginapi.ManagementResponse 
 
 	name := strings.TrimSpace(body.Name)
 	if name == "" {
-		label := firstNonEmptyString(cred.UserName, cred.UserID, cred.AccessKeyID)
-		name = providerLoginFile(label)
+		name = credentialFileName(&cred)
 	}
 	if !strings.HasSuffix(strings.ToLower(name), ".json") {
 		name += ".json"

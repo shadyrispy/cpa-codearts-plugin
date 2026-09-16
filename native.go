@@ -117,6 +117,29 @@ type openAIUsage struct {
 	PromptTokens     int `json:"prompt_tokens"`
 	CompletionTokens int `json:"completion_tokens"`
 	TotalTokens      int `json:"total_tokens"`
+	// PromptTokensDetails carries the cache counters OpenAI-compatible upstreams
+	// report. It is forwarded when present so the aggregation stays faithful, and
+	// the accessors below tolerate its absence.
+	PromptTokensDetails *openAIPromptTokensDetails `json:"prompt_tokens_details,omitempty"`
+}
+
+type openAIPromptTokensDetails struct {
+	CachedTokens     int `json:"cached_tokens,omitempty"`
+	CacheWriteTokens int `json:"cache_write_tokens,omitempty"`
+}
+
+func (u *openAIUsage) cachedTokens() int {
+	if u == nil || u.PromptTokensDetails == nil {
+		return 0
+	}
+	return u.PromptTokensDetails.CachedTokens
+}
+
+func (u *openAIUsage) cacheWriteTokens() int {
+	if u == nil || u.PromptTokensDetails == nil {
+		return 0
+	}
+	return u.PromptTokensDetails.CacheWriteTokens
 }
 
 type openAICompletion struct {
@@ -148,7 +171,7 @@ type sseDecoder struct {
 // so far. The trailing partial frame is retained for the next call.
 func (d *sseDecoder) push(data []byte) []string {
 	d.buffer.Write(data)
-	all := d.buffer.String()
+	all := strings.ReplaceAll(d.buffer.String(), "\r\n", "\n")
 
 	var frames []string
 	for {
@@ -319,11 +342,13 @@ func (t *nativeTranslator) marshalChunk(delta *openAIDelta, finish *string) []by
 // finalChunk emits the terminal content chunk carrying the finish reason and
 // usage, followed by the SSE done marker.
 func (t *nativeTranslator) finalFrames() [][]byte {
+	// Flush a final SSE event even when the upstream omits the blank line.
+	trailing := t.translate([]byte("\n\n"))
 	reason := t.finishReason
 	if reason == "" {
 		reason = "stop"
 	}
-	frames := [][]byte{t.marshalChunk(&openAIDelta{}, &reason)}
+	frames := append(trailing, t.marshalChunk(&openAIDelta{}, &reason))
 	if t.totalTokens > 0 || t.promptTokens > 0 || t.completionTokens > 0 {
 		usage := &openAIUsage{
 			PromptTokens:     t.promptTokens,

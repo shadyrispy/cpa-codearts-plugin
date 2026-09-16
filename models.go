@@ -131,12 +131,19 @@ func staticModels() pluginapi.ModelResponse {
 }
 
 func modelInfos() []pluginapi.ModelInfo {
-	cfg := config()
+	return infosForModels(config().Models)
+}
+
+func infosForModels(models []ModelConfig) []pluginapi.ModelInfo {
 	now := time.Now().Unix()
-	out := make([]pluginapi.ModelInfo, 0, len(cfg.Models))
-	for _, model := range cfg.Models {
+	out := make([]pluginapi.ModelInfo, 0, len(models))
+	for _, model := range models {
 		if model.ID == "" {
 			continue
+		}
+		modalities := []string{"text"}
+		if model.SupportsImages && config().APIMode == "agent" {
+			modalities = append(modalities, "image")
 		}
 		out = append(out, pluginapi.ModelInfo{
 			ID:                         model.ID,
@@ -152,7 +159,7 @@ func modelInfos() []pluginapi.ModelInfo {
 			ContextLength:              model.ContextLength,
 			MaxCompletionTokens:        model.MaxOutputTokens,
 			SupportedGenerationMethods: []string{"chat.completions"},
-			SupportedInputModalities:   []string{"text"},
+			SupportedInputModalities:   modalities,
 			SupportedOutputModalities:  []string{"text"},
 			SupportedParameters: []string{
 				"temperature",
@@ -176,12 +183,20 @@ func modelInfos() []pluginapi.ModelInfo {
 func declaredCapabilities() map[string]any {
 	return map[string]any{
 		// Implemented.
-		"model_provider":          true,
-		"auth_provider":           true,
-		"executor":                true,
-		"executor_model_scope":    pluginapi.ExecutorModelScopeBoth,
-		"executor_input_formats":  []string{"chat-completions"},
-		"executor_output_formats": []string{"chat-completions"},
+		"model_provider":         true,
+		"auth_provider":          true,
+		"executor":               true,
+		"executor_model_scope":   pluginapi.ExecutorModelScopeBoth,
+		"executor_input_formats": []string{"chat-completions"},
+		// "claude" is declared so that Anthropic clients get the plugin's own
+		// Anthropic SSE frames instead of host translation. CPA's OpenAI→Claude
+		// stream translator only accepts frames that already carry a `data:`
+		// prefix, which is exactly what the Chat Completions path must not send,
+		// and the ExecutorRequest does not reveal the original client protocol.
+		// Declaring the format makes the host select and pass it through, which
+		// gives the plugin an explicit signal (Format == "claude"). See
+		// claude_output.go for the full rationale.
+		"executor_output_formats": []string{"chat-completions", "claude"},
 		"management_api":          true,
 		"quota_provider":          true,
 		"usage_plugin":            true,

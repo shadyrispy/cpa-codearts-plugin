@@ -97,6 +97,20 @@ const panelTemplate = `<!doctype html>
 
   <div id="msg"></div>
 
+  <div class="card">
+    <h2>Connection and sign-in</h2>
+    <label for="managementKey">CPA management key (kept in this page's memory)</label>
+    <input id="managementKey" type="password" autocomplete="off" placeholder="Enter your CPA management key">
+    <div class="bar"><button id="connect">Connect</button><button id="login">Sign in to Huawei Cloud</button></div>
+    <a id="loginURL" target="_blank" rel="noopener noreferrer" hidden>Open Huawei sign-in</a>
+    <div id="loginStatus" role="status"></div>
+    <details><summary>CPA is on a remote server</summary>
+      <p>After signing in, paste the localhost callback URL here if your browser cannot open it.</p>
+      <input id="callbackURL" type="password" autocomplete="off" placeholder="http://127.0.0.1:…/authentication?secret=…">
+      <button id="submitCallback">Complete remote sign-in</button>
+    </details>
+  </div>
+
   <div class="bar">
     <button class="primary" id="refresh">Refresh</button>
     <button id="refreshQuota">Refresh quota</button>
@@ -154,18 +168,12 @@ const panelTemplate = `<!doctype html>
   // The management UI keeps the admin key in same-origin localStorage. Resource
   // pages are not authenticated themselves, so privileged calls carry this key.
   function adminKey() {
+	var entered = document.getElementById("managementKey").value.trim();
+	if (entered) return entered;
     var keys = ["apiKey", "api_key", "adminKey", "cliproxy_api_key", "cpa_api_key"];
     for (var i = 0; i < keys.length; i++) {
       var v = window.localStorage.getItem(keys[i]);
       if (v) return v;
-    }
-    for (var j = 0; j < window.localStorage.length; j++) {
-      var k = window.localStorage.key(j);
-      if (!k) continue;
-      if (/key|token/i.test(k)) {
-        var val = window.localStorage.getItem(k);
-        if (val && val.length > 8) return val;
-      }
     }
     return "";
   }
@@ -296,6 +304,38 @@ const panelTemplate = `<!doctype html>
   }
 
   document.getElementById("refresh").onclick = load;
+  document.getElementById("connect").onclick = load;
+  var loginState = "", loginTimer = null, loginDeadline = 0;
+  function pollLogin() {
+    if (!loginState || Date.now() > loginDeadline) {
+      document.getElementById("loginStatus").textContent = "Sign-in expired. Start again.";
+      return;
+    }
+    call("/v0/management/get-auth-status?state=" + encodeURIComponent(loginState)).then(function(r) {
+      if (r.status === "ok") {
+        document.getElementById("loginStatus").textContent = "Account saved in CPA.";
+        document.getElementById("callbackURL").value = "";
+        loginState = ""; load(); return;
+      }
+      if (r.status === "error") throw new Error(r.error || r.message || "Sign-in failed");
+      loginTimer = setTimeout(pollLogin, 2000);
+    }).catch(function(e) { document.getElementById("loginStatus").textContent = e.message; });
+  }
+  document.getElementById("login").onclick = function() {
+    clearTimeout(loginTimer);
+    call("/v0/management/" + P + "-auth-url").then(function(r) {
+      loginState = r.state; loginDeadline = Date.now() + 300000;
+      var link = document.getElementById("loginURL");
+      link.href = r.url; link.hidden = false;
+      document.getElementById("loginStatus").textContent = "Open the sign-in link and authorize your account.";
+      pollLogin();
+    }).catch(function(e) { say(e.message, "err"); });
+  };
+  document.getElementById("submitCallback").onclick = function() {
+    call(BASE + "/login/callback", {method:"POST", body:{state:loginState, callback_url:document.getElementById("callbackURL").value.trim()}})
+      .then(function() { document.getElementById("callbackURL").value = ""; say("Callback received; waiting for CPA to save the account."); })
+      .catch(function(e) { say(e.message, "err"); });
+  };
   document.getElementById("refreshQuota").onclick = function () {
     say("Refreshing quota…");
     call(BASE + "/quota/refresh", { method: "POST", body: {} })

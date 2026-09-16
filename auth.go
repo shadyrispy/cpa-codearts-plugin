@@ -61,21 +61,11 @@ func authParse(request []byte) ([]byte, error) {
 		// Not ours: report unhandled so other parsers can try.
 		return okEnvelope(pluginapi.AuthParseResponse{Handled: false})
 	}
-	var payload map[string]any
-	if errUnmarshal := json.Unmarshal(req.RawJSON, &payload); errUnmarshal != nil {
+	parsed, errCredential := credentialFromStorage(req.RawJSON)
+	if errCredential != nil || !parsed.valid() {
 		return okEnvelope(pluginapi.AuthParseResponse{Handled: false})
 	}
-
-	cred := credential{
-		AccessKeyID:     firstString(payload, "access_key_id", "accessKeyId", "ak"),
-		SecretAccessKey: firstString(payload, "secret_access_key", "secretAccessKey", "sk"),
-		SecurityToken:   firstString(payload, "security_token", "securityToken", "accessToken"),
-		DomainID:        firstString(payload, "domain_id", "domainId", "X-Domain-Id"),
-		UserName:        firstString(payload, "user_name", "userName"),
-		UserID:          firstString(payload, "user_id", "userId"),
-		ExpiresAt:       firstString(payload, "expires_at", "expiresAt"),
-		LoginType:       firstString(payload, "login_type", "loginType"),
-	}
+	cred := *parsed
 	if !cred.valid() {
 		logWarn("auth file is missing an access key or secret key", map[string]any{"file": req.FileName})
 		return okEnvelope(pluginapi.AuthParseResponse{Handled: false})
@@ -129,13 +119,13 @@ func authLoginStart(request []byte) ([]byte, error) {
 	callbackURL := fmt.Sprintf("http://127.0.0.1:%d/authentication", port)
 
 	ticketID := randomUUIDv4()
-	secret := randomHex(16)
 	state := randomHex(16)
+	ctx, cancel := context.WithTimeout(context.Background(), cfg.loginTimeout())
 
 	session := &loginSession{
 		state:    state,
 		ticketID: ticketID,
-		secret:   secret,
+		cancel:   cancel,
 		listener: listener,
 		expires:  time.Now().Add(cfg.loginTimeout()),
 	}
@@ -155,23 +145,15 @@ func authLoginStart(request []byte) ([]byte, error) {
 
 	loginMu.Lock()
 	loginSessions[state] = session
-	if len(loginSessions) > 32 {
-		// Bound the session table; expired entries are also purged on lookup.
-		for key, item := range loginSessions {
-			if time.Now().After(item.expires) {
-				item.stop()
-				delete(loginSessions, key)
-			}
-		}
-	}
+	evictLoginSessionsLocked()
 	loginMu.Unlock()
 
 	// Poll the ticket endpoint in the background so the flow completes as soon
 	// as the browser hands the secret back to our loopback listener.
-	go session.poll()
+	go session.poll(ctx)
 
 	loginURL := buildLoginURL(cfg, ticketID, callbackURL)
-	logInfo("started browser login", map[string]any{"url": loginURL, "port": port})
+	logInfo("started browser login", map[string]any{"port": port})
 
 	return okEnvelope(pluginapi.AuthLoginStartResponse{
 		Provider:  providerID,
@@ -180,6 +162,40 @@ func authLoginStart(request []byte) ([]byte, error) {
 		ExpiresAt: session.expires,
 		Metadata:  map[string]any{"callback_url": callbackURL, "ticket_id": ticketID},
 	})
+}
+
+// maxLoginSessions bounds the live login flows. Each one holds a loopback
+// listener, a server goroutine and a poll goroutine for the whole login timeout,
+// so an unbounded table would let a caller that never finishes a login exhaust
+// sockets. Callers hold loginMu.
+const maxLoginSessions = 8
+
+// evictLoginSessionsLocked drops expired sessions and, when the table is still
+// full, the session closest to expiry. Evicting the oldest keeps the newest
+// attempt - the one the operator just started - working.
+func evictLoginSessionsLocked() {
+	now := time.Now()
+	for key, item := range loginSessions {
+		if now.After(item.expires) {
+			item.stop()
+			delete(loginSessions, key)
+		}
+	}
+	for len(loginSessions) > maxLoginSessions {
+		var oldestKey string
+		var oldestExpiry time.Time
+		for key, item := range loginSessions {
+			if oldestKey == "" || item.expires.Before(oldestExpiry) {
+				oldestKey, oldestExpiry = key, item.expires
+			}
+		}
+		if oldestKey == "" {
+			return
+		}
+		logWarn("dropping an unfinished login flow to make room for a new one", map[string]any{"state": oldestKey})
+		loginSessions[oldestKey].stop()
+		delete(loginSessions, oldestKey)
+	}
 }
 
 // authLoginPoll reports the current state of an interactive login flow.
@@ -250,7 +266,7 @@ func authLoginPoll(request []byte) ([]byte, error) {
 		Auth: pluginapi.AuthData{
 			Provider:    providerID,
 			Label:       label,
-			FileName:    providerLoginFile(label),
+			FileName:    credentialFileName(cred),
 			StorageJSON: storage,
 			Metadata: map[string]any{
 				"type":       providerID,
@@ -321,7 +337,7 @@ func authRefresh(request []byte) ([]byte, error) {
 	headers, errSign := signRequest(http.MethodPost, endpoint, map[string]string{
 		"Content-Type": "application/json",
 		"Accept":       "application/json",
-	}, renewBody, cred, true)
+	}, renewBody, cred, cfg.SignHost)
 	if errSign != nil {
 		return failEnvelope("sign_failed", errSign.Error(), http.StatusInternalServerError)
 	}
@@ -387,6 +403,14 @@ func (s *loginSession) handleCallback(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusNoContent)
 		return
 	}
+	if r.Method != http.MethodGet {
+		w.WriteHeader(http.StatusMethodNotAllowed)
+		return
+	}
+	if time.Now().After(s.expires) {
+		w.WriteHeader(http.StatusGone)
+		return
+	}
 	secret := strings.TrimSpace(r.URL.Query().Get("secret"))
 	if secret == "" {
 		w.WriteHeader(http.StatusBadRequest)
@@ -394,8 +418,11 @@ func (s *loginSession) handleCallback(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	s.mu.Lock()
-	matches := secret == s.secret
+	// The web console creates this secret. It is then bound to our ticket by
+	// the upstream exchange; it is not a locally generated OAuth state.
+	matches := !s.received || secret == s.secret
 	if matches {
+		s.secret = secret
 		s.received = true
 	}
 	s.mu.Unlock()
@@ -404,23 +431,32 @@ func (s *loginSession) handleCallback(w http.ResponseWriter, r *http.Request) {
 		_, _ = w.Write([]byte("invalid secret"))
 		return
 	}
-	w.Header().Set("Content-Type", "text/html; charset=utf-8")
+	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(http.StatusOK)
-	_, _ = w.Write([]byte("<!doctype html><title>CodeArts Doer</title><main>Sign-in complete. You can close this tab and return to CLIProxyAPI.</main>"))
+	_, _ = w.Write([]byte(`{"status":"success","message":"Secret received"}`))
 }
 
 // poll exchanges the ticket for a credential once the secret arrives.
-func (s *loginSession) poll() {
+func (s *loginSession) poll(ctx context.Context) {
+	defer s.stop()
 	cfg := config()
-	interval := 2 * time.Second
-	deadline := s.expires
-
-	for time.Now().Before(deadline) {
+	ticker := time.NewTicker(2 * time.Second)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			s.mu.Lock()
+			if s.credential == nil && s.err == "" {
+				s.err = "login session expired or was cancelled"
+			}
+			s.mu.Unlock()
+			return
+		case <-ticker.C:
+		}
 		s.mu.Lock()
 		received := s.received
 		s.mu.Unlock()
 		if !received {
-			time.Sleep(interval)
 			continue
 		}
 		cred, retry, errPoll := s.exchangeTicket(cfg)
@@ -436,14 +472,7 @@ func (s *loginSession) poll() {
 			s.mu.Unlock()
 			return
 		}
-		time.Sleep(interval)
 	}
-
-	s.mu.Lock()
-	if s.credential == nil && s.err == "" {
-		s.err = "timed out waiting for sign-in to complete"
-	}
-	s.mu.Unlock()
 }
 
 // exchangeTicket performs one ticket poll. retry reports whether another
@@ -456,7 +485,9 @@ func (s *loginSession) exchangeTicket(cfg *Config) (*credential, bool, error) {
 	}
 	query := parsed.Query()
 	query.Set("ticket_id", s.ticketID)
+	s.mu.Lock()
 	query.Set("secret", s.secret)
+	s.mu.Unlock()
 	parsed.RawQuery = query.Encode()
 
 	headers := map[string]string{
@@ -530,7 +561,7 @@ func decodeCredentialResponse(body []byte) (credential, error) {
 	if envelope.Credential == nil {
 		return credential{}, fmt.Errorf("response contains no credential object")
 	}
-	return credential{
+	cred := credential{
 		AccessKeyID:     strings.TrimSpace(envelope.Credential.Access),
 		SecretAccessKey: strings.TrimSpace(envelope.Credential.Secret),
 		SecurityToken:   strings.TrimSpace(envelope.Credential.SecurityToken),
@@ -539,7 +570,11 @@ func decodeCredentialResponse(body []byte) (credential, error) {
 		UserID:          strings.TrimSpace(envelope.UserID),
 		ExpiresAt:       strings.TrimSpace(envelope.Credential.ExpiresAt),
 		LoginType:       strings.TrimSpace(envelope.LoginType),
-	}, nil
+	}
+	if !cred.valid() || cred.SecurityToken == "" {
+		return credential{}, fmt.Errorf("response contains an incomplete temporary credential")
+	}
+	return cred, nil
 }
 
 // credentialFromStorage pulls the credential out of the opaque storage blob the
@@ -551,23 +586,37 @@ func credentialFromStorage(storage []byte) (*credential, error) {
 	// Look the field up by name rather than through a struct tag, so the key
 	// exists in exactly one place (storageKey) and cannot drift from what
 	// buildAuthFileDocument writes.
-	var document map[string]json.RawMessage
+	var document map[string]any
 	if errUnmarshal := json.Unmarshal(storage, &document); errUnmarshal != nil {
 		return nil, errUnmarshal
 	}
-	if raw, ok := document[storageKey]; ok && len(raw) > 0 {
-		var nested credential
-		if errNested := json.Unmarshal(raw, &nested); errNested != nil {
-			return nil, errNested
+	if raw, ok := document[storageKey]; ok {
+		nested, ok := raw.(map[string]any)
+		if !ok {
+			return nil, fmt.Errorf("invalid credential object")
 		}
-		return &nested, nil
+		document = nested
 	}
-	// Fall back to a flat layout in case the storage was written by hand.
-	var flat credential
-	if errFlat := json.Unmarshal(storage, &flat); errFlat == nil && flat.AccessKeyID != "" {
-		return &flat, nil
+	return &credential{
+		AccessKeyID:     firstString(document, "access_key_id", "accessKeyId", "ak"),
+		SecretAccessKey: firstString(document, "secret_access_key", "secretAccessKey", "sk"),
+		SecurityToken:   firstString(document, "security_token", "securityToken", "accessToken"),
+		DomainID:        firstString(document, "domain_id", "domainId", "X-Domain-Id"),
+		UserName:        firstString(document, "user_name", "userName"),
+		UserID:          firstString(document, "user_id", "userId"),
+		ExpiresAt:       firstString(document, "expires_at", "expiresAt"),
+		LoginType:       firstString(document, "login_type", "loginType"),
+	}, nil
+}
+
+func stopLoginSessions() {
+	loginMu.Lock()
+	sessions := loginSessions
+	loginSessions = map[string]*loginSession{}
+	loginMu.Unlock()
+	for _, session := range sessions {
+		session.stop()
 	}
-	return nil, nil
 }
 
 // refreshDeadline returns when the host should next renew the credential. The
@@ -621,6 +670,14 @@ func providerLoginFile(label string) string {
 		label = providerID
 	}
 	return providerID + "-" + sanitizeFileToken(label) + ".json"
+}
+
+func credentialFileName(cred *credential) string {
+	identity := cred.DomainID + ":" + cred.UserID
+	if cred.UserID == "" {
+		identity = cred.AccessKeyID
+	}
+	return providerLoginFile(firstNonEmptyString(cred.UserName, "account") + "-" + sha256Hex([]byte(identity))[:12])
 }
 
 func sanitizeFileToken(value string) string {
