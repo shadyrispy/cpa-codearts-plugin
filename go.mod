@@ -1,4 +1,4 @@
-module github.com/local/codearts-provider-cliproxyapi-plugin
+module github.com/zyxzjyzjj/cpa-codearts-plugin
 
 go 1.26.0
 

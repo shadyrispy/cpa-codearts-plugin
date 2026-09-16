@@ -44,7 +44,7 @@ secret_key.txt
 # `tools/package-release.sh` writes release-assets/, and build.sh/build.bat write
 # the platform library into plugins/. Binaries are distributed through GitHub
 # Releases (that is what the plugin store downloads), so they do not need to be
-# committed. Delete the two `!` lines below if you prefer to vendor the library.
+# committed. Delete the `!` line below if you prefer to vendor the library.
 # ---------------------------------------------------------------------------
 /release-assets/
 /plugins/**/*.dll
@@ -56,6 +56,8 @@ secret_key.txt
 # Local build scratch space.
 /tools/abitest/abitest
 /tools/abitest/abitest.exe
+# `go build ./...` in the repo root writes an executable named after the module.
+/*.exe
 /dist/
 /coverage.out
 

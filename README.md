@@ -521,13 +521,17 @@ curl -H "Authorization: Bearer $ADMIN_KEY" \
   http://localhost:8317/v0/management/plugin-store
 
 curl -X POST -H "Authorization: Bearer $ADMIN_KEY" \
-  http://localhost:8317/v0/management/plugin-store/codearts/install
+  http://localhost:8317/v0/management/plugin-store/codearts-provider/install
 ```
 
 Installing writes the dynamic library and sets that plugin's `enabled: true`, but
 does **not** switch on the global `plugins.enabled`. Use `?source=<sourceID>` when
 two registries define the same plugin ID. Because a loaded DLL cannot be
 overwritten on Windows, updating a running plugin reports a restart conflict.
+
+For a complete walkthrough of tagging and publishing — including the exact asset
+naming rules the store enforces and a CI recipe for the other platforms — see
+[docs/release.md](docs/release.md).
 
 ## Building and testing
 
