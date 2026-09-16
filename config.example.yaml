@@ -1,0 +1,172 @@
+# CodeArts Doer plugin configuration for CLIProxyAPI.
+#
+# Merge the `plugins:` block below into your CLIProxyAPI config.yaml. The plugin
+# ID is the dynamic library file name without its extension, so the library must
+# be named `codearts-provider.dll` / `codearts-provider.so` / `codearts-provider.dylib`.
+#
+# Placement (searched in priority order per platform):
+#   plugins/<GOOS>/<GOARCH>/codearts-provider.dll   <- most specific, used below
+#   plugins/<GOOS>/<GOARCH>-<variant>/codearts-provider.dll
+#   plugins/codearts-provider.dll
+#
+# CLIProxyAPI must be a CGO build ("1" is reported by the management API header
+# indicating dynamic-library plugin support).
+
+plugins:
+  # Global switch. File discovery and per-plugin config are ignored when this is
+  # false.
+  enabled: true
+  dir: "plugins"
+  configs:
+    codearts-provider:
+      # Per-plugin switch. Omitting it is treated as enabled.
+      enabled: true
+      # Start/register/routing order: higher priority runs first.
+      priority: 100
+
+      # ---------------------------------------------------------------------
+      # Upstream endpoint
+      # ---------------------------------------------------------------------
+
+      # CodeArts Doer regional API gateway. Both the native chat API and the
+      # OpenAI-compatible agent API are served from this host.
+      # Regions: cn-north-4 (Beijing), cn-east-3 (Shanghai), cn-south-1 (Guangzhou),
+      #          ap-southeast-1 (Singapore), ...
+      base_url: "https://snap-access.cn-north-4.myhuaweicloud.com"
+
+      # Upstream protocol.
+      #   agent  - OpenAI-compatible POST /api/v2/chat/completions
+      #   native - proprietary POST /v1/chat/chat with CodeArts SSE framing
+      api_mode: "agent"
+
+      # CodeArts web console used to start the browser sign-in flow.
+      web_login_base: "https://devcloud.cn-north-4.huaweicloud.com"
+
+      # ---------------------------------------------------------------------
+      # Client identity sent upstream (these headers are part of the signature)
+      # ---------------------------------------------------------------------
+
+      plugin_name: "snap_vscode"
+      plugin_version: "26.3.6"
+      # Defaults to "Vscode_<plugin_version>" when omitted.
+      client_version: "Vscode_26.3.6"
+      language: "en-us"
+
+      # ---------------------------------------------------------------------
+      # Models
+      # ---------------------------------------------------------------------
+
+      # Upstream agent to talk to. Used by the native protocol only.
+      agent_id: "Pangu_Doer_in_CodeArts"
+
+      # Upstream model_id used when the requested model has no explicit mapping.
+      default_model_id: "PanguDev_COM_QC2"
+
+      # Client-facing ID -> upstream model_id. Add an entry per model you want to
+      # expose under a friendlier alias.
+      model_map:
+        "pangu-dev": "PanguDev_COM_QC2"
+
+      # Models advertised to CLIProxyAPI. The upstream catalogue is tenant
+      # specific, so adjust this list to the models your account can reach.
+      models:
+        - id: "PanguDev_COM_QC2"
+          name: "PanguDev_COM_QC2"
+          display_name: "Pangu Dev (CodeArts)"
+          description: "Huawei CodeArts Doer chat model."
+          context_length: 128000
+          max_output_tokens: 8192
+
+      # ---------------------------------------------------------------------
+      # Transport / signing
+      # ---------------------------------------------------------------------
+
+      # Ask the upstream for SSE heartbeat comment frames.
+      heartbeat: true
+
+      # Include `host` in the signature's SignedHeaders list. Off by default
+      # because the official extension does not sign `host`; turn it on only if
+      # your gateway rejects the default.
+      sign_host: false
+
+      # Set the is_confidential header (KIA / confidential-code mode).
+      is_confidential: false
+
+      request_timeout_seconds: 600
+      login_timeout_seconds: 300
+
+      # ---------------------------------------------------------------------
+      # Scheduled tasks
+      # ---------------------------------------------------------------------
+      #
+      # The CLIProxyAPI plugin ABI has no timer: the host never calls a plugin on
+      # a schedule, so the plugin runs its own cron. Expressions accept the
+      # standard 5-field form (minute first) or the 6-field form with seconds.
+      schedule:
+        enabled: true
+        # IANA zone the expressions are evaluated in. Empty means the host's
+        # local zone.
+        timezone: "Asia/Shanghai"
+
+        # When tasks is omitted the built-in defaults below are used. Set
+        # disable_defaults: true to run only your own tasks.
+        disable_defaults: false
+
+        tasks:
+          # Renew the temporary AK/SK hourly. The upstream credential lasts 24h
+          # and the official IDE extension renews every hour.
+          - id: "token-renew"
+            type: "token_renew"
+            cron: "17 * * * *"
+            enabled: true
+
+          # Keep the subscription/quota snapshot warm for the panel and the
+          # quota API, so a page load does not hit the upstream per account.
+          - id: "quota-refresh"
+            type: "quota_refresh"
+            cron: "*/30 * * * *"
+            enabled: true
+
+          # Daily benefit check-in (每日签到). The claim UI is a server-hosted
+          # page ("Wish Wall") and the extension performs no claim request, so
+          # there is no endpoint to hard-code. Capture the real request once
+          # (browser devtools -> Network -> copy as cURL while claiming), then
+          # fill in the fields below. Disabled until you do.
+          - id: "daily-checkin"
+            type: "checkin"
+            cron: "5 0 * * *"                          # 00:05 daily
+            checkin_method: "POST"
+            # Absolute, or a path resolved against base_url.
+            checkin_url: "/v1/activity/benefit/daily/claim"
+            checkin_body: '{"activityCode":"daily_sign_in"}'
+            checkin_headers: {}
+              # x-snap-traceid: "..."   # only if the page sends one
+            # Text that appears only on a real claim. With this set, a bare HTTP
+            # 200 that lacks the marker is reported as a failure rather than a
+            # silent success.
+            checkin_success_marker: ""
+            # Text meaning "already claimed today". Matching it counts as
+            # success, so a twice-a-day schedule does not look like a failure.
+            checkin_already_marker: ""
+            enabled: false
+
+          # Escape hatch: schedule any CodeArts gateway endpoint. `path` is
+          # resolved against base_url. Set sign: true to sign the request with
+          # the first available credential.
+          - id: "custom-instructions-warmup"
+            type: "http"
+            cron: "0 8 * * 1-5"     # weekdays at 08:00
+            method: "GET"
+            path: "/v1/chat/custom-instructions"
+            sign: true
+            enabled: false
+
+      # Extra headers added to every upstream request. They are included in the
+      # request signature, so keep the set stable.
+      extra_headers: {}
+        # x-snap-zone: "green"
+        # department: "your-department"
+
+      # Debugging only: send unsigned upstream requests when no credential is
+      # available. Never enable this in production.
+      insist_missing_credentials: false

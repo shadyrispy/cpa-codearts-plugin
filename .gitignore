@@ -1,0 +1,100 @@
+# ---------------------------------------------------------------------------
+# Secrets and credential material — the important part of this file.
+#
+# This plugin handles live CodeArts credentials: an access key, a secret key and
+# a security token. `providerLoginFile` generates `codearts-provider-<user>.json`
+# for browser sign-in, and the `/export` route emits the same material as JSON.
+# None of these may ever be committed.
+#
+# Rules are anchored to the repo root where possible so they cannot accidentally
+# hide a source file deeper in the tree.
+# ---------------------------------------------------------------------------
+
+# Credential files this plugin produces or imports.
+/codearts-provider-*.json
+/codearts-*.json
+/auths/
+/credentials/
+/backup/
+*-credentials.json
+*credential*.json
+*secret*.json
+*token*.json
+
+# A real gateway config (as opposed to config.example.yaml) carries the upstream
+# endpoint and may carry store-source URLs.
+/config.yaml
+/config.yml
+
+# Generic secret material.
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+*.p12
+*.pfx
+id_rsa*
+.netrc
+secret_key.txt
+
+# ---------------------------------------------------------------------------
+# Build and release outputs
+#
+# `tools/package-release.sh` writes release-assets/, and build.sh/build.bat write
+# the platform library into plugins/. Binaries are distributed through GitHub
+# Releases (that is what the plugin store downloads), so they do not need to be
+# committed. Delete the two `!` lines below if you prefer to vendor the library.
+# ---------------------------------------------------------------------------
+/release-assets/
+/plugins/**/*.dll
+/plugins/**/*.so
+/plugins/**/*.dylib
+/plugins/**/*.h
+!plugins/**/.gitkeep
+
+# Local build scratch space.
+/tools/abitest/abitest
+/tools/abitest/abitest.exe
+/dist/
+/coverage.out
+
+# ---------------------------------------------------------------------------
+# Editor / IDE / OS
+# ---------------------------------------------------------------------------
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+.DS_Store
+Thumbs.db
+
+# ---------------------------------------------------------------------------
+# Tooling state written into the working tree by the AI IDE, not by this project
+# ---------------------------------------------------------------------------
+.codeartsdoer/
+.codewhisperer/
+.claude/
+.codex/
+.qoder/
+.trellis/
+.superpowers/
+.agents/
+.ace-tool/
+.test_tmp/
+.tmp/
+.merkle-snapshot.json
+
+# ---------------------------------------------------------------------------
+# Python helpers, if any are ever added
+# ---------------------------------------------------------------------------
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+
+# ---------------------------------------------------------------------------
+# Logs
+# ---------------------------------------------------------------------------
+*.log

@@ -1,0 +1,18 @@
+{
+  "id": "codearts-provider",
+  "name": "CodeArts",
+  "description": "Huawei CodeArts provider: chat completions, browser sign-in, subscription/quota view, usage tracking, cron tasks and a management dashboard.",
+  "author": "REPLACE_WITH_YOUR_GITHUB_USERNAME",
+  "version": "0.1.0",
+  "repository": "https://github.com/REPLACE_WITH_YOUR_GITHUB_USERNAME/cpa-plugin-codearts",
+  "logo": "https://raw.githubusercontent.com/REPLACE_WITH_YOUR_GITHUB_USERNAME/cpa-plugin-codearts/main/logo.png",
+  "homepage": "https://github.com/REPLACE_WITH_YOUR_GITHUB_USERNAME/cpa-plugin-codearts",
+  "license": "MIT",
+  "tags": [
+    "provider",
+    "auth",
+    "quota",
+    "usage",
+    "management"
+  ]
+}

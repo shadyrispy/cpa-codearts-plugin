@@ -1,0 +1,40 @@
+# Normalize line endings so the repo behaves the same on every platform.
+#
+# Without this, Git on Windows checks files out with CRLF, and a shell script
+# with CRLF line endings fails on Linux/macOS with:
+#   bash: ./build.sh: /bin/bash^M: bad interpreter: No such file or directory
+# That breaks CI and `./build.sh` for anyone who clones on Linux.
+
+# Default: let Git store LF in the repository.
+* text=auto eol=lf
+
+# Shell scripts and batch files must keep the endings their host expects.
+*.sh      text eol=lf
+*.bash    text eol=lf
+*.bat     text eol=crlf
+*.cmd     text eol=crlf
+
+# Go source and modules: always LF.
+*.go      text eol=lf
+go.mod    text eol=lf
+go.sum    text eol=lf
+
+# Text config and docs.
+*.md      text eol=lf
+*.yaml    text eol=lf
+*.yml     text eol=lf
+*.json    text eol=lf
+
+# Binary artifacts must never be line-ending converted or diffed as text.
+# These are ignored by .gitignore anyway; the rules here are a safety net for
+# anyone who commits them deliberately.
+*.dll     binary
+*.so      binary
+*.dylib   binary
+*.exe     binary
+*.zip     binary
+*.png     binary
+*.jpg     binary
+*.ttf     binary
+*.woff    binary
+*.woff2   binary
