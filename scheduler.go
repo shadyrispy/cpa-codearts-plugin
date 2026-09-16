@@ -612,6 +612,13 @@ func hostAuthSave(name string, payload []byte) error {
 // persists the refreshed payload.
 func renewCredential(cred *credential) error {
 	cfg := config()
+	if strings.TrimSpace(cred.RefreshToken) != "" || cred.OAuthContext != nil {
+		updated, _, _, errRefresh := oauthRefreshCredential(cfg, cred)
+		if errRefresh != nil {
+			return errRefresh
+		}
+		return persistRenewedCredential(cred, updated)
+	}
 	renewBody, errMarshal := json.Marshal(map[string]any{
 		"access":           cred.AccessKeyID,
 		"securitytoken":    cred.SecurityToken,
@@ -643,8 +650,14 @@ func renewCredential(cred *credential) error {
 	updated.UserName = firstNonEmptyString(updated.UserName, cred.UserName)
 	updated.UserID = firstNonEmptyString(updated.UserID, cred.UserID)
 	updated.LoginType = firstNonEmptyString(updated.LoginType, cred.LoginType, "WEB")
+	return persistRenewedCredential(cred, &updated)
+}
 
-	storage, errMarshal2 := json.Marshal(map[string]any{storageKey: updated})
+func persistRenewedCredential(previous, updated *credential) error {
+	if previous == nil || updated == nil || !updated.valid() {
+		return fmt.Errorf("refreshed credential is incomplete")
+	}
+	storage, errMarshal2 := json.Marshal(map[string]any{storageKey: *updated})
 	if errMarshal2 != nil {
 		return errMarshal2
 	}
@@ -662,7 +675,7 @@ func renewCredential(cred *credential) error {
 			continue
 		}
 		existing, _ := credentialFromStorage(storageExisting)
-		if existing == nil || existing.AccessKeyID != cred.AccessKeyID {
+		if existing == nil || existing.AccessKeyID != previous.AccessKeyID {
 			continue
 		}
 		wrap, errWrap := mergeCredentialFile(storageExisting, storage)

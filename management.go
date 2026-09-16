@@ -25,8 +25,8 @@ const managementBasePath = "/v0/management"
 // the operator has already stored in the management UI.
 func managementRoutes() []map[string]any {
 	return []map[string]any{
-		{"Method": http.MethodPost, "Path": "/codearts-provider/login/callback", "Description": "Submit the browser callback URL when CPA runs on a different machine."},
-		{"Method": http.MethodGet, "Path": "/codearts-provider/login/status", "Description": "Report the stage of one browser sign-in flow (waiting for the callback, or exchanging the ticket)."},
+		{"Method": http.MethodPost, "Path": "/codearts-provider/login/callback", "Description": "Submit the localhost OAuth callback URL when CPA runs on a different machine."},
+		{"Method": http.MethodGet, "Path": "/codearts-provider/login/status", "Description": "Report the stage of one OAuth sign-in flow (waiting for the callback, or exchanging the code)."},
 		{
 			"Method":      http.MethodGet,
 			"Path":        "/codearts-provider/accounts",
@@ -175,8 +175,9 @@ func managementHandle(request []byte) ([]byte, error) {
 }
 
 // Remote CPA deployments cannot receive a browser's localhost redirect. The
-// operator can submit that URL over the authenticated management channel, which
-// is exactly the callback the plugin's own listener would have served.
+// operator copies the failed localhost /oauth/callback?code=... URL into the
+// authenticated panel; the plugin then performs the same STS exchange its
+// loopback listener would have performed locally.
 func handleLoginCallback(req pluginapi.ManagementRequest) pluginapi.ManagementResponse {
 	var body struct {
 		State       string `json:"state"`
@@ -192,8 +193,8 @@ func handleLoginCallback(req pluginapi.ManagementRequest) pluginapi.ManagementRe
 		return errorJSON(400, "unknown or expired login state")
 	}
 	u, err := url.Parse(strings.TrimSpace(body.CallbackURL))
-	if err != nil || u.Path != "/authentication" {
-		return errorJSON(400, "paste the full callback URL from the browser address bar, for example http://127.0.0.1:40000/authentication?secret=...")
+	if err != nil || (u.Path != codeArtsOAuthCallback && u.Path != "/authentication") {
+		return errorJSON(400, "paste the full localhost callback URL, for example http://127.0.0.1:40000/oauth/callback?code=...&state=...")
 	}
 	// The host must be either the socket the listener actually bound or the
 	// address the plugin advertised to the console (login_callback_base); those
@@ -201,17 +202,17 @@ func handleLoginCallback(req pluginapi.ManagementRequest) pluginapi.ManagementRe
 	if submitted := u.Host; submitted != session.bindAddr && submitted != callbackHost(session.callbackURL) {
 		return errorJSON(400, "that callback URL belongs to a different sign-in attempt")
 	}
+	code := strings.TrimSpace(u.Query().Get("code"))
 	secret := strings.TrimSpace(u.Query().Get("secret"))
-	if secret == "" {
-		// A secret-less callback is accepted: the console binds the secret to the
-		// ticket, and the ticket exchange is what proves the login.
-		logWarn("the submitted callback carried no secret; exchanging the ticket anyway", map[string]any{"state": session.state})
+	if code == "" && secret == "" {
+		return errorJSON(400, "callback URL contains neither an OAuth code nor a legacy secret")
 	}
 	session.mu.Lock()
 	if session.received {
 		session.mu.Unlock()
 		return errorJSON(409, "callback already received")
 	}
+	session.authorizationCode = code
 	session.secret = secret
 	session.received = true
 	session.callbackAt = time.Now()
@@ -232,7 +233,7 @@ func callbackHost(rawURL string) string {
 // handleLoginStatus reports the stage of one sign-in flow. CPA's own
 // get-auth-status route only distinguishes pending/success/error, so a pending
 // flow would otherwise be silent; this route says whether the plugin is waiting
-// for the browser callback or already exchanging the ticket, and what the
+// for the browser callback or already exchanging the authorization code, and what the
 // exchange last answered.
 func handleLoginStatus(query url.Values) pluginapi.ManagementResponse {
 	state := strings.TrimSpace(query.Get("state"))

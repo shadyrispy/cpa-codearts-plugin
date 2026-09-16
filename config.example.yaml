@@ -45,16 +45,21 @@ plugins:
       api_mode: "agent"
 
       # CodeArts web console used to start the browser sign-in flow.
-      web_login_base: "https://devcloud.cn-north-4.huaweicloud.com"
+      web_login_base: "https://codearts.huaweicloud.com"
+
+      # Huawei STS OAuth endpoints. Public-cloud users should keep these values;
+      # overrides mainly exist for private clouds and integration tests.
+      oauth_token_url: "https://sts.cn-north-4.myhuaweicloud.com/v1/oauth2/tokens"
+      oauth_identity_url: "https://sts.cn-north-4.myhuaweicloud.com/v5/caller-identity"
 
       # ---------------------------------------------------------------------
       # Client identity sent upstream (these headers are part of the signature)
       # ---------------------------------------------------------------------
 
       plugin_name: "snap_vscode"
-      plugin_version: "26.3.6"
+      plugin_version: "26.9.101"
       # Defaults to "Vscode_<plugin_version>" when omitted.
-      client_version: "Vscode_26.3.6"
+      client_version: "Vscode_26.9.101"
       language: "en-us"
 
       # ---------------------------------------------------------------------
@@ -110,30 +115,23 @@ plugins:
       login_timeout_seconds: 300
 
       # ---------------------------------------------------------------------
-      # Browser authorization callback
+      # OAuth PKCE browser authorization callback
       # ---------------------------------------------------------------------
       #
-      # The plugin opens a local listener and hands its URL to the CodeArts
-      # console as auth_callback_url, exactly like the VS Code extension. The
-      # browser then reports the authorization result back to that listener; the
-      # plugin exchanges the ticket and stores the credential in CPA. There is
-      # only this one authorization flow - the same single 授权 the extension has.
+      # The plugin opens a localhost listener and hands its URL to CodeArts,
+      # exactly like VS Code CodeArts Agent 26.9.101. After authorization it
+      # exchanges the one-time code with PKCE + DPoP and stores the refresh
+      # context in CPA.
 
-      # Interface the callback listener binds to. Default 127.0.0.1, which is
-      # right when the browser runs on the same machine as CPA. Set 0.0.0.0 when
-      # the browser is elsewhere (a gateway in a container or on a server) and
-      # the callback port is published.
+      # Keep these defaults for Docker or a remote server. The browser will end
+      # on an unreachable localhost URL; copy that full URL into the plugin
+      # panel. No public callback, reverse proxy, or Docker port is needed.
       login_callback_bind: "127.0.0.1"
-
-      # Fixed callback port instead of a random one. Set it together with
-      # login_callback_base so a published container port can reach the listener:
-      #   docker run ... -p 40605:40605
       login_callback_port: 0
-
-      # Address handed to the browser instead of the loopback URL, for example
-      # "http://192.168.1.10:40605" or "https://cpa.example.com:40605". Leave
-      # empty when the browser can reach 127.0.0.1 on this host.
       login_callback_base: ""
+
+      # Advanced local-LAN deployments may pin a port and advertise a directly
+      # reachable HTTP base, but do not expose this callback publicly.
 
       # ---------------------------------------------------------------------
       # Scheduled tasks

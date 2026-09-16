@@ -2,6 +2,8 @@ package main
 
 import (
 	"bytes"
+	"crypto/sha256"
+	"encoding/base64"
 	"encoding/json"
 	"fmt"
 	"net/http"
@@ -83,22 +85,22 @@ func TestCredentialPersistReloadAndRenew(t *testing.T) {
 	}
 }
 
-// TestBuildLoginURLMatchesExtension pins the sign-in URL against the extension's
-// own construction:
-//
-//	${codeartsWebUrl}/doer/redirect?ticket_id=..&IdeaType=vscode&auth_callback_url=..&plugin-name=snap_vscode&plugin-version=..
-//
-// A wrong path, parameter name or plugin identity here is invisible until a real
-// browser session fails, so the shape is asserted exactly.
+// TestBuildLoginURLMatchesExtension pins the OAuth PKCE URL used by CodeArts
+// Agent 26.9.101.
 func TestBuildLoginURLMatchesExtension(t *testing.T) {
 	cfg := defaultConfig()
-	cfg.WebLoginBase = "https://devcloud.cn-north-4.huaweicloud.com"
-	got := buildLoginURL(cfg, "f4415ec8-6377-43f7-b909-dc90d177aa50", "http://127.0.0.1:40605/authentication")
-	want := "https://devcloud.cn-north-4.huaweicloud.com/doer/redirect" +
-		"?ticket_id=f4415ec8-6377-43f7-b909-dc90d177aa50" +
-		"&IdeaType=vscode" +
-		"&auth_callback_url=http://127.0.0.1:40605/authentication" +
-		"&plugin-name=snap_vscode&plugin-version=26.3.6"
+	ctx := &oauthLoginContext{PKCEPair: oauthPKCEPair{
+		CodeVerifier:        "verifier",
+		CodeChallenge:       "challenge-value",
+		CodeChallengeMethod: codeArtsOAuthPKCEMethod,
+	}}
+	got := buildLoginURL(cfg, "f4415ec8-6377-43f7-b909-dc90d177aa50", "http://127.0.0.1:40605/oauth/callback", ctx)
+	want := "https://codearts.huaweicloud.com/portal/authorize" +
+		"?theme=2&locale=en&uri_scheme=vscode-codebot&client_id=vscode-codebot&port=40605" +
+		"&code_challenge=challenge-value&code_challenge_method=SHA-256" +
+		"&ticket_id=f4415ec8-6377-43f7-b909-dc90d177aa50" +
+		"&auth_callback_url=http%3A%2F%2F127.0.0.1%3A40605%2Foauth%2Fcallback" +
+		"&plugin-name=snap_vscode&plugin-version=26.9.101"
 	if got != want {
 		t.Fatalf("login URL mismatch:\n got %s\nwant %s", got, want)
 	}
@@ -106,28 +108,130 @@ func TestBuildLoginURLMatchesExtension(t *testing.T) {
 	if errParse != nil {
 		t.Fatal(errParse)
 	}
-	if parsed.Path != "/doer/redirect" {
+	if parsed.Path != "/portal/authorize" {
 		t.Fatalf("wrong login path: %s", parsed.Path)
 	}
-	if callback := parsed.Query().Get("auth_callback_url"); callback != "http://127.0.0.1:40605/authentication" {
-		t.Fatalf("callback URL did not survive the extension-compatible query: %q", callback)
+	if callback := parsed.Query().Get("auth_callback_url"); callback != "http://127.0.0.1:40605/oauth/callback" {
+		t.Fatalf("OAuth callback URL did not survive encoding: %q", callback)
 	}
-	if parsed.Query().Get("plugin-name") != "snap_vscode" || parsed.Query().Get("IdeaType") != "vscode" {
+	if parsed.Query().Get("plugin-name") != "snap_vscode" || parsed.Query().Get("client_id") != codeArtsOAuthClientID {
 		t.Fatalf("plugin identity or idea type changed: %s", got)
 	}
 }
 
-// TestLoginCallbackMatchesExtensionBehaviour covers the callback contract the
-// official extension implements: answer any callback, treat the secret as
-// optional (the console binds it to the ticket), keep the first secret, and stop
-// accepting callbacks once one has been seen. An earlier version of this plugin
-// required a secret and a GET, which left the sign-in flow waiting forever for a
-// callback the console had already delivered.
+func TestOAuthPKCEDPoPExchangeAndPersistence(t *testing.T) {
+	ctx, errContext := newOAuthLoginContext()
+	if errContext != nil {
+		t.Fatal(errContext)
+	}
+	if len(ctx.PKCEPair.CodeVerifier) != 128 || ctx.PKCEPair.CodeChallengeMethod != "SHA-256" {
+		t.Fatalf("unexpected PKCE context: %+v", ctx.PKCEPair)
+	}
+	digest := sha256.Sum256([]byte(ctx.PKCEPair.CodeVerifier))
+	if want := base64.RawURLEncoding.EncodeToString(digest[:]); ctx.PKCEPair.CodeChallenge != want {
+		t.Fatalf("PKCE challenge mismatch: got %q want %q", ctx.PKCEPair.CodeChallenge, want)
+	}
+	proof, errProof := dpopProof(ctx, http.MethodPost, codeArtsOAuthTokenURL)
+	if errProof != nil {
+		t.Fatal(errProof)
+	}
+	parts := strings.Split(proof, ".")
+	if len(parts) != 3 {
+		t.Fatalf("DPoP proof is not a JWT: %q", proof)
+	}
+	headerRaw, _ := base64.RawURLEncoding.DecodeString(parts[0])
+	var header struct {
+		Alg string   `json:"alg"`
+		Typ string   `json:"typ"`
+		JWK oauthJWK `json:"jwk"`
+	}
+	if json.Unmarshal(headerRaw, &header) != nil || header.Alg != "ES256" || header.Typ != "dpop+jwt" || header.JWK.D != "" {
+		t.Fatalf("invalid/public-key-leaking DPoP header: %s", headerRaw)
+	}
+
+	profile, _ := json.Marshal(oauthIdentity{AccountID: "account", PrincipalID: "principal", PrincipalURN: "iam::account:test-user"})
+	claims, _ := json.Marshal(map[string]string{"user_profile": base64.RawURLEncoding.EncodeToString(profile)})
+	refreshToken := "e30." + base64.RawURLEncoding.EncodeToString(claims) + ".signature"
+	testHost(t, func(method string, request any) (json.RawMessage, error) {
+		if method != "host.http.do" {
+			return nil, fmt.Errorf("unexpected host method %s", method)
+		}
+		req := request.(map[string]any)
+		if req["method"] != http.MethodPost || req["url"] != codeArtsOAuthTokenURL {
+			t.Fatalf("wrong OAuth token request: %#v", req)
+		}
+		headers := req["headers"].(map[string][]string)
+		if len(headers["DPoP"]) != 1 || len(strings.Split(headers["DPoP"][0], ".")) != 3 {
+			t.Fatal("OAuth exchange omitted DPoP proof")
+		}
+		form, _ := url.ParseQuery(string(req["body"].([]byte)))
+		if form.Get("grant_type") != "authorization_code" || form.Get("code") != "one-time-code" || form.Get("code_verifier") != ctx.PKCEPair.CodeVerifier {
+			t.Fatalf("wrong OAuth token form: %v", form)
+		}
+		body, _ := json.Marshal(map[string]any{
+			"credentials": map[string]string{
+				"access_key_id": "oauth-ak", "secret_access_key": "oauth-sk", "security_token": "oauth-sts", "expiration": "2030-01-01T00:00:00Z",
+			},
+			"refresh_token": refreshToken,
+		})
+		return json.Marshal(hostHTTPResponse{StatusCode: http.StatusOK, Body: body})
+	})
+	cred, status, message, errExchange := oauthExchangeAuthorizationCode(defaultConfig(), "one-time-code", "http://127.0.0.1:40605/oauth/callback", ctx)
+	if errExchange != nil || status != 200 || message != "" || cred.UserName != "test-user" || cred.DomainID != "account" || cred.RefreshToken == "" {
+		t.Fatalf("OAuth exchange failed: cred=%+v status=%d message=%q err=%v", cred, status, message, errExchange)
+	}
+	doc, _ := buildAuthFileDocument(*cred)
+	stored, errStored := credentialFromStorage(doc)
+	if errStored != nil || stored.OAuthContext == nil || stored.OAuthContext.DPoPKeyPair.PrivateKeyJWK.D == "" || stored.RefreshToken != refreshToken {
+		t.Fatalf("OAuth refresh state did not persist: %+v err=%v", stored, errStored)
+	}
+}
+
+func TestOAuthRefreshReusesProofContextAndRefreshToken(t *testing.T) {
+	ctx, errContext := newOAuthLoginContext()
+	if errContext != nil {
+		t.Fatal(errContext)
+	}
+	profile, _ := json.Marshal(oauthIdentity{AccountID: "account", PrincipalID: "principal", PrincipalURN: "iam::account:test-user"})
+	claims, _ := json.Marshal(map[string]string{"user_profile": base64.RawURLEncoding.EncodeToString(profile)})
+	refreshToken := "e30." + base64.RawURLEncoding.EncodeToString(claims) + ".signature"
+	existing := &credential{
+		AccessKeyID: "old-ak", SecretAccessKey: "old-sk", SecurityToken: "old-sts",
+		DomainID: "account", UserID: "principal", UserName: "test-user", LoginType: "WEB",
+		RefreshToken: refreshToken, OAuthContext: ctx,
+	}
+	testHost(t, func(method string, request any) (json.RawMessage, error) {
+		if method != "host.http.do" {
+			return nil, fmt.Errorf("unexpected host method %s", method)
+		}
+		req := request.(map[string]any)
+		headers := req["headers"].(map[string][]string)
+		form, _ := url.ParseQuery(string(req["body"].([]byte)))
+		if form.Get("grant_type") != "refresh_token" || form.Get("refresh_token") != refreshToken || form.Get("code_verifier") != ctx.PKCEPair.CodeVerifier {
+			t.Fatalf("wrong OAuth refresh form: %v", form)
+		}
+		if len(headers["DPoP"]) != 1 {
+			t.Fatal("OAuth refresh omitted DPoP proof")
+		}
+		body := []byte(`{"credentials":{"access_key_id":"new-ak","secret_access_key":"new-sk","security_token":"new-sts","expiration":"2030-01-02T00:00:00Z"}}`)
+		return json.Marshal(hostHTTPResponse{StatusCode: http.StatusOK, Body: body})
+	})
+	updated, status, message, errRefresh := oauthRefreshCredential(defaultConfig(), existing)
+	if errRefresh != nil || status != http.StatusOK || message != "" {
+		t.Fatalf("OAuth refresh failed: status=%d message=%q err=%v", status, message, errRefresh)
+	}
+	if updated.AccessKeyID != "new-ak" || updated.RefreshToken != refreshToken || updated.OAuthContext != ctx || updated.UserName != existing.UserName {
+		t.Fatalf("OAuth refresh lost credential context: %+v", updated)
+	}
+}
+
+// TestLoginCallbackMatchesExtensionBehaviour covers the new authorization-code
+// callback while retaining the legacy secret fallback.
 func TestLoginCallbackMatchesExtensionBehaviour(t *testing.T) {
-	s := &loginSession{expires: time.Now().Add(time.Minute), callbackURL: "http://127.0.0.1:40000/authentication"}
+	s := &loginSession{expires: time.Now().Add(time.Minute), callbackURL: "http://127.0.0.1:40000/oauth/callback"}
 	w := httptest.NewRecorder()
-	s.handleCallback(w, httptest.NewRequest("GET", "http://127.0.0.1/authentication?secret=web-generated-secret", nil))
-	if w.Code != 200 || s.secret != "web-generated-secret" || !s.received {
+	s.handleCallback(w, httptest.NewRequest("GET", "http://127.0.0.1/oauth/callback?code=authorization-code&state=portal-state", nil))
+	if w.Code != 200 || s.authorizationCode != "authorization-code" || !s.received {
 		t.Fatalf("callback rejected: %d", w.Code)
 	}
 	if s.callbackAt.IsZero() {
@@ -137,21 +241,19 @@ func TestLoginCallbackMatchesExtensionBehaviour(t *testing.T) {
 	// A second callback must not be able to replace the bound secret, and it must
 	// still be answered (the browser is showing the page).
 	w = httptest.NewRecorder()
-	s.handleCallback(w, httptest.NewRequest("GET", "http://127.0.0.1/authentication?secret=other", nil))
-	if w.Code != 200 || s.secret != "web-generated-secret" {
-		t.Fatalf("a second callback replaced the secret: %d %q", w.Code, s.secret)
+	s.handleCallback(w, httptest.NewRequest("GET", "http://127.0.0.1/oauth/callback?code=other", nil))
+	if w.Code != 200 || s.authorizationCode != "authorization-code" {
+		t.Fatalf("a second callback replaced the code: %d %q", w.Code, s.authorizationCode)
 	}
 
-	// A callback without a secret is accepted: the ticket exchange is what proves
-	// the login, and the extension polls with an empty secret in that case.
-	plain := &loginSession{expires: time.Now().Add(time.Minute), callbackURL: "http://127.0.0.1:40001/authentication"}
+	plain := &loginSession{expires: time.Now().Add(time.Minute), callbackURL: "http://127.0.0.1:40001/oauth/callback"}
 	w = httptest.NewRecorder()
-	plain.handleCallback(w, httptest.NewRequest("GET", "http://127.0.0.1/authentication", nil))
-	if w.Code != 200 || !plain.received || plain.secret != "" {
-		t.Fatalf("secret-less callback rejected: %d", w.Code)
+	plain.handleCallback(w, httptest.NewRequest("GET", "http://127.0.0.1/oauth/callback", nil))
+	if w.Code != http.StatusBadRequest || plain.received {
+		t.Fatalf("code-less OAuth callback accepted: %d", w.Code)
 	}
 
-	// Same for a POST body, which is how a script or proxy may deliver it.
+	// The old secret callback remains accepted during migration.
 	posted := &loginSession{expires: time.Now().Add(time.Minute)}
 	w = httptest.NewRecorder()
 	posted.handleCallback(w, httptest.NewRequest("POST", "http://127.0.0.1/authentication", strings.NewReader(`{"secret":"body-secret"}`)))
@@ -161,14 +263,14 @@ func TestLoginCallbackMatchesExtensionBehaviour(t *testing.T) {
 
 	// Preflight must succeed so a browser-side fetch can reach us.
 	w = httptest.NewRecorder()
-	s.handleCallback(w, httptest.NewRequest("OPTIONS", "http://127.0.0.1/authentication", nil))
+	s.handleCallback(w, httptest.NewRequest("OPTIONS", "http://127.0.0.1/oauth/callback", nil))
 	if w.Code != http.StatusNoContent {
 		t.Fatalf("preflight rejected: %d", w.Code)
 	}
 
 	s.expires = time.Now().Add(-time.Minute)
 	w = httptest.NewRecorder()
-	s.handleCallback(w, httptest.NewRequest("GET", "http://127.0.0.1/authentication?secret=late", nil))
+	s.handleCallback(w, httptest.NewRequest("GET", "http://127.0.0.1/oauth/callback?code=late", nil))
 	if w.Code != http.StatusGone {
 		t.Fatal("expired callback accepted")
 	}
@@ -861,6 +963,10 @@ func TestRefreshDeadlineScheduling(t *testing.T) {
 	expired := &credential{AccessKeyID: "ak", SecretAccessKey: "sk", SecurityToken: "sts", ExpiresAt: time.Now().Add(-time.Hour).Format(time.RFC3339)}
 	if deadline := refreshDeadline(expired); time.Until(deadline) > 10*time.Minute {
 		t.Fatalf("an already expired credential was not renewed promptly: %s", deadline)
+	}
+	expiredOAuth := &credential{AccessKeyID: "ak", SecretAccessKey: "sk", SecurityToken: "sts", ExpiresAt: time.Now().Add(-time.Hour).Format(time.RFC3339), RefreshToken: "refresh", OAuthContext: &oauthLoginContext{}}
+	if deadline := refreshDeadline(expiredOAuth); time.Until(deadline) > 2*time.Minute {
+		t.Fatalf("an expired OAuth credential was not renewed promptly: %s", deadline)
 	}
 	fresh := &credential{AccessKeyID: "ak", SecretAccessKey: "sk", SecurityToken: "sts", ExpiresAt: time.Now().Add(24 * time.Hour).Format(time.RFC3339)}
 	until := time.Until(refreshDeadline(fresh))

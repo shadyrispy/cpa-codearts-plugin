@@ -9,7 +9,7 @@ real traffic through code that may not handle it.
 
 | Capability | Status | What it does here |
 | --- | --- | --- |
-| `auth_provider` | yes | Browser-ticket sign-in + AK/SK renewal. |
+| `auth_provider` | yes | OAuth authorization-code sign-in with PKCE + DPoP, refresh-token renewal, and legacy ticket compatibility. |
 | `model_provider` | yes | Advertises the configured model list, plus each account's models discovered from the Agent Center. |
 | `executor` | yes | Chat completions, streaming and non-streaming, both upstream protocols. Declares input `chat-completions` and outputs `chat-completions` + `claude`, so OpenAI, Anthropic and Responses clients are served (see below). |
 | `quota_provider` | yes | Subscription/quota view in the host's normalised quota shape. |

@@ -17,6 +17,11 @@ type Config struct {
 	BaseURL string `yaml:"base_url" json:"base_url"`
 	// WebLoginBase is the web console used to start the browser login flow.
 	WebLoginBase string `yaml:"web_login_base" json:"web_login_base"`
+	// OAuthTokenURL and OAuthIdentityURL are the Huawei STS endpoints used by
+	// the 26.9.x PKCE/DPoP login. Overrides are primarily for private clouds and
+	// integration tests; public Huawei Cloud uses the defaults below.
+	OAuthTokenURL    string `yaml:"oauth_token_url" json:"oauth_token_url"`
+	OAuthIdentityURL string `yaml:"oauth_identity_url" json:"oauth_identity_url"`
 	// APIMode selects the upstream protocol: "agent" uses the OpenAI-compatible
 	// /api/v2/chat/completions endpoint, "native" uses the proprietary
 	// /v1/chat/chat endpoint with its own SSE framing.
@@ -50,16 +55,16 @@ type Config struct {
 	RequestTimeoutSeconds int `yaml:"request_timeout_seconds" json:"request_timeout_seconds"`
 	// LoginTimeoutSeconds bounds the interactive browser login flow.
 	LoginTimeoutSeconds int `yaml:"login_timeout_seconds" json:"login_timeout_seconds"`
-	// LoginCallbackBind is the local interface the browser-callback listener binds
-	// to. Defaults to 127.0.0.1; set it to 0.0.0.0 when the browser cannot reach
-	// the plugin's loopback (for example a gateway in a container).
+	// LoginCallbackBind is the local interface the short-lived OAuth callback
+	// listener binds to. Keep the default 127.0.0.1 for remote/container CPA:
+	// the operator relays the final localhost URL through the management panel.
 	LoginCallbackBind string `yaml:"login_callback_bind" json:"login_callback_bind"`
 	// LoginCallbackPort pins the callback port instead of using an ephemeral one.
-	// A fixed port is what makes containerised deployments work: publish it
-	// (docker run -p <port>:<port>) together with login_callback_base.
+	// A fixed port is only needed for an advanced directly reachable callback.
 	LoginCallbackPort int `yaml:"login_callback_port" json:"login_callback_port"`
 	// LoginCallbackBase replaces the callback URL host:port handed to the browser,
-	// for example "http://192.168.1.10:40605". Leave empty for the loopback URL.
+	// for example "http://192.168.1.10:40605". Leave empty for the recommended
+	// localhost + manual relay flow; no Docker/public port mapping is required.
 	LoginCallbackBase string `yaml:"login_callback_base" json:"login_callback_base"`
 	// Heartbeat enables the upstream SSE heartbeat comment frames.
 	Heartbeat bool `yaml:"heartbeat" json:"heartbeat"`
@@ -204,10 +209,12 @@ type ModelConfig struct {
 func defaultConfig() *Config {
 	return &Config{
 		BaseURL:               "https://snap-access.cn-north-4.myhuaweicloud.com",
-		WebLoginBase:          "https://devcloud.cn-north-4.huaweicloud.com",
+		WebLoginBase:          "https://codearts.huaweicloud.com",
+		OAuthTokenURL:         codeArtsOAuthTokenURL,
+		OAuthIdentityURL:      codeArtsOAuthIdentityURL,
 		APIMode:               "agent",
 		PluginName:            "snap_vscode",
-		PluginVersion:         "26.3.6",
+		PluginVersion:         "26.9.101",
 		Language:              "en-us",
 		AgentID:               "Pangu_Doer_in_CodeArts",
 		DefaultModelID:        "PanguDev_COM_QC2",
@@ -265,6 +272,8 @@ func (c *Config) normalize() {
 	}
 	c.BaseURL = strings.TrimRight(strings.TrimSpace(c.BaseURL), "/")
 	c.WebLoginBase = strings.TrimRight(strings.TrimSpace(c.WebLoginBase), "/")
+	c.OAuthTokenURL = strings.TrimSpace(c.OAuthTokenURL)
+	c.OAuthIdentityURL = strings.TrimSpace(c.OAuthIdentityURL)
 	c.PluginName = strings.TrimSpace(c.PluginName)
 	c.PluginVersion = strings.TrimSpace(c.PluginVersion)
 	c.ClientVersion = strings.TrimSpace(c.ClientVersion)
@@ -281,6 +290,12 @@ func (c *Config) normalize() {
 	}
 	if c.WebLoginBase == "" {
 		c.WebLoginBase = c.IDEBaseURL
+	}
+	if c.OAuthTokenURL == "" {
+		c.OAuthTokenURL = codeArtsOAuthTokenURL
+	}
+	if c.OAuthIdentityURL == "" {
+		c.OAuthIdentityURL = codeArtsOAuthIdentityURL
 	}
 	if c.ClientVersion == "" && c.PluginVersion != "" {
 		c.ClientVersion = "Vscode_" + c.PluginVersion

@@ -23,17 +23,16 @@ import (
 // the plugin on every executor call.
 const storageKey = "codearts_provider_credential"
 
-// loginSession tracks one interactive browser login flow. The official IDE
-// extension starts a loopback HTTP server, opens the CodeArts web console with
-// a ticket id and a callback URL, then polls the ticket endpoint with the
-// secret the console echoes back to that callback. The plugin reproduces that
-// flow, including the extension's tolerance for a callback that carries no
-// secret: the console binds the secret to the ticket, and the ticket exchange is
-// what actually proves the login.
+// loginSession tracks one interactive browser login flow. CodeArts Agent
+// 26.9.x uses OAuth authorization-code + PKCE and binds the resulting token to
+// a DPoP proof key. The legacy ticket/secret fields remain so credentials made
+// by the 26.3.x flow can still be completed while operators migrate.
 type loginSession struct {
-	state    string
-	ticketID string
-	secret   string
+	state             string
+	ticketID          string
+	secret            string
+	authorizationCode string
+	oauthContext      *oauthLoginContext
 
 	mu       sync.Mutex
 	listener net.Listener
@@ -120,15 +119,21 @@ func authParse(request []byte) ([]byte, error) {
 	})
 }
 
-// authLoginStart begins the interactive browser login. It binds a loopback
-// listener, builds the CodeArts web console redirect URL carrying the ticket id
-// and the callback URL, and returns the URL for the user to open.
+// authLoginStart begins the OAuth PKCE browser login used by CodeArts Agent
+// 26.9.x. A loopback listener supports a local CPA deployment. When CPA runs on
+// another machine the browser will fail to open its own localhost callback; the
+// operator copies that full URL back into the authenticated management panel,
+// which supplies the authorization code to this same session.
 func authLoginStart(request []byte) ([]byte, error) {
 	var req pluginapi.AuthLoginStartRequest
 	if errUnmarshal := json.Unmarshal(request, &req); errUnmarshal != nil {
 		return nil, fmt.Errorf("decode login start request: %w", errUnmarshal)
 	}
 	cfg := config()
+	oauthContext, errOAuth := newOAuthLoginContext()
+	if errOAuth != nil {
+		return failEnvelope("login_unavailable", errOAuth.Error(), http.StatusInternalServerError)
+	}
 
 	bindAddr := fmt.Sprintf("%s:%d", cfg.LoginCallbackBind, cfg.LoginCallbackPort)
 	listener, errListen := net.Listen("tcp", bindAddr)
@@ -146,11 +151,9 @@ func authLoginStart(request []byte) ([]byte, error) {
 		return failEnvelope("login_unavailable", "failed to bind the browser callback listener on "+bindAddr+": "+errListen.Error(), http.StatusInternalServerError)
 	}
 	port := listener.Addr().(*net.TCPAddr).Port
-	callbackURL := fmt.Sprintf("http://127.0.0.1:%d/authentication", port)
+	callbackURL := fmt.Sprintf("http://127.0.0.1:%d%s", port, codeArtsOAuthCallback)
 	if cfg.LoginCallbackBase != "" {
-		// An advertised base is what makes a containerised gateway reachable:
-		// the browser is sent to the published address instead of the loopback.
-		callbackURL = cfg.LoginCallbackBase + "/authentication"
+		callbackURL = cfg.LoginCallbackBase + codeArtsOAuthCallback
 	}
 
 	ticketID := randomUUIDv4()
@@ -158,15 +161,19 @@ func authLoginStart(request []byte) ([]byte, error) {
 	ctx, cancel := context.WithTimeout(context.Background(), cfg.loginTimeout())
 
 	session := &loginSession{
-		state:       state,
-		ticketID:    ticketID,
-		cancel:      cancel,
-		listener:    listener,
-		callbackURL: callbackURL,
-		bindAddr:    listener.Addr().String(),
-		expires:     time.Now().Add(cfg.loginTimeout()),
+		state:        state,
+		ticketID:     ticketID,
+		cancel:       cancel,
+		listener:     listener,
+		callbackURL:  callbackURL,
+		bindAddr:     listener.Addr().String(),
+		expires:      time.Now().Add(cfg.loginTimeout()),
+		oauthContext: oauthContext,
 	}
 	mux := http.NewServeMux()
+	mux.HandleFunc(codeArtsOAuthCallback, session.handleCallback)
+	// Keep the old callback path for a browser that was already open during an
+	// upgrade. New authorization URLs never advertise it.
 	mux.HandleFunc("/authentication", session.handleCallback)
 	server := &http.Server{
 		Handler:           mux,
@@ -187,19 +194,19 @@ func authLoginStart(request []byte) ([]byte, error) {
 	evictLoginSessionsLocked()
 	loginMu.Unlock()
 
-	// Poll the ticket endpoint in the background so the flow completes as soon
-	// as the browser hands the secret back to our loopback listener.
+	// Exchange the authorization code as soon as either the loopback server or
+	// the management panel supplies it.
 	go session.poll(ctx)
 
-	loginURL := buildLoginURL(cfg, ticketID, callbackURL)
-	logInfo("started browser login", map[string]any{"port": port})
+	loginURL := buildLoginURL(cfg, ticketID, callbackURL, oauthContext)
+	logInfo("started OAuth PKCE browser login", map[string]any{"port": port})
 
 	return okEnvelope(pluginapi.AuthLoginStartResponse{
 		Provider:  providerID,
 		URL:       loginURL,
 		State:     state,
 		ExpiresAt: session.expires,
-		Metadata:  map[string]any{"callback_url": callbackURL, "ticket_id": ticketID},
+		Metadata:  map[string]any{"callback_url": callbackURL, "ticket_id": ticketID, "flow": "oauth_pkce"},
 	})
 }
 
@@ -280,7 +287,7 @@ func authLoginPoll(request []byte) ([]byte, error) {
 	}
 	if cred == nil {
 		// Pending, but never silent: the message says whether the plugin is still
-		// waiting for the browser or already exchanging the ticket.
+		// waiting for the browser or already exchanging the authorization code.
 		return okEnvelope(pluginapi.AuthLoginPollResponse{
 			Status:  pluginapi.AuthLoginStatusPending,
 			Message: session.progress(),
@@ -342,6 +349,19 @@ func authRefresh(request []byte) ([]byte, error) {
 		return failEnvelope("invalid_credential", "stored credential is incomplete", http.StatusUnauthorized)
 	}
 	cfg := config()
+
+	// CodeArts Agent 26.9.x refreshes through the STS OAuth endpoint using the
+	// stored refresh token, PKCE verifier and DPoP private key. Do this before
+	// the legacy token/renew path so newly issued credentials never fall back to
+	// the retired ticket-era protocol.
+	if strings.TrimSpace(cred.RefreshToken) != "" || cred.OAuthContext != nil {
+		updated, status, _, errRefresh := oauthRefreshCredential(cfg, cred)
+		if errRefresh != nil {
+			return failEnvelope("refresh_rejected", errRefresh.Error(), httpStatusFor(status))
+		}
+		logInfo("refreshed OAuth upstream credential", map[string]any{"expires_at": updated.ExpiresAt})
+		return authRefreshEnvelope(updated)
+	}
 
 	// A long-lived AK/SK pair has nothing to renew: the endpoint requires a
 	// security token. Hand the credential back unchanged rather than failing.
@@ -412,12 +432,18 @@ func authRefresh(request []byte) ([]byte, error) {
 	}
 	updated.LoginType = firstNonEmptyString(updated.LoginType, cred.LoginType, "WEB")
 
-	storage, errMarshal2 := json.Marshal(map[string]any{storageKey: updated})
-	if errMarshal2 != nil {
-		return nil, errMarshal2
-	}
 	logInfo("refreshed upstream credential", map[string]any{"expires_at": updated.ExpiresAt})
+	return authRefreshEnvelope(&updated)
+}
 
+func authRefreshEnvelope(updated *credential) ([]byte, error) {
+	if updated == nil || !updated.valid() {
+		return failEnvelope("refresh_failed", "refreshed credential is incomplete", http.StatusBadGateway)
+	}
+	storage, errMarshal := json.Marshal(map[string]any{storageKey: *updated})
+	if errMarshal != nil {
+		return nil, errMarshal
+	}
 	return okEnvelope(pluginapi.AuthRefreshResponse{
 		Auth: pluginapi.AuthData{
 			Provider:    providerID,
@@ -430,9 +456,9 @@ func authRefresh(request []byte) ([]byte, error) {
 				"domain_id":  updated.DomainID,
 				"login_type": updated.LoginType,
 			},
-			NextRefreshAfter: refreshDeadline(&updated),
+			NextRefreshAfter: refreshDeadline(updated),
 		},
-		NextRefreshAfter: refreshDeadline(&updated),
+		NextRefreshAfter: refreshDeadline(updated),
 	})
 }
 
@@ -440,17 +466,9 @@ func authRefresh(request []byte) ([]byte, error) {
 // login session plumbing
 // ---------------------------------------------------------------------------
 
-// handleCallback receives the browser redirect from the CodeArts console.
-//
-// It deliberately mirrors the official extension's callback server rather than
-// validating the request: that server answers every request with the same
-// success body, resolves with whatever query the browser sent, and closes the
-// listener afterwards. The extension then reads `secret` and falls back to an
-// empty string, because the secret is bound to the ticket by the console and it
-// is the ticket exchange - not this callback - that establishes the login.
-// Rejecting a secret-less or non-GET callback (as an earlier version of this
-// plugin did) leaves the flow waiting forever for a second callback that never
-// comes, which is exactly the "sign-in hangs" report this fixes.
+// handleCallback accepts the new OAuth authorization code and, for compatibility,
+// the old ticket-flow secret. A remote CPA receives the same URL through the
+// authenticated management panel rather than through this loopback listener.
 func (s *loginSession) handleCallback(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Access-Control-Allow-Origin", "*")
 	w.Header().Set("Access-Control-Allow-Methods", "GET, OPTIONS")
@@ -465,10 +483,17 @@ func (s *loginSession) handleCallback(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	code := strings.TrimSpace(r.URL.Query().Get("code"))
 	secret := callbackSecret(r)
+	if code == "" && secret == "" && r.URL.Path == codeArtsOAuthCallback {
+		w.WriteHeader(http.StatusBadRequest)
+		_, _ = w.Write([]byte("callback URL is missing authorization code"))
+		return
+	}
 	s.mu.Lock()
 	first := !s.received
 	if first {
+		s.authorizationCode = code
 		s.secret = secret
 		s.received = true
 		s.callbackAt = time.Now()
@@ -476,17 +501,16 @@ func (s *loginSession) handleCallback(w http.ResponseWriter, r *http.Request) {
 	s.mu.Unlock()
 
 	if first {
-		if secret == "" {
-			logWarn("the browser callback carried no secret; exchanging the ticket anyway", map[string]any{"state": s.state})
+		if code != "" {
+			logInfo("received OAuth authorization callback", map[string]any{"state": s.state})
+		} else if secret == "" {
+			logWarn("the legacy browser callback carried no secret; exchanging the ticket anyway", map[string]any{"state": s.state})
 		}
-		// The extension stops accepting callbacks once it has one; a second
-		// browser hit must not be able to replace the bound secret.
-		s.closeListener()
 	}
 
-	w.Header().Set("Content-Type", "application/json")
+	w.Header().Set("Content-Type", "text/html; charset=utf-8")
 	w.WriteHeader(http.StatusOK)
-	_, _ = w.Write([]byte(`{"status":"success","message":"Secret received"}`))
+	_, _ = w.Write([]byte(`<!doctype html><meta charset="utf-8"><title>CodeArts</title><p>授权信息已收到，请返回 CPA 等待账号保存。</p>`))
 }
 
 // callbackSecret extracts the secret from the callback request. The console
@@ -554,9 +578,9 @@ func (s *loginSession) progressLocked() string {
 	case s.err != "":
 		return s.err
 	case !s.received:
-		return "等待浏览器完成授权回调（" + s.callbackURL + "）。"
+		return "等待浏览器完成 OAuth 授权。远程 CPA 请把浏览器最终的 localhost 回调地址完整粘贴到面板。"
 	case s.attempts == 0:
-		return "已收到浏览器回调，正在换取凭证…"
+		return "已收到浏览器回调，正在通过 STS 换取凭证…"
 	case s.lastStatus == http.StatusOK:
 		return "已收到回调，凭证尚未就绪，正在重试…"
 	case s.lastMessage != "":
@@ -566,13 +590,12 @@ func (s *loginSession) progressLocked() string {
 	}
 }
 
-// poll exchanges the ticket for a credential once the secret arrives, retrying
-// until the login window closes. Every attempt is recorded so the management
-// API can explain a flow that is not progressing instead of leaving it silent.
+// poll exchanges the OAuth authorization code once it arrives. The legacy
+// ticket exchange remains available only for an old callback carrying secret.
 func (s *loginSession) poll(ctx context.Context) {
 	defer s.stop()
 	cfg := config()
-	ticker := time.NewTicker(2 * time.Second)
+	ticker := time.NewTicker(250 * time.Millisecond)
 	defer ticker.Stop()
 	for {
 		select {
@@ -580,8 +603,7 @@ func (s *loginSession) poll(ctx context.Context) {
 			s.mu.Lock()
 			if s.credential == nil && s.err == "" {
 				if !s.received {
-					s.err = "登录超时：浏览器没有把授权结果回传到 " + s.callbackURL +
-						"。如果 CPA 运行在容器或远程主机上，请在面板中粘贴浏览器地址栏里的回调地址。"
+					s.err = "登录超时：未收到 OAuth 回调。如果 CPA 在远程服务器上，请把浏览器最终的 localhost /oauth/callback 地址完整粘贴到面板。"
 				} else if s.lastMessage != "" {
 					s.err = fmt.Sprintf("登录超时：换取凭证一直返回 HTTP %d（%s）。", s.lastStatus, s.lastMessage)
 				} else {
@@ -595,11 +617,22 @@ func (s *loginSession) poll(ctx context.Context) {
 
 		s.mu.Lock()
 		received := s.received
+		code := s.authorizationCode
 		s.mu.Unlock()
 		if !received {
 			continue
 		}
-		cred, retry, status, message, errPoll := s.exchangeTicket(cfg)
+		var cred *credential
+		var retry bool
+		var status int
+		var message string
+		var errPoll error
+		if code != "" {
+			cred, status, message, errPoll = oauthExchangeAuthorizationCode(cfg, code, s.callbackURL, s.oauthContext)
+			retry = false
+		} else {
+			cred, retry, status, message, errPoll = s.exchangeTicket(cfg)
+		}
 		s.mu.Lock()
 		s.attempts++
 		s.lastStatus = status
@@ -745,6 +778,18 @@ func credentialFromStorage(storage []byte) (*credential, error) {
 		}
 		document = nested
 	}
+	var oauthContext *oauthLoginContext
+	if rawContext, ok := document["oauth_context"]; ok && rawContext != nil {
+		encoded, errMarshal := json.Marshal(rawContext)
+		if errMarshal != nil {
+			return nil, fmt.Errorf("encode OAuth context: %w", errMarshal)
+		}
+		var parsed oauthLoginContext
+		if errUnmarshal := json.Unmarshal(encoded, &parsed); errUnmarshal != nil {
+			return nil, fmt.Errorf("decode OAuth context: %w", errUnmarshal)
+		}
+		oauthContext = &parsed
+	}
 	return &credential{
 		AccessKeyID:     firstString(document, "access_key_id", "accessKeyId", "ak"),
 		SecretAccessKey: firstString(document, "secret_access_key", "secretAccessKey", "sk"),
@@ -754,6 +799,8 @@ func credentialFromStorage(storage []byte) (*credential, error) {
 		UserID:          firstString(document, "user_id", "userId"),
 		ExpiresAt:       firstString(document, "expires_at", "expiresAt"),
 		LoginType:       firstString(document, "login_type", "loginType"),
+		RefreshToken:    firstString(document, "refresh_token", "refreshToken"),
+		OAuthContext:    oauthContext,
 	}, nil
 }
 
@@ -780,6 +827,20 @@ func refreshDeadline(cred *credential) time.Time {
 	}
 	if cred.ExpiresAt != "" {
 		if parsed, errParse := time.Parse(time.RFC3339, cred.ExpiresAt); errParse == nil {
+			if cred.RefreshToken != "" && cred.OAuthContext != nil {
+				remaining := time.Until(parsed)
+				if remaining <= 0 {
+					return time.Now().Add(time.Minute)
+				}
+				delay := remaining / 2
+				if delay < 30*time.Minute {
+					delay = 30 * time.Minute
+				}
+				if delay > 2*time.Hour {
+					delay = 2 * time.Hour
+				}
+				return time.Now().Add(delay)
+			}
 			if target := parsed.Add(-time.Hour); target.After(time.Now()) {
 				return target
 			}
@@ -789,29 +850,51 @@ func refreshDeadline(cred *credential) time.Time {
 	return time.Now().Add(time.Hour)
 }
 
-// buildLoginURL mirrors the URL the official extension opens:
-//
-//	${codeartsWebUrl}/doer/redirect?ticket_id=..&IdeaType=vscode&auth_callback_url=..&plugin-name=..&plugin-version=..
-//
-// Keep the parameter order and literal callback URL byte-for-byte compatible
-// with the extension. The CodeArts redirect page does not consistently treat a
-// percent-encoded auth_callback_url as equivalent: in the authenticated flow it
-// can reject the otherwise valid UUID with "invalid ticketId".
-func buildLoginURL(cfg *Config, ticketID, callbackURL string) string {
+// buildLoginURL mirrors CodeArts Agent 26.9.x WebLoginStrategy.openAuthorizeUrl.
+func buildLoginURL(cfg *Config, ticketID, callbackURL string, context *oauthLoginContext) string {
 	base := cfg.WebLoginBase
 	if base == "" {
 		base = cfg.IDEBaseURL
 	}
 	if base == "" {
-		base = "https://devcloud.cn-north-4.huaweicloud.com"
+		base = "https://codearts.huaweicloud.com"
 	}
-	base = strings.TrimRight(base, "/") + "/doer/redirect"
-	return base +
-		"?ticket_id=" + ticketID +
-		"&IdeaType=vscode" +
-		"&auth_callback_url=" + callbackURL +
-		"&plugin-name=" + cfg.PluginName +
-		"&plugin-version=" + cfg.PluginVersion
+	base = strings.TrimRight(base, "/") + "/portal/authorize"
+	if context == nil {
+		return base
+	}
+	callback, _ := url.Parse(callbackURL)
+	locale := "en"
+	if strings.HasPrefix(strings.ToLower(cfg.Language), "zh") {
+		locale = "zh-cn"
+	}
+	params := [][2]string{
+		{"theme", "2"},
+		{"locale", locale},
+		{"uri_scheme", codeArtsOAuthURIScheme},
+		{"client_id", codeArtsOAuthClientID},
+		{"port", callback.Port()},
+		{"code_challenge", context.PKCEPair.CodeChallenge},
+		{"code_challenge_method", context.PKCEPair.CodeChallengeMethod},
+		{"ticket_id", ticketID},
+		{"auth_callback_url", callbackURL},
+		{"plugin-name", cfg.PluginName},
+		{"plugin-version", cfg.PluginVersion},
+	}
+	parts := make([]string, 0, len(params))
+	for _, pair := range params {
+		parts = append(parts, pair[0]+"="+encodeURIComponent(pair[1]))
+	}
+	return base + "?" + strings.Join(parts, "&")
+}
+
+func encodeURIComponent(value string) string {
+	encoded := url.QueryEscape(value)
+	encoded = strings.ReplaceAll(encoded, "+", "%20")
+	for _, pair := range [][2]string{{"%21", "!"}, {"%27", "'"}, {"%28", "("}, {"%29", ")"}, {"%2A", "*"}} {
+		encoded = strings.ReplaceAll(encoded, pair[0], pair[1])
+	}
+	return encoded
 }
 
 func normalizeProvider(provider string) string {

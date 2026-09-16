@@ -118,7 +118,7 @@ const panelTemplate = `<!doctype html>
     <ol class="steps">
       <li>点击「开始授权」，下方会出现登录链接。</li>
       <li>打开链接，在 CodeArts 控制台完成登录授权。</li>
-      <li>授权后浏览器会跳到本机回调地址，插件自动换取凭证并写入 CPA。</li>
+      <li>本机 CPA 会自动接收回调；远程 CPA 请复制浏览器最终的 localhost 地址并在下方提交。</li>
     </ol>
     <div class="status" id="loginStatus">尚未开始。请先填写管理密钥。</div>
     <div id="loginLinkBox" hidden style="margin-top:8px">
@@ -127,10 +127,10 @@ const panelTemplate = `<!doctype html>
 
     <details>
       <summary>授权页面打不开 127.0.0.1（CPA 在容器 / 远程服务器上）</summary>
-      <p>浏览器的回调地址指向插件监听的 127.0.0.1，容器或远程主机上的 CPA 收不到它。授权完成后浏览器会停在一个无法打开的 <span class="mono">http://127.0.0.1:端口/authentication?...</span> 页面，把地址栏里的完整地址复制下来，粘贴到下面完成授权。</p>
-      <textarea id="callbackURL" autocomplete="off" placeholder="http://127.0.0.1:40000/authentication?secret=..."></textarea>
+      <p>OAuth 完成后会跳到一个无法打开的 <span class="mono">http://127.0.0.1:端口/oauth/callback?code=...&amp;state=...</span> 页面。这是远程部署的预期行为：把地址栏里的完整地址复制下来，粘贴到下面，CPA 会用其中的一次性 code 换取并保存凭证。</p>
+      <textarea id="callbackURL" autocomplete="off" placeholder="http://127.0.0.1:40000/oauth/callback?code=...&state=..."></textarea>
       <div style="margin-top:8px"><button id="submitCallback">提交回调地址，完成授权</button></div>
-      <p class="sub" style="margin:8px 0 0">长期方案：在配置里设置 <span class="mono">login_callback_port</span> 固定端口、<span class="mono">login_callback_base</span> 为浏览器可访问的地址，并把该端口映射到容器。</p>
+      <p class="sub" style="margin:8px 0 0">authorization code 为一次性凭证，请立即提交且不要分享；无需把回调端口映射到公网。</p>
     </details>
   </div>
 
@@ -327,7 +327,7 @@ const panelTemplate = `<!doctype html>
         loginState = ""; return;
       }
       // "wait" carries no detail, so the plugin's own poll route explains which
-      // stage the flow is in (waiting for the browser, or exchanging the ticket).
+      // stage the flow is in (waiting for the browser, or exchanging the code).
       call(BASE + "/login/status?state=" + encodeURIComponent(loginState)).then(function (d) {
         if (d && d.message) setLoginStatus(d.message);
       }).catch(function () {});

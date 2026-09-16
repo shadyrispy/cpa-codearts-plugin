@@ -12,7 +12,7 @@ plugin C ABI.
 
 | Capability | Purpose |
 | --- | --- |
-| `auth_provider` | Browser-ticket sign-in plus AK/SK renewal, matching the extension's own login flow. |
+| `auth_provider` | OAuth authorization-code sign-in with PKCE + DPoP and refresh-token renewal, matching CodeArts Agent 26.9.101. |
 | `model_provider` | Advertises the configured model list, and the per-account models discovered from the Agent Center. |
 | `executor` | Transports chat completions to the CodeArts gateway, streaming and non-streaming, and serves OpenAI Chat Completions, Anthropic Messages and OpenAI Responses clients. |
 | `quota_provider` | Serves the subscription/quota snapshot in CLIProxyAPI's normalised quota shape. |
@@ -201,46 +201,37 @@ Responses clients (`/v1/responses`), with tool calls and usage preserved.
    ```bash
    curl -H "Authorization: Bearer $ADMIN_KEY" \
      http://localhost:8317/v0/management/codearts-provider-auth-url
-   # -> {"status":"ok","url":"https://devcloud.../doer/redirect?ticket_id=...","state":"..."}
+   # -> {"status":"ok","url":"https://codearts.huaweicloud.com/portal/authorize?...","state":"..."}
 
    # follow the flow while it runs (reports which stage it is in)
    curl -H "Authorization: Bearer $ADMIN_KEY" \
      "http://localhost:8317/v0/management/codearts-provider/login/status?state=$STATE"
    ```
 
-   Open the returned `url`, authorize in the CodeArts console, and the browser
-   reports the result back to the plugin's listener; the plugin then exchanges
-   the ticket and CLIProxyAPI stores the credential. The panel polls the same
-   state and shows the account when it lands.
+   Open the returned `url` and authorize in CodeArts. The plugin exchanges the
+   one-time authorization code at Huawei STS using the same PKCE verifier and
+   ES256 DPoP key as the official extension, then CLIProxyAPI stores the
+   temporary AK/SK, security token, refresh token and refresh context.
 
    **When the gateway is not on the browser's machine** (a container or a remote
-   server), the browser cannot reach the plugin's listener. Two ways to finish:
-
-   - *Quickest*: after authorizing, the browser stops on an unreachable
-     `http://127.0.0.1:PORT/authentication?...` page. Copy that address from the
-     address bar and paste it into **提交回调地址，完成授权** in the panel (or POST
-     it), which completes the same flow:
+   server), the browser cannot reach the plugin's listener. This is expected:
+   after authorizing, the browser stops on an unreachable
+   `http://127.0.0.1:PORT/oauth/callback?code=...` page. Copy the complete address
+   from the address bar and paste it into **提交回调地址，完成授权** in the panel
+   (or POST it), which completes the same flow:
 
      ```bash
      curl -X POST -H "Authorization: Bearer $ADMIN_KEY" -H "Content-Type: application/json" \
-       -d '{"state":"<state>","callback_url":"<the full http://127.0.0.1:PORT/authentication?... URL>"}' \
+       -d '{"state":"<state>","callback_url":"<the full http://127.0.0.1:PORT/oauth/callback?code=... URL>"}' \
        http://localhost:8317/v0/management/codearts-provider/login/callback
      ```
 
-   - *Permanent fix*: pin and publish the callback port, and advertise an address
-     the browser can reach:
-
-     ```yaml
-     login_callback_port: 40605        # docker run -p 40605:40605
-     login_callback_bind: "0.0.0.0"
-     login_callback_base: "http://192.168.1.10:40605"
-     ```
-
-   The callback listener accepts whatever the console sends: any HTTP method, and
-   a missing `secret` (the console binds the secret to the ticket, and the ticket
-   exchange is what proves the login). This mirrors the extension's own callback
-   server. Once a callback has been seen the listener closes, so a later request
-   cannot replace the bound secret.
+   Keep `login_callback_bind: "127.0.0.1"`, `login_callback_port: 0`, and
+   `login_callback_base: ""` for this remote/Docker workflow. The localhost URL
+   is only the OAuth redirect identity; the browser does not need to reach the
+   CPA host. Do not add a public port, reverse-proxy callback, or Nginx route.
+   The authorization code is single-use, so submit it immediately and do not
+   share it.
 
    An AK/SK pair you already hold can also be imported as a credential file
    instead of authorizing in a browser. The file name is up to you; the
@@ -435,7 +426,7 @@ All routes live under `/v0/management/codearts-provider/` and require the admin 
 | Method | Path | Purpose |
 | --- | --- | --- |
 | `GET` | `/accounts` | Accounts with subscription, quota percentages and credential expiry. |
-| `GET` | `/login/status` | Stage of one sign-in flow: waiting for the browser callback, or exchanging the ticket (with the last exchange status). |
+| `GET` | `/login/status` | Stage of one OAuth sign-in flow: waiting for the browser callback, or exchanging the authorization code. |
 | `POST` | `/login/callback` | Relay the browser callback URL for a gateway the browser cannot reach (body: `{state, callback_url}`). |
 | `GET` | `/quota` | Normalised quota view; `?auth_index=` narrows to one account. |
 | `POST` | `/quota/refresh` | Force an upstream quota read (body: `{auth_index}`, omit for all). |
@@ -498,7 +489,7 @@ real traffic through code that may not handle it.
 
 | Capability | Status | What it does here |
 | --- | --- | --- |
-| `auth_provider` | yes | Browser-ticket sign-in + AK/SK renewal. |
+| `auth_provider` | yes | OAuth authorization-code sign-in with PKCE + DPoP, refresh-token renewal, and legacy ticket compatibility. |
 | `model_provider` | yes | Advertises the configured model list. |
 | `executor` | yes | Chat completions, streaming and non-streaming, both upstream protocols. |
 | `quota_provider` | yes | Subscription/quota view in the host's normalised quota shape. |
@@ -579,9 +570,11 @@ example.
 | --- | --- | --- |
 | `base_url` | `https://snap-access.cn-north-4.myhuaweicloud.com` | Regional CodeArts Doer gateway. |
 | `api_mode` | `agent` | `agent` (`/api/v2/chat/completions`) or `native` (`/v1/chat/chat`). |
-| `web_login_base` | `https://devcloud.cn-north-4.huaweicloud.com` | Console used to start browser sign-in. |
+| `web_login_base` | `https://codearts.huaweicloud.com` | Portal used to start OAuth browser sign-in. |
+| `oauth_token_url` | Huawei STS `/v1/oauth2/tokens` | OAuth authorization-code and refresh-token exchange endpoint. |
+| `oauth_identity_url` | Huawei STS `/v5/caller-identity` | Signed identity fallback when the refresh token has no usable profile. |
 | `plugin_name` | `snap_vscode` | Sent as the `plugin-name` header. |
-| `plugin_version` | `26.3.6` | Sent as `plugin-version`. |
+| `plugin_version` | `26.9.101` | Sent as `plugin-version`. |
 | `client_version` | `Vscode_<plugin_version>` | Sent as `client_version`. |
 | `language` | `en-us` | Sent as `X-Language`. |
 | `agent_id` | `Pangu_Doer_in_CodeArts` | Agent used by the native protocol. |
@@ -595,9 +588,9 @@ example.
 | `is_confidential` | `false` | Send the `is_confidential` header. |
 | `request_timeout_seconds` | `600` | Per-request upstream timeout. |
 | `login_timeout_seconds` | `300` | Browser sign-in window. |
-| `login_callback_bind` | `127.0.0.1` | Interface the browser-callback listener binds to; set `0.0.0.0` when the browser is not on this host. |
-| `login_callback_port` | `0` (ephemeral) | Pin the callback port so a container can publish it. |
-| `login_callback_base` | empty | Address advertised to the browser instead of the loopback URL, e.g. `http://192.168.1.10:40605`. |
+| `login_callback_bind` | `127.0.0.1` | Short-lived local listener. Keep the default for remote/Docker CPA and relay the final URL through the panel. |
+| `login_callback_port` | `0` (ephemeral) | Local callback port. No Docker/public mapping is needed for manual relay. |
+| `login_callback_base` | empty | Optional advanced override; leave empty for the recommended localhost flow. |
 | `extra_headers` | `{}` | Extra signed headers. |
 | `insist_missing_credentials` | `false` | Debug-only: send unsigned requests. |
 | `schedule.enabled` | `false` | Start the cron scheduler. |
@@ -831,21 +824,18 @@ Rebuild the library before running it: the test loads the file named by
   fetch error per account.
 - **The agent ID and agent UUIDs are build-specific.** Values such as
   `Pangu_Doer_in_CodeArts` and the hardcoded agent UUIDs come from this VSIX
-  version (26.3.6) and may change upstream.
-- **The browser callback needs a listener the browser can reach.** The plugin
-  binds `127.0.0.1:0` (configurable) and hands that URL to the console, exactly
-  as the extension does. When the browser runs elsewhere, either relay the
-  callback URL the browser stops on (panel or `POST /login/callback`), or pin
-  `login_callback_port` / `login_callback_bind` / `login_callback_base` and
-  publish that port so the redirect completes on its own. The listener answers
-  any method and tolerates a missing `secret`, mirroring the extension's own
-  callback server, and it stops accepting callbacks once one has been seen. Each
-  flow holds a listener and two goroutines, so at most 8 concurrent flows are
-  kept; starting a 9th drops the flow closest to expiry.
+  version (26.9.101) and may change upstream.
+- **Remote/Docker login intentionally finishes on browser localhost.** The plugin
+  advertises `127.0.0.1:0`, matching the official extension's redirect identity.
+  When CPA runs elsewhere, copy the browser's final
+  `/oauth/callback?code=...` URL into the panel or `POST /login/callback`; CPA
+  then performs the PKCE + DPoP token exchange and persists the refresh context.
+  No callback port is exposed on the server. Each flow holds a listener and two
+  goroutines, so at most 8 concurrent flows are kept; starting a 9th drops the
+  flow closest to expiry.
 - **A pending sign-in can always be explained.** `GET /login/status?state=` (and
   the panel) reports whether the plugin is still waiting for the browser callback
-  or already exchanging the ticket, including the last HTTP status and body
-  excerpt from the exchange, and the flow keeps retrying for the whole login
-  window instead of aborting on the first rejection.
+  or already exchanging the authorization code, including the last HTTP status
+  and a bounded error excerpt from the exchange.
 - **Resource pages are unauthenticated by design.** The status page therefore
   never exposes credential material.

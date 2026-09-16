@@ -3,7 +3,7 @@
   "name": "CodeArts",
   "description": "Huawei CodeArts provider with browser sign-in, per-account model discovery, OpenAI/Anthropic/Responses compatibility, quota management and a dashboard.",
   "author": "zyxzjyzjj",
-  "version": "0.1.3",
+  "version": "0.1.4",
   "repository": "https://github.com/zyxzjyzjj/cpa-codearts-plugin",
   "homepage": "https://github.com/zyxzjyzjj/cpa-codearts-plugin",
   "license": "MIT",

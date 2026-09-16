@@ -38,14 +38,16 @@ const (
 // credential is a resolved upstream credential: a temporary AK/SK pair plus the
 // security token and domain returned by the login flow.
 type credential struct {
-	AccessKeyID     string `json:"access_key_id"`
-	SecretAccessKey string `json:"secret_access_key"`
-	SecurityToken   string `json:"security_token"`
-	DomainID        string `json:"domain_id"`
-	UserName        string `json:"user_name"`
-	UserID          string `json:"user_id"`
-	ExpiresAt       string `json:"expires_at"`
-	LoginType       string `json:"login_type"`
+	AccessKeyID     string             `json:"access_key_id"`
+	SecretAccessKey string             `json:"secret_access_key"`
+	SecurityToken   string             `json:"security_token"`
+	DomainID        string             `json:"domain_id"`
+	UserName        string             `json:"user_name"`
+	UserID          string             `json:"user_id"`
+	ExpiresAt       string             `json:"expires_at"`
+	LoginType       string             `json:"login_type"`
+	RefreshToken    string             `json:"refresh_token,omitempty"`
+	OAuthContext    *oauthLoginContext `json:"oauth_context,omitempty"`
 }
 
 func (c *credential) valid() bool {

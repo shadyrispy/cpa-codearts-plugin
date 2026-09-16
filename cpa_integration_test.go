@@ -2,6 +2,7 @@ package main
 
 import (
 	"bytes"
+	"encoding/base64"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -29,19 +30,23 @@ func TestCPAIntegration(t *testing.T) {
 	}
 	var chatCalls, loginCalls atomic.Int32
 	var nextStatus atomic.Int32
+	profile, _ := json.Marshal(oauthIdentity{AccountID: "tenant", PrincipalID: "browser-id", PrincipalURN: "iam::tenant:browser-user"})
+	claims, _ := json.Marshal(map[string]string{"user_profile": base64.RawURLEncoding.EncodeToString(profile)})
+	refreshToken := "e30." + base64.RawURLEncoding.EncodeToString(claims) + ".signature"
 	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if r.URL.Path == "/snap-manager/v1/login/ticket" {
+		if r.URL.Path == "/v1/oauth2/tokens" {
 			loginCalls.Add(1)
-			// The console binds the secret to the ticket, so a callback that
-			// carried none still exchanges successfully; the fixture accepts both
-			// shapes to exercise that contract.
-			secret := r.URL.Query().Get("secret")
-			if (secret != "browser-secret" && secret != "") || r.URL.Query().Get("ticket_id") == "" {
-				http.Error(w, "wrong ticket exchange", 400)
+			if r.Header.Get("DPoP") == "" || r.Header.Get("Content-Type") != "application/x-www-form-urlencoded" {
+				http.Error(w, "missing OAuth proof", 400)
+				return
+			}
+			_ = r.ParseForm()
+			if r.Form.Get("client_id") != codeArtsOAuthClientID || r.Form.Get("code_verifier") == "" || (r.Form.Get("grant_type") != "authorization_code" && r.Form.Get("grant_type") != "refresh_token") {
+				http.Error(w, "wrong OAuth exchange", 400)
 				return
 			}
 			w.Header().Set("Content-Type", "application/json")
-			fmt.Fprint(w, `{"credential":{"access":"login-ak","secret":"login-sk","securitytoken":"login-sts","expires_at":"2030-01-01T00:00:00Z"},"domain_id":"tenant","user_name":"browser-user","user_id":"browser-id"}`)
+			fmt.Fprintf(w, `{"credentials":{"access_key_id":"login-ak","secret_access_key":"login-sk","security_token":"login-sts","expiration":"2030-01-01T00:00:00Z"},"refresh_token":%q}`, refreshToken)
 			return
 		}
 		if !strings.HasPrefix(r.Header.Get("Authorization"), "SDK-HMAC-SHA256 Access=") {
@@ -101,7 +106,7 @@ func TestCPAIntegration(t *testing.T) {
 	port := listener.Addr().(*net.TCPAddr).Port
 	listener.Close()
 	configPath := filepath.Join(dir, "config.yaml")
-	configYAML := fmt.Sprintf("host: 127.0.0.1\nport: %d\nauth-dir: %q\napi-keys: [audit-client]\nremote-management:\n  allow-remote: false\n  secret-key: audit-admin\n  disable-control-panel: true\nrequest-retry: 0\nplugins:\n  enabled: true\n  dir: %q\n  configs:\n    codearts-provider:\n      enabled: true\n      base_url: %q\n      discover_models: true\n", port, filepath.ToSlash(authDir), filepath.ToSlash(pluginDir), upstream.URL)
+	configYAML := fmt.Sprintf("host: 127.0.0.1\nport: %d\nauth-dir: %q\napi-keys: [audit-client]\nremote-management:\n  allow-remote: false\n  secret-key: audit-admin\n  disable-control-panel: true\nrequest-retry: 0\nplugins:\n  enabled: true\n  dir: %q\n  configs:\n    codearts-provider:\n      enabled: true\n      base_url: %q\n      oauth_token_url: %q\n      discover_models: true\n", port, filepath.ToSlash(authDir), filepath.ToSlash(pluginDir), upstream.URL, upstream.URL+"/v1/oauth2/tokens")
 	if err = os.WriteFile(configPath, []byte(configYAML), 0600); err != nil {
 		t.Fatal(err)
 	}
@@ -287,7 +292,8 @@ func TestCPAIntegration(t *testing.T) {
 		t.Fatal(err)
 	}
 	query := callback.Query()
-	query.Set("secret", "browser-secret")
+	query.Set("code", "browser-authorization-code")
+	query.Set("state", "portal-state")
 	callback.RawQuery = query.Encode()
 	// Use the protected callback submission also used by remote deployments.
 	callbackBody, _ := json.Marshal(map[string]string{"state": login.State, "callback_url": callback.String()})
@@ -312,10 +318,8 @@ func TestCPAIntegration(t *testing.T) {
 	}
 	t.Log("CPA browser login/poll persisted the subscription credential")
 
-	// Second flow: the browser hits the plugin's own callback listener with no
-	// secret, which is what the CodeArts console does when it only echoes the
-	// ticket. An earlier plugin version rejected that callback and the flow hung
-	// forever, so this is asserted against the real host, not just unit tests.
+	// Second flow: a local browser reaches the plugin's own OAuth callback
+	// listener directly instead of copying the URL through the management panel.
 	status, body = request("GET", "/v0/management/codearts-provider-auth-url", "")
 	if status != 200 {
 		t.Fatalf("second login start failed: %d %s", status, body)
@@ -338,18 +342,20 @@ func TestCPAIntegration(t *testing.T) {
 	if status != 200 || !bytes.Contains(body, []byte("浏览器")) {
 		t.Fatalf("pending login did not report its stage: %d %s", status, body)
 	}
-	// Snapshot the exchange counter before triggering the callback: the plugin
-	// polls the ticket endpoint on its own schedule and may complete the login
-	// before the assertions below run.
+	// Snapshot the exchange counter before triggering the one-time code.
 	beforeCalls := loginCalls.Load()
+	secondQuery := secondCallback.Query()
+	secondQuery.Set("code", "second-authorization-code")
+	secondQuery.Set("state", "second-portal-state")
+	secondCallback.RawQuery = secondQuery.Encode()
 	callbackResp, err := client.Get(secondCallback.String())
 	if err != nil {
 		t.Fatalf("browser-style callback could not reach the plugin listener: %v", err)
 	}
 	callbackPayload, _ := io.ReadAll(callbackResp.Body)
 	callbackResp.Body.Close()
-	if callbackResp.StatusCode != 200 || !bytes.Contains(callbackPayload, []byte("Secret received")) {
-		t.Fatalf("plugin rejected a secret-less browser callback: %d %s", callbackResp.StatusCode, callbackPayload)
+	if callbackResp.StatusCode != 200 || !bytes.Contains(callbackPayload, []byte("授权信息已收到")) {
+		t.Fatalf("plugin rejected the OAuth browser callback: %d %s", callbackResp.StatusCode, callbackPayload)
 	}
 	deadline = time.Now().Add(15 * time.Second)
 	for time.Now().Before(deadline) {
@@ -360,13 +366,13 @@ func TestCPAIntegration(t *testing.T) {
 		time.Sleep(300 * time.Millisecond)
 	}
 	if status != 200 || !bytes.Contains(body, []byte(`"status":"ok"`)) || loginCalls.Load() == beforeCalls {
-		t.Fatalf("secret-less browser login did not complete: %d %s", status, body)
+		t.Fatalf("direct OAuth browser login did not complete: %d %s", status, body)
 	}
 	status, body = request("GET", "/v0/management/codearts-provider/accounts", "")
 	if status != 200 || !bytes.Contains(body, []byte(`"login_type":"WEB"`)) {
 		t.Fatalf("browser login was not persisted as a WEB credential: %d %s", status, body)
 	}
-	t.Log("secret-less browser callback completed the login through the plugin listener")
+	t.Log("OAuth browser callback completed the login through the plugin listener")
 
 	// The dashboard is the operator-facing surface: it must be the Chinese,
 	// single-authorization page the extension's own flow implies, and it must not
