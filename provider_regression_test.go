@@ -97,7 +97,7 @@ func TestBuildLoginURLMatchesExtension(t *testing.T) {
 	want := "https://devcloud.cn-north-4.huaweicloud.com/doer/redirect" +
 		"?ticket_id=f4415ec8-6377-43f7-b909-dc90d177aa50" +
 		"&IdeaType=vscode" +
-		"&auth_callback_url=http%3A%2F%2F127.0.0.1%3A40605%2Fauthentication" +
+		"&auth_callback_url=http://127.0.0.1:40605/authentication" +
 		"&plugin-name=snap_vscode&plugin-version=26.3.6"
 	if got != want {
 		t.Fatalf("login URL mismatch:\n got %s\nwant %s", got, want)
@@ -110,7 +110,7 @@ func TestBuildLoginURLMatchesExtension(t *testing.T) {
 		t.Fatalf("wrong login path: %s", parsed.Path)
 	}
 	if callback := parsed.Query().Get("auth_callback_url"); callback != "http://127.0.0.1:40605/authentication" {
-		t.Fatalf("callback URL did not survive encoding: %q", callback)
+		t.Fatalf("callback URL did not survive the extension-compatible query: %q", callback)
 	}
 	if parsed.Query().Get("plugin-name") != "snap_vscode" || parsed.Query().Get("IdeaType") != "vscode" {
 		t.Fatalf("plugin identity or idea type changed: %s", got)

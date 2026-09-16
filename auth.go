@@ -793,10 +793,10 @@ func refreshDeadline(cred *credential) time.Time {
 //
 //	${codeartsWebUrl}/doer/redirect?ticket_id=..&IdeaType=vscode&auth_callback_url=..&plugin-name=..&plugin-version=..
 //
-// The parameters are sent in the extension's order. Values are percent-encoded
-// rather than interpolated literally as the extension does, so a callback URL
-// cannot inject further query parameters into the console URL; the console
-// accepts both forms (it re-serialises the URL after decoding it anyway).
+// Keep the parameter order and literal callback URL byte-for-byte compatible
+// with the extension. The CodeArts redirect page does not consistently treat a
+// percent-encoded auth_callback_url as equivalent: in the authenticated flow it
+// can reject the otherwise valid UUID with "invalid ticketId".
 func buildLoginURL(cfg *Config, ticketID, callbackURL string) string {
 	base := cfg.WebLoginBase
 	if base == "" {
@@ -806,27 +806,12 @@ func buildLoginURL(cfg *Config, ticketID, callbackURL string) string {
 		base = "https://devcloud.cn-north-4.huaweicloud.com"
 	}
 	base = strings.TrimRight(base, "/") + "/doer/redirect"
-	query := url.Values{}
-	query.Set("ticket_id", ticketID)
-	query.Set("IdeaType", "vscode")
-	query.Set("auth_callback_url", callbackURL)
-	query.Set("plugin-name", cfg.PluginName)
-	query.Set("plugin-version", cfg.PluginVersion)
-	return base + "?" + encodeLoginQuery(query)
-}
-
-// encodeLoginQuery renders the query in the extension's parameter order, with
-// %20 for spaces (the console's own URLs use %20 rather than "+").
-func encodeLoginQuery(values url.Values) string {
-	var parts []string
-	for _, key := range []string{"ticket_id", "IdeaType", "auth_callback_url", "plugin-name", "plugin-version"} {
-		value := values.Get(key)
-		if value == "" {
-			continue
-		}
-		parts = append(parts, key+"="+strings.ReplaceAll(url.QueryEscape(value), "+", "%20"))
-	}
-	return strings.Join(parts, "&")
+	return base +
+		"?ticket_id=" + ticketID +
+		"&IdeaType=vscode" +
+		"&auth_callback_url=" + callbackURL +
+		"&plugin-name=" + cfg.PluginName +
+		"&plugin-version=" + cfg.PluginVersion
 }
 
 func normalizeProvider(provider string) string {
