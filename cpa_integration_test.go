@@ -32,7 +32,11 @@ func TestCPAIntegration(t *testing.T) {
 	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.URL.Path == "/snap-manager/v1/login/ticket" {
 			loginCalls.Add(1)
-			if r.URL.Query().Get("secret") != "browser-secret" || r.URL.Query().Get("ticket_id") == "" {
+			// The console binds the secret to the ticket, so a callback that
+			// carried none still exchanges successfully; the fixture accepts both
+			// shapes to exercise that contract.
+			secret := r.URL.Query().Get("secret")
+			if (secret != "browser-secret" && secret != "") || r.URL.Query().Get("ticket_id") == "" {
 				http.Error(w, "wrong ticket exchange", 400)
 				return
 			}
@@ -307,6 +311,82 @@ func TestCPAIntegration(t *testing.T) {
 		t.Fatalf("CPA did not persist browser account: %d %s", status, body)
 	}
 	t.Log("CPA browser login/poll persisted the subscription credential")
+
+	// Second flow: the browser hits the plugin's own callback listener with no
+	// secret, which is what the CodeArts console does when it only echoes the
+	// ticket. An earlier plugin version rejected that callback and the flow hung
+	// forever, so this is asserted against the real host, not just unit tests.
+	status, body = request("GET", "/v0/management/codearts-provider-auth-url", "")
+	if status != 200 {
+		t.Fatalf("second login start failed: %d %s", status, body)
+	}
+	var secondLogin struct {
+		URL   string `json:"url"`
+		State string `json:"state"`
+	}
+	json.Unmarshal(body, &secondLogin)
+	secondURL, err := url.Parse(secondLogin.URL)
+	if err != nil {
+		t.Fatal(err)
+	}
+	secondCallback, err := url.Parse(secondURL.Query().Get("auth_callback_url"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	// The pending flow must explain itself rather than stay silent.
+	status, body = request("GET", "/v0/management/codearts-provider/login/status?state="+url.QueryEscape(secondLogin.State), "")
+	if status != 200 || !bytes.Contains(body, []byte("浏览器")) {
+		t.Fatalf("pending login did not report its stage: %d %s", status, body)
+	}
+	// Snapshot the exchange counter before triggering the callback: the plugin
+	// polls the ticket endpoint on its own schedule and may complete the login
+	// before the assertions below run.
+	beforeCalls := loginCalls.Load()
+	callbackResp, err := client.Get(secondCallback.String())
+	if err != nil {
+		t.Fatalf("browser-style callback could not reach the plugin listener: %v", err)
+	}
+	callbackPayload, _ := io.ReadAll(callbackResp.Body)
+	callbackResp.Body.Close()
+	if callbackResp.StatusCode != 200 || !bytes.Contains(callbackPayload, []byte("Secret received")) {
+		t.Fatalf("plugin rejected a secret-less browser callback: %d %s", callbackResp.StatusCode, callbackPayload)
+	}
+	deadline = time.Now().Add(15 * time.Second)
+	for time.Now().Before(deadline) {
+		status, body = request("GET", "/v0/management/get-auth-status?state="+url.QueryEscape(secondLogin.State), "")
+		if bytes.Contains(body, []byte(`"status":"ok"`)) {
+			break
+		}
+		time.Sleep(300 * time.Millisecond)
+	}
+	if status != 200 || !bytes.Contains(body, []byte(`"status":"ok"`)) || loginCalls.Load() == beforeCalls {
+		t.Fatalf("secret-less browser login did not complete: %d %s", status, body)
+	}
+	status, body = request("GET", "/v0/management/codearts-provider/accounts", "")
+	if status != 200 || !bytes.Contains(body, []byte(`"login_type":"WEB"`)) {
+		t.Fatalf("browser login was not persisted as a WEB credential: %d %s", status, body)
+	}
+	t.Log("secret-less browser callback completed the login through the plugin listener")
+
+	// The dashboard is the operator-facing surface: it must be the Chinese,
+	// single-authorization page the extension's own flow implies, and it must not
+	// grow a second sign-in path.
+	status, body = request("GET", "/v0/resource/plugins/codearts-provider/panel", "")
+	if status != 200 {
+		t.Fatalf("panel resource unavailable: %d", status)
+	}
+	for _, want := range []string{`lang="zh-CN"`, "charset=\"utf-8\"", "开始授权", "提交回调地址，完成授权", "账号", "定时任务"} {
+		if !bytes.Contains(body, []byte(want)) {
+			t.Fatalf("panel is missing %q", want)
+		}
+	}
+	for _, unwanted := range []string{"Sign in to Huawei Cloud", "Import credential", "Access key ID", "Scheduled tasks"} {
+		if bytes.Contains(body, []byte(unwanted)) {
+			t.Fatalf("panel still exposes the old UI string %q", unwanted)
+		}
+	}
+	t.Log("panel serves the Chinese single-authorization dashboard")
+
 	nextStatus.Store(429)
 	status, body = request("POST", "/v1/chat/completions", `{"model":"audit-model","messages":[{"role":"user","content":"rate limit"}],"stream":true}`)
 	if status != 429 {

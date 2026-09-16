@@ -83,23 +83,93 @@ func TestCredentialPersistReloadAndRenew(t *testing.T) {
 	}
 }
 
-func TestLoginCallbackUsesWebSecret(t *testing.T) {
-	s := &loginSession{expires: time.Now().Add(time.Minute)}
-	r := httptest.NewRequest("GET", "http://127.0.0.1/authentication?secret=web-generated-secret", nil)
+// TestBuildLoginURLMatchesExtension pins the sign-in URL against the extension's
+// own construction:
+//
+//	${codeartsWebUrl}/doer/redirect?ticket_id=..&IdeaType=vscode&auth_callback_url=..&plugin-name=snap_vscode&plugin-version=..
+//
+// A wrong path, parameter name or plugin identity here is invisible until a real
+// browser session fails, so the shape is asserted exactly.
+func TestBuildLoginURLMatchesExtension(t *testing.T) {
+	cfg := defaultConfig()
+	cfg.WebLoginBase = "https://devcloud.cn-north-4.huaweicloud.com"
+	got := buildLoginURL(cfg, "f4415ec8-6377-43f7-b909-dc90d177aa50", "http://127.0.0.1:40605/authentication")
+	want := "https://devcloud.cn-north-4.huaweicloud.com/doer/redirect" +
+		"?ticket_id=f4415ec8-6377-43f7-b909-dc90d177aa50" +
+		"&IdeaType=vscode" +
+		"&auth_callback_url=http%3A%2F%2F127.0.0.1%3A40605%2Fauthentication" +
+		"&plugin-name=snap_vscode&plugin-version=26.3.6"
+	if got != want {
+		t.Fatalf("login URL mismatch:\n got %s\nwant %s", got, want)
+	}
+	parsed, errParse := url.Parse(got)
+	if errParse != nil {
+		t.Fatal(errParse)
+	}
+	if parsed.Path != "/doer/redirect" {
+		t.Fatalf("wrong login path: %s", parsed.Path)
+	}
+	if callback := parsed.Query().Get("auth_callback_url"); callback != "http://127.0.0.1:40605/authentication" {
+		t.Fatalf("callback URL did not survive encoding: %q", callback)
+	}
+	if parsed.Query().Get("plugin-name") != "snap_vscode" || parsed.Query().Get("IdeaType") != "vscode" {
+		t.Fatalf("plugin identity or idea type changed: %s", got)
+	}
+}
+
+// TestLoginCallbackMatchesExtensionBehaviour covers the callback contract the
+// official extension implements: answer any callback, treat the secret as
+// optional (the console binds it to the ticket), keep the first secret, and stop
+// accepting callbacks once one has been seen. An earlier version of this plugin
+// required a secret and a GET, which left the sign-in flow waiting forever for a
+// callback the console had already delivered.
+func TestLoginCallbackMatchesExtensionBehaviour(t *testing.T) {
+	s := &loginSession{expires: time.Now().Add(time.Minute), callbackURL: "http://127.0.0.1:40000/authentication"}
 	w := httptest.NewRecorder()
-	s.handleCallback(w, r)
+	s.handleCallback(w, httptest.NewRequest("GET", "http://127.0.0.1/authentication?secret=web-generated-secret", nil))
 	if w.Code != 200 || s.secret != "web-generated-secret" || !s.received {
 		t.Fatalf("callback rejected: %d", w.Code)
 	}
-	w = httptest.NewRecorder()
-	s.handleCallback(w, httptest.NewRequest("GET", "http://localhost/authentication?secret=other", nil))
-	if w.Code != 403 {
-		t.Fatal("a second callback replaced the secret")
+	if s.callbackAt.IsZero() {
+		t.Fatal("callback arrival was not recorded")
 	}
+
+	// A second callback must not be able to replace the bound secret, and it must
+	// still be answered (the browser is showing the page).
+	w = httptest.NewRecorder()
+	s.handleCallback(w, httptest.NewRequest("GET", "http://127.0.0.1/authentication?secret=other", nil))
+	if w.Code != 200 || s.secret != "web-generated-secret" {
+		t.Fatalf("a second callback replaced the secret: %d %q", w.Code, s.secret)
+	}
+
+	// A callback without a secret is accepted: the ticket exchange is what proves
+	// the login, and the extension polls with an empty secret in that case.
+	plain := &loginSession{expires: time.Now().Add(time.Minute), callbackURL: "http://127.0.0.1:40001/authentication"}
+	w = httptest.NewRecorder()
+	plain.handleCallback(w, httptest.NewRequest("GET", "http://127.0.0.1/authentication", nil))
+	if w.Code != 200 || !plain.received || plain.secret != "" {
+		t.Fatalf("secret-less callback rejected: %d", w.Code)
+	}
+
+	// Same for a POST body, which is how a script or proxy may deliver it.
+	posted := &loginSession{expires: time.Now().Add(time.Minute)}
+	w = httptest.NewRecorder()
+	posted.handleCallback(w, httptest.NewRequest("POST", "http://127.0.0.1/authentication", strings.NewReader(`{"secret":"body-secret"}`)))
+	if w.Code != 200 || posted.secret != "body-secret" {
+		t.Fatalf("POST callback rejected: %d %q", w.Code, posted.secret)
+	}
+
+	// Preflight must succeed so a browser-side fetch can reach us.
+	w = httptest.NewRecorder()
+	s.handleCallback(w, httptest.NewRequest("OPTIONS", "http://127.0.0.1/authentication", nil))
+	if w.Code != http.StatusNoContent {
+		t.Fatalf("preflight rejected: %d", w.Code)
+	}
+
 	s.expires = time.Now().Add(-time.Minute)
 	w = httptest.NewRecorder()
-	s.handleCallback(w, r)
-	if w.Code != 410 {
+	s.handleCallback(w, httptest.NewRequest("GET", "http://127.0.0.1/authentication?secret=late", nil))
+	if w.Code != http.StatusGone {
 		t.Fatal("expired callback accepted")
 	}
 }
@@ -114,12 +184,44 @@ func TestLoginTicketExchangeBindsTicketAndSecret(t *testing.T) {
 		}
 		return json.Marshal(hostHTTPResponse{StatusCode: 200, Body: []byte(`{"credential":{"access":"a","secret":"s","securitytoken":"t"},"user_id":"user"}`)})
 	})
-	cred, retry, err := s.exchangeTicket(defaultConfig())
-	if err != nil || retry || !cred.valid() || cred.UserID != "user" {
-		t.Fatalf("exchange failed: %v", err)
+	cred, retry, status, message, err := s.exchangeTicket(defaultConfig())
+	if err != nil || retry || status != 200 || message != "" || !cred.valid() || cred.UserID != "user" {
+		t.Fatalf("exchange failed: %v status=%d message=%q", err, status, message)
 	}
 	if _, err := decodeCredentialResponse([]byte(`{"credential":{"access":"a"}}`)); err == nil {
 		t.Fatal("incomplete renewal accepted")
+	}
+}
+
+// TestTicketExchangeKeepsPollingAndReportsStatus pins the "never silently
+// stuck" behaviour: a non-200 ticket answer stays retryable and its status and
+// body excerpt are kept for the panel instead of aborting the flow.
+func TestTicketExchangeKeepsPollingAndReportsStatus(t *testing.T) {
+	s := &loginSession{ticketID: "test-ticket", secret: "web-secret", callbackURL: "http://127.0.0.1:40000/authentication"}
+	testHost(t, func(method string, request any) (json.RawMessage, error) {
+		return json.Marshal(hostHTTPResponse{StatusCode: http.StatusForbidden, Body: []byte(`{"error_code":"TM.00020003","message":"ticket not ready"}`)})
+	})
+	cred, retry, status, message, err := s.exchangeTicket(defaultConfig())
+	if cred != nil || !retry || err != nil {
+		t.Fatalf("a rejected ticket exchange must stay retryable: cred=%v retry=%v err=%v", cred, retry, err)
+	}
+	if status != http.StatusForbidden || !strings.Contains(message, "ticket not ready") {
+		t.Fatalf("exchange diagnostics lost: status=%d message=%q", status, message)
+	}
+
+	// The reported progress must distinguish "waiting for the browser" from
+	// "exchanging the ticket", so a hanging flow is explainable.
+	if got := s.progress(); !strings.Contains(got, "等待浏览器") {
+		t.Fatalf("pending flow did not report what it waits for: %q", got)
+	}
+	s.mu.Lock()
+	s.received = true
+	s.attempts = 1
+	s.lastStatus = status
+	s.lastMessage = message
+	s.mu.Unlock()
+	if got := s.progress(); !strings.Contains(got, "HTTP 403") || !strings.Contains(got, "ticket not ready") {
+		t.Fatalf("exchange failure was not reported: %q", got)
 	}
 }
 

@@ -5,15 +5,17 @@ Work through it top to bottom; every command is copy-pasteable from Git Bash.
 
 ## TL;DR
 
-On Windows, `release.bat` validates the repository and performs the commit,
-`master` push, annotated tag and tag push. Double-click it for the version in
-`main.go`, or preview without changing anything using:
+On Windows, `release.bat` synchronizes the requested version into `main.go`,
+`registry.json` and `registry-entry.json`, then performs the commit, `master`
+push, annotated tag and tag push. Double-click it to reuse the version already
+in `main.go`, or preview a new version without changing anything using:
 
 ```bat
 release.bat 0.1.1 --dry-run
 ```
 
-Use `release.bat 0.1.1 --yes` to skip its confirmation prompt.
+Use `release.bat 0.1.2 --yes` to publish a new version and skip its confirmation
+prompt. Existing local or remote tags are never overwritten.
 
 ```bash
 # 1. Build the assets (tag and version must agree)

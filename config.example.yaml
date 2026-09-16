@@ -110,6 +110,32 @@ plugins:
       login_timeout_seconds: 300
 
       # ---------------------------------------------------------------------
+      # Browser authorization callback
+      # ---------------------------------------------------------------------
+      #
+      # The plugin opens a local listener and hands its URL to the CodeArts
+      # console as auth_callback_url, exactly like the VS Code extension. The
+      # browser then reports the authorization result back to that listener; the
+      # plugin exchanges the ticket and stores the credential in CPA. There is
+      # only this one authorization flow - the same single 授权 the extension has.
+
+      # Interface the callback listener binds to. Default 127.0.0.1, which is
+      # right when the browser runs on the same machine as CPA. Set 0.0.0.0 when
+      # the browser is elsewhere (a gateway in a container or on a server) and
+      # the callback port is published.
+      login_callback_bind: "127.0.0.1"
+
+      # Fixed callback port instead of a random one. Set it together with
+      # login_callback_base so a published container port can reach the listener:
+      #   docker run ... -p 40605:40605
+      login_callback_port: 0
+
+      # Address handed to the browser instead of the loopback URL, for example
+      # "http://192.168.1.10:40605" or "https://cpa.example.com:40605". Leave
+      # empty when the browser can reach 127.0.0.1 on this host.
+      login_callback_base: ""
+
+      # ---------------------------------------------------------------------
       # Scheduled tasks
       # ---------------------------------------------------------------------
       #

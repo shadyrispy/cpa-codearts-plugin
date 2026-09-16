@@ -26,6 +26,7 @@ const managementBasePath = "/v0/management"
 func managementRoutes() []map[string]any {
 	return []map[string]any{
 		{"Method": http.MethodPost, "Path": "/codearts-provider/login/callback", "Description": "Submit the browser callback URL when CPA runs on a different machine."},
+		{"Method": http.MethodGet, "Path": "/codearts-provider/login/status", "Description": "Report the stage of one browser sign-in flow (waiting for the callback, or exchanging the ticket)."},
 		{
 			"Method":      http.MethodGet,
 			"Path":        "/codearts-provider/accounts",
@@ -139,6 +140,8 @@ func managementHandle(request []byte) ([]byte, error) {
 		return okEnvelope(handleAccounts())
 	case route == "/login/callback" && method == http.MethodPost:
 		return okEnvelope(handleLoginCallback(req))
+	case route == "/login/status" && method == http.MethodGet:
+		return okEnvelope(handleLoginStatus(req.Query))
 	case route == "/quota" && method == http.MethodGet:
 		return okEnvelope(handleQuotaGet(req.Query))
 	case route == "/quota/refresh" && method == http.MethodPost:
@@ -172,7 +175,8 @@ func managementHandle(request []byte) ([]byte, error) {
 }
 
 // Remote CPA deployments cannot receive a browser's localhost redirect. The
-// operator can submit that URL over the authenticated management channel.
+// operator can submit that URL over the authenticated management channel, which
+// is exactly the callback the plugin's own listener would have served.
 func handleLoginCallback(req pluginapi.ManagementRequest) pluginapi.ManagementResponse {
 	var body struct {
 		State       string `json:"state"`
@@ -187,22 +191,93 @@ func handleLoginCallback(req pluginapi.ManagementRequest) pluginapi.ManagementRe
 	if session == nil || time.Now().After(session.expires) {
 		return errorJSON(400, "unknown or expired login state")
 	}
-	u, err := url.Parse(body.CallbackURL)
-	if err != nil || u.Scheme != "http" || u.Hostname() != "127.0.0.1" || u.Path != "/authentication" || u.Host != session.listener.Addr().String() {
-		return errorJSON(400, "paste the localhost callback URL from this login attempt")
+	u, err := url.Parse(strings.TrimSpace(body.CallbackURL))
+	if err != nil || u.Path != "/authentication" {
+		return errorJSON(400, "paste the full callback URL from the browser address bar, for example http://127.0.0.1:40000/authentication?secret=...")
+	}
+	// The host must be either the socket the listener actually bound or the
+	// address the plugin advertised to the console (login_callback_base); those
+	// differ whenever a deployment publishes a different host.
+	if submitted := u.Host; submitted != session.bindAddr && submitted != callbackHost(session.callbackURL) {
+		return errorJSON(400, "that callback URL belongs to a different sign-in attempt")
 	}
 	secret := strings.TrimSpace(u.Query().Get("secret"))
 	if secret == "" {
-		return errorJSON(400, "callback URL contains no secret")
+		// A secret-less callback is accepted: the console binds the secret to the
+		// ticket, and the ticket exchange is what proves the login.
+		logWarn("the submitted callback carried no secret; exchanging the ticket anyway", map[string]any{"state": session.state})
 	}
 	session.mu.Lock()
-	defer session.mu.Unlock()
-	if session.received && session.secret != secret {
+	if session.received {
+		session.mu.Unlock()
 		return errorJSON(409, "callback already received")
 	}
 	session.secret = secret
 	session.received = true
+	session.callbackAt = time.Now()
+	session.mu.Unlock()
+	session.closeListener()
 	return jsonResponse(200, []byte(`{"success":true}`))
+}
+
+// callbackHost extracts the host:port of an advertised callback URL.
+func callbackHost(rawURL string) string {
+	parsed, errParse := url.Parse(strings.TrimSpace(rawURL))
+	if errParse != nil {
+		return ""
+	}
+	return parsed.Host
+}
+
+// handleLoginStatus reports the stage of one sign-in flow. CPA's own
+// get-auth-status route only distinguishes pending/success/error, so a pending
+// flow would otherwise be silent; this route says whether the plugin is waiting
+// for the browser callback or already exchanging the ticket, and what the
+// exchange last answered.
+func handleLoginStatus(query url.Values) pluginapi.ManagementResponse {
+	state := strings.TrimSpace(query.Get("state"))
+	loginMu.Lock()
+	session := loginSessions[state]
+	loginMu.Unlock()
+	if session == nil {
+		return jsonResponse(http.StatusNotFound, mustJSON(map[string]any{
+			"status":  "unknown",
+			"message": "登录会话不存在或已结束，请重新点击「开始授权」。",
+		}))
+	}
+	session.mu.Lock()
+	payload := map[string]any{
+		"state":        session.state,
+		"status":       "pending",
+		"message":      session.progressLocked(),
+		"callback_url": session.callbackURL,
+		"attempts":     session.attempts,
+		"expires_at":   session.expires.UTC().Format(time.RFC3339),
+	}
+	if session.credential != nil {
+		payload["status"] = "success"
+	}
+	if session.err != "" {
+		payload["status"] = "error"
+	}
+	if !session.callbackAt.IsZero() {
+		payload["callback_at"] = session.callbackAt.UTC().Format(time.RFC3339)
+	}
+	if session.lastStatus != 0 {
+		payload["last_status"] = session.lastStatus
+	}
+	session.mu.Unlock()
+	return jsonResponse(http.StatusOK, mustJSON(payload))
+}
+
+// mustJSON marshals a management payload, falling back to a minimal error body
+// so the route can never return an empty response.
+func mustJSON(payload any) []byte {
+	raw, errMarshal := json.Marshal(payload)
+	if errMarshal != nil {
+		return []byte(`{"status":"error","message":"failed to encode response"}`)
+	}
+	return raw
 }
 
 // managementRouteSuffix strips the management or resource prefix and the plugin

@@ -50,6 +50,17 @@ type Config struct {
 	RequestTimeoutSeconds int `yaml:"request_timeout_seconds" json:"request_timeout_seconds"`
 	// LoginTimeoutSeconds bounds the interactive browser login flow.
 	LoginTimeoutSeconds int `yaml:"login_timeout_seconds" json:"login_timeout_seconds"`
+	// LoginCallbackBind is the local interface the browser-callback listener binds
+	// to. Defaults to 127.0.0.1; set it to 0.0.0.0 when the browser cannot reach
+	// the plugin's loopback (for example a gateway in a container).
+	LoginCallbackBind string `yaml:"login_callback_bind" json:"login_callback_bind"`
+	// LoginCallbackPort pins the callback port instead of using an ephemeral one.
+	// A fixed port is what makes containerised deployments work: publish it
+	// (docker run -p <port>:<port>) together with login_callback_base.
+	LoginCallbackPort int `yaml:"login_callback_port" json:"login_callback_port"`
+	// LoginCallbackBase replaces the callback URL host:port handed to the browser,
+	// for example "http://192.168.1.10:40605". Leave empty for the loopback URL.
+	LoginCallbackBase string `yaml:"login_callback_base" json:"login_callback_base"`
 	// Heartbeat enables the upstream SSE heartbeat comment frames.
 	Heartbeat bool `yaml:"heartbeat" json:"heartbeat"`
 	// SignHost adds the `host` header to the signed header set. The official
@@ -283,6 +294,14 @@ func (c *Config) normalize() {
 	if c.LoginTimeoutSeconds <= 0 {
 		c.LoginTimeoutSeconds = 300
 	}
+	c.LoginCallbackBind = strings.TrimSpace(c.LoginCallbackBind)
+	if c.LoginCallbackBind == "" {
+		c.LoginCallbackBind = "127.0.0.1"
+	}
+	if c.LoginCallbackPort < 0 || c.LoginCallbackPort > 65535 {
+		c.LoginCallbackPort = 0
+	}
+	c.LoginCallbackBase = strings.TrimRight(strings.TrimSpace(c.LoginCallbackBase), "/")
 	if len(c.Models) == 0 {
 		c.Models = defaultModels()
 	}

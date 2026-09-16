@@ -193,57 +193,79 @@ Responses clients (`/v1/responses`), with tool calls and usage preserved.
 
    `registered` and `effective_enabled` should both be `true`.
 
-5. **Sign in.** Two options:
+5. **Sign in (授权).** There is exactly one authorization flow, the browser
+   authorization the VS Code extension performs. Open the dashboard at
+   `/v0/resource/plugins/codearts-provider/panel`, enter the management key and
+   click **开始授权**; or drive it over the API:
 
-   - *Browser flow* (recommended, mirrors the IDE plugin):
+   ```bash
+   curl -H "Authorization: Bearer $ADMIN_KEY" \
+     http://localhost:8317/v0/management/codearts-provider-auth-url
+   # -> {"status":"ok","url":"https://devcloud.../doer/redirect?ticket_id=...","state":"..."}
 
-     ```bash
-     curl -H "Authorization: Bearer $ADMIN_KEY" \
-       http://localhost:8317/v0/management/codearts-provider-auth-url
-     # -> {"status":"ok","url":"https://devcloud.../doer/redirect?ticket_id=...","state":"..."}
-     ```
+   # follow the flow while it runs (reports which stage it is in)
+   curl -H "Authorization: Bearer $ADMIN_KEY" \
+     "http://localhost:8317/v0/management/codearts-provider/login/status?state=$STATE"
+   ```
 
-     Open the returned `url`, sign in, and wait for the tab to report completion.
-     CLIProxyAPI polls the flow and stores the credential.
+   Open the returned `url`, authorize in the CodeArts console, and the browser
+   reports the result back to the plugin's listener; the plugin then exchanges
+   the ticket and CLIProxyAPI stores the credential. The panel polls the same
+   state and shows the account when it lands.
 
-     *Remote / containerised gateways* cannot receive the browser's
-     `127.0.0.1` redirect. The callback URL the browser lands on is a plain URL —
-     copy it out of the address bar and submit it over the authenticated
-     management channel instead:
+   **When the gateway is not on the browser's machine** (a container or a remote
+   server), the browser cannot reach the plugin's listener. Two ways to finish:
+
+   - *Quickest*: after authorizing, the browser stops on an unreachable
+     `http://127.0.0.1:PORT/authentication?...` page. Copy that address from the
+     address bar and paste it into **提交回调地址，完成授权** in the panel (or POST
+     it), which completes the same flow:
 
      ```bash
      curl -X POST -H "Authorization: Bearer $ADMIN_KEY" -H "Content-Type: application/json" \
-       -d '{"state":"<state from step 1>","callback_url":"<the full http://127.0.0.1:PORT/authentication?secret=... URL>"}' \
+       -d '{"state":"<state>","callback_url":"<the full http://127.0.0.1:PORT/authentication?... URL>"}' \
        http://localhost:8317/v0/management/codearts-provider/login/callback
      ```
 
-     The route validates that the URL points at the loopback listener this login
-     attempt opened, and then completes the flow exactly as the browser would.
-     The dashboard on `/panel` exposes the same control.
+   - *Permanent fix*: pin and publish the callback port, and advertise an address
+     the browser can reach:
 
-   - *Credential file* — drop a JSON file into the auth directory. The file name
-     is up to you; the auto-generated name for a browser sign-in is
-     `codearts-provider-<user>-<identity digest>.json` (the digest keeps two
-     accounts with the same display name apart):
-
-     ```json
-     {
-       "type": "codearts-provider",
-       "access_key_id": "AK...",
-       "secret_access_key": "SK...",
-       "security_token": "STS token, if you have one",
-       "domain_id": "domain id",
-       "user_name": "you"
-     }
+     ```yaml
+     login_callback_port: 40605        # docker run -p 40605:40605
+     login_callback_bind: "0.0.0.0"
+     login_callback_base: "http://192.168.1.10:40605"
      ```
 
-     The `type` field must be `codearts-provider`: it is how the plugin
-     recognises the file as its own. A file that looks like ours but lacks the
-     access/secret key pair is left for other providers to claim.
+   The callback listener accepts whatever the console sends: any HTTP method, and
+   a missing `secret` (the console binds the secret to the ticket, and the ticket
+   exchange is what proves the login). This mirrors the extension's own callback
+   server. Once a callback has been seen the listener closes, so a later request
+   cannot replace the bound secret.
 
-     The temporary AK/SK pair is obtained from the IAM flow
-     (`POST /v3.0/OS-CREDENTIAL/securitytokens`) if you prefer to mint one
-     yourself.
+   An AK/SK pair you already hold can also be imported as a credential file
+   instead of authorizing in a browser. The file name is up to you; the
+   auto-generated name for a browser sign-in is
+   `codearts-provider-<user>-<identity digest>.json` (the digest keeps two
+   accounts with the same display name apart):
+
+   ```json
+   {
+     "type": "codearts-provider",
+     "access_key_id": "AK...",
+     "secret_access_key": "SK...",
+     "security_token": "STS token, if you have one",
+     "domain_id": "domain id",
+     "user_name": "you"
+   }
+   ```
+
+   The `type` field must be `codearts-provider`: it is how the plugin recognises
+   the file as its own. A file that looks like ours but lacks the access/secret
+   key pair is left for other providers to claim. The temporary AK/SK pair is
+   obtained from the IAM flow (`POST /v3.0/OS-CREDENTIAL/securitytokens`) if you
+   prefer to mint one yourself. This path is for operators who already have a
+   key pair; it is not a second sign-in method in the panel, which keeps the
+   single authorization the extension has.
 
 6. **Acceptance checks.** Confirm the models are visible, then call each client
    protocol:
@@ -413,6 +435,8 @@ All routes live under `/v0/management/codearts-provider/` and require the admin 
 | Method | Path | Purpose |
 | --- | --- | --- |
 | `GET` | `/accounts` | Accounts with subscription, quota percentages and credential expiry. |
+| `GET` | `/login/status` | Stage of one sign-in flow: waiting for the browser callback, or exchanging the ticket (with the last exchange status). |
+| `POST` | `/login/callback` | Relay the browser callback URL for a gateway the browser cannot reach (body: `{state, callback_url}`). |
 | `GET` | `/quota` | Normalised quota view; `?auth_index=` narrows to one account. |
 | `POST` | `/quota/refresh` | Force an upstream quota read (body: `{auth_index}`, omit for all). |
 | `GET` | `/usage` | Token usage rollup from host usage records: totals, per-model, per-account, recent. |
@@ -429,13 +453,20 @@ to the operator.
 
 ### Dashboard
 
-`GET /v0/resource/plugins/codearts-provider/panel` serves a browser dashboard with
-account cards (plan, reset date, usage meters), the task table with next/last
-run, credential import and export. It is served from the unauthenticated
-resource namespace, so it holds no secrets of its own — it reads the admin key
-from the management UI's same-origin `localStorage` and calls the authenticated
-routes above. Scripts are inlined rather than loaded from a CDN, so no
-third-party code runs in an admin context.
+`GET /v0/resource/plugins/codearts-provider/panel` serves the Chinese browser
+dashboard, laid out like the extension's own model: **one** authorization card
+(开始授权 → open the link → authorize in the console → the account appears, with a
+collapsible 提交回调地址 step for gateways the browser cannot reach directly),
+an account card with the subscription, reset date and usage meters, the cron task
+table with next/last run, and a diagnostics section. It is served from the
+unauthenticated resource namespace, so it holds no secrets of its own — it reads
+the admin key from the management UI's same-origin `localStorage` and calls the
+authenticated routes above. Scripts are inlined rather than loaded from a CDN, so
+no third-party code runs in an admin context.
+
+The page deliberately offers a single sign-in path. Importing a pre-existing
+AK/SK pair stays available as `POST /codearts-provider/import` for operators who
+already hold one, but it is not a second authorization method in the UI.
 
 `GET /v0/resource/plugins/codearts-provider/status` returns machine-readable status
 and, like the panel, never contains credential material.
@@ -564,6 +595,9 @@ example.
 | `is_confidential` | `false` | Send the `is_confidential` header. |
 | `request_timeout_seconds` | `600` | Per-request upstream timeout. |
 | `login_timeout_seconds` | `300` | Browser sign-in window. |
+| `login_callback_bind` | `127.0.0.1` | Interface the browser-callback listener binds to; set `0.0.0.0` when the browser is not on this host. |
+| `login_callback_port` | `0` (ephemeral) | Pin the callback port so a container can publish it. |
+| `login_callback_base` | empty | Address advertised to the browser instead of the loopback URL, e.g. `http://192.168.1.10:40605`. |
 | `extra_headers` | `{}` | Extra signed headers. |
 | `insist_missing_credentials` | `false` | Debug-only: send unsigned requests. |
 | `schedule.enabled` | `false` | Start the cron scheduler. |
@@ -695,7 +729,9 @@ Pushing a version tag such as `v0.1.1` runs
 [the release workflow](.github/workflows/release.yml): tests, Linux/Windows
 builds, ABI/archive verification, checksums and GitHub Release publication.
 On Windows, run [`release.bat`](release.bat) to validate, commit, push and create
-the tag in one guided step; add `--dry-run` as the second argument to preview it.
+the tag in one guided step. Passing a new version also updates `main.go` and both
+registry files automatically; add `--dry-run` as the second argument to preview
+the release without changing files.
 
 ```bash
 # unit tests (signer reference vector, SSE translation, Anthropic rendering,
@@ -796,16 +832,20 @@ Rebuild the library before running it: the test loads the file named by
 - **The agent ID and agent UUIDs are build-specific.** Values such as
   `Pangu_Doer_in_CodeArts` and the hardcoded agent UUIDs come from this VSIX
   version (26.3.6) and may change upstream.
-- **The browser callback needs a loopback the *browser* can reach.** The plugin
-  binds `127.0.0.1:0` to receive the callback, exactly as the extension does. When
-  CLIProxyAPI runs elsewhere (container, remote host) use
-  `POST /v0/management/codearts-provider/login/callback` or the panel button to
-  submit the callback URL, or use the credential-file path instead. Each login
-  flow holds a loopback listener and two goroutines, so at most 8 concurrent
-  flows are kept; starting a 9th drops the flow closest to expiry. The callback
-  binds the first secret it receives for that ticket and rejects a different one
-  afterwards, and the upstream ticket exchange rejects a secret that does not
-  belong to the ticket — an unrelated page that probes the loopback port cannot
-  complete a login, but it can force the flow to be restarted.
+- **The browser callback needs a listener the browser can reach.** The plugin
+  binds `127.0.0.1:0` (configurable) and hands that URL to the console, exactly
+  as the extension does. When the browser runs elsewhere, either relay the
+  callback URL the browser stops on (panel or `POST /login/callback`), or pin
+  `login_callback_port` / `login_callback_bind` / `login_callback_base` and
+  publish that port so the redirect completes on its own. The listener answers
+  any method and tolerates a missing `secret`, mirroring the extension's own
+  callback server, and it stops accepting callbacks once one has been seen. Each
+  flow holds a listener and two goroutines, so at most 8 concurrent flows are
+  kept; starting a 9th drops the flow closest to expiry.
+- **A pending sign-in can always be explained.** `GET /login/status?state=` (and
+  the panel) reports whether the plugin is still waiting for the browser callback
+  or already exchanging the ticket, including the last HTTP status and body
+  excerpt from the exchange, and the flow keeps retrying for the whole login
+  window instead of aborting on the first rejection.
 - **Resource pages are unauthenticated by design.** The status page therefore
   never exposes credential material.

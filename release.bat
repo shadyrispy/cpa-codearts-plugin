@@ -29,6 +29,10 @@ if not exist "registry.json" (
   echo ERROR: registry.json was not found.
   goto :abort_release
 )
+if not exist "tools\set-version.ps1" (
+  echo ERROR: tools\set-version.ps1 was not found.
+  goto :abort_release
+)
 
 set "PLUGIN_VERSION="
 for /f "tokens=4" %%V in ('findstr /B /C:"const pluginVersion = " main.go') do set "PLUGIN_VERSION=%%~V"
@@ -46,21 +50,12 @@ if errorlevel 1 (
   echo ERROR: Version must use dotted numeric form, for example 0.1.1.
   goto :abort_release
 )
-if not "%VERSION%"=="%PLUGIN_VERSION%" (
-  echo ERROR: Requested version %VERSION% does not match main.go %PLUGIN_VERSION%.
-  goto :abort_release
-)
-
+set "NEEDS_VERSION_SYNC=0"
+if not "%VERSION%"=="%PLUGIN_VERSION%" set "NEEDS_VERSION_SYNC=1"
 powershell.exe -NoProfile -Command "$j = Get-Content -Raw -LiteralPath 'registry-entry.json' | ConvertFrom-Json; if ($j.version -ne '%VERSION%') { exit 1 }"
-if errorlevel 1 (
-  echo ERROR: registry-entry.json does not contain version %VERSION%.
-  goto :abort_release
-)
+if errorlevel 1 set "NEEDS_VERSION_SYNC=1"
 powershell.exe -NoProfile -Command "$j = Get-Content -Raw -LiteralPath 'registry.json' | ConvertFrom-Json; if ($j.plugins[0].version -ne '%VERSION%') { exit 1 }"
-if errorlevel 1 (
-  echo ERROR: registry.json does not contain version %VERSION%.
-  goto :abort_release
-)
+if errorlevel 1 set "NEEDS_VERSION_SYNC=1"
 
 for /f "delims=" %%B in ('git branch --show-current') do set "BRANCH=%%B"
 if /i not "%BRANCH%"=="master" (
@@ -87,11 +82,16 @@ if not errorlevel 1 (
 
 echo.
 echo Release v%VERSION%
-echo   1. Stage all repository changes
-echo   2. Commit as "release: v%VERSION%"
-echo   3. Push master to origin
-echo   4. Create and push annotated tag v%VERSION%
-echo   5. GitHub Actions builds and publishes the Release
+if "%NEEDS_VERSION_SYNC%"=="1" (
+  echo   1. Set main.go and registry metadata to %VERSION%
+) else (
+  echo   1. Version metadata already matches %VERSION%
+)
+echo   2. Stage all repository changes
+echo   3. Commit as "release: v%VERSION%"
+echo   4. Push master to origin
+echo   5. Create and push annotated tag v%VERSION%
+echo   6. GitHub Actions builds and publishes the Release
 echo.
 git status --short
 echo.
@@ -109,6 +109,12 @@ echo Cancelled.
 exit /b 0
 
 :publish
+
+powershell.exe -NoProfile -ExecutionPolicy Bypass -File "%~dp0tools\set-version.ps1" -Version "%VERSION%"
+if errorlevel 1 (
+  echo ERROR: Failed to synchronize release version metadata.
+  goto :abort_release
+)
 
 git add -A
 if errorlevel 1 goto :git_failed

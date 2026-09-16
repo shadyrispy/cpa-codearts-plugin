@@ -1,11 +1,13 @@
 package main
 
 import (
+	"bytes"
 	"context"
 	"crypto/rand"
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
+	"io"
 	"net"
 	"net/http"
 	"net/url"
@@ -24,7 +26,10 @@ const storageKey = "codearts_provider_credential"
 // loginSession tracks one interactive browser login flow. The official IDE
 // extension starts a loopback HTTP server, opens the CodeArts web console with
 // a ticket id and a callback URL, then polls the ticket endpoint with the
-// secret echoed back to that callback. The plugin reproduces that flow.
+// secret the console echoes back to that callback. The plugin reproduces that
+// flow, including the extension's tolerance for a callback that carries no
+// secret: the console binds the secret to the ticket, and the ticket exchange is
+// what actually proves the login.
 type loginSession struct {
 	state    string
 	ticketID string
@@ -36,6 +41,20 @@ type loginSession struct {
 	received bool
 	expires  time.Time
 	cancel   context.CancelFunc
+
+	// callbackURL is the URL handed to the CodeArts console; bindAddr is the
+	// local socket it is served from. They differ when the deployment advertises
+	// a different host (login_callback_base) or binds a non-loopback interface.
+	callbackURL string
+	bindAddr    string
+
+	// progress is the observable state of the flow, so a page can always tell
+	// whether it is waiting for the browser or for the ticket exchange.
+	callbackAt   time.Time
+	attempts     int
+	lastStatus   int
+	lastMessage  string
+	closedListen bool
 
 	credential *credential
 	err        string
@@ -111,23 +130,41 @@ func authLoginStart(request []byte) ([]byte, error) {
 	}
 	cfg := config()
 
-	listener, errListen := net.Listen("tcp", "127.0.0.1:0")
+	bindAddr := fmt.Sprintf("%s:%d", cfg.LoginCallbackBind, cfg.LoginCallbackPort)
+	listener, errListen := net.Listen("tcp", bindAddr)
+	if errListen != nil && cfg.LoginCallbackPort != 0 {
+		// A pinned port may already be in use; an ephemeral one still lets the
+		// flow work for a browser on the same machine.
+		logWarn("the configured login callback port is unavailable; using an ephemeral port", map[string]any{
+			"bind":  bindAddr,
+			"error": errListen.Error(),
+		})
+		bindAddr = fmt.Sprintf("%s:0", cfg.LoginCallbackBind)
+		listener, errListen = net.Listen("tcp", bindAddr)
+	}
 	if errListen != nil {
-		return failEnvelope("login_unavailable", "failed to bind a loopback callback listener: "+errListen.Error(), http.StatusInternalServerError)
+		return failEnvelope("login_unavailable", "failed to bind the browser callback listener on "+bindAddr+": "+errListen.Error(), http.StatusInternalServerError)
 	}
 	port := listener.Addr().(*net.TCPAddr).Port
 	callbackURL := fmt.Sprintf("http://127.0.0.1:%d/authentication", port)
+	if cfg.LoginCallbackBase != "" {
+		// An advertised base is what makes a containerised gateway reachable:
+		// the browser is sent to the published address instead of the loopback.
+		callbackURL = cfg.LoginCallbackBase + "/authentication"
+	}
 
 	ticketID := randomUUIDv4()
 	state := randomHex(16)
 	ctx, cancel := context.WithTimeout(context.Background(), cfg.loginTimeout())
 
 	session := &loginSession{
-		state:    state,
-		ticketID: ticketID,
-		cancel:   cancel,
-		listener: listener,
-		expires:  time.Now().Add(cfg.loginTimeout()),
+		state:       state,
+		ticketID:    ticketID,
+		cancel:      cancel,
+		listener:    listener,
+		callbackURL: callbackURL,
+		bindAddr:    listener.Addr().String(),
+		expires:     time.Now().Add(cfg.loginTimeout()),
 	}
 	mux := http.NewServeMux()
 	mux.HandleFunc("/authentication", session.handleCallback)
@@ -135,7 +172,9 @@ func authLoginStart(request []byte) ([]byte, error) {
 		Handler:           mux,
 		ReadHeaderTimeout: 10 * time.Second,
 	}
+	session.mu.Lock()
 	session.server = server
+	session.mu.Unlock()
 
 	go func() {
 		if errServe := server.Serve(listener); errServe != nil && errServe != http.ErrServerClosed {
@@ -240,13 +279,20 @@ func authLoginPoll(request []byte) ([]byte, error) {
 		})
 	}
 	if cred == nil {
+		// Pending, but never silent: the message says whether the plugin is still
+		// waiting for the browser or already exchanging the ticket.
 		return okEnvelope(pluginapi.AuthLoginPollResponse{
 			Status:  pluginapi.AuthLoginStatusPending,
-			Message: "waiting for the browser to complete sign-in",
+			Message: session.progress(),
 		})
 	}
 
-	storage, errMarshal := json.Marshal(map[string]any{storageKey: *cred})
+	// A browser authorization is a WEB credential; stamping it on the stored
+	// credential matches the extension's transferToUserInfo(..., "WEB") and lets
+	// the account view report how the account signed in.
+	stamped := *cred
+	stamped.LoginType = firstNonEmptyString(stamped.LoginType, "WEB")
+	storage, errMarshal := json.Marshal(map[string]any{storageKey: stamped})
 	if errMarshal != nil {
 		return nil, errMarshal
 	}
@@ -266,14 +312,14 @@ func authLoginPoll(request []byte) ([]byte, error) {
 		Auth: pluginapi.AuthData{
 			Provider:    providerID,
 			Label:       label,
-			FileName:    credentialFileName(cred),
+			FileName:    credentialFileName(&stamped),
 			StorageJSON: storage,
 			Metadata: map[string]any{
 				"type":       providerID,
-				"user_name":  cred.UserName,
-				"user_id":    cred.UserID,
-				"domain_id":  cred.DomainID,
-				"login_type": "WEB",
+				"user_name":  stamped.UserName,
+				"user_id":    stamped.UserID,
+				"domain_id":  stamped.DomainID,
+				"login_type": stamped.LoginType,
 			},
 			Attributes:       map[string]string{"provider_type": providerID},
 			NextRefreshAfter: refreshDeadline(cred),
@@ -394,49 +440,135 @@ func authRefresh(request []byte) ([]byte, error) {
 // login session plumbing
 // ---------------------------------------------------------------------------
 
-// handleCallback receives the browser redirect carrying the login secret.
+// handleCallback receives the browser redirect from the CodeArts console.
+//
+// It deliberately mirrors the official extension's callback server rather than
+// validating the request: that server answers every request with the same
+// success body, resolves with whatever query the browser sent, and closes the
+// listener afterwards. The extension then reads `secret` and falls back to an
+// empty string, because the secret is bound to the ticket by the console and it
+// is the ticket exchange - not this callback - that establishes the login.
+// Rejecting a secret-less or non-GET callback (as an earlier version of this
+// plugin did) leaves the flow waiting forever for a second callback that never
+// comes, which is exactly the "sign-in hangs" report this fixes.
 func (s *loginSession) handleCallback(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Access-Control-Allow-Origin", "*")
 	w.Header().Set("Access-Control-Allow-Methods", "GET, OPTIONS")
 	w.Header().Set("Access-Control-Allow-Headers", "Content-Type, Authorization")
+	w.Header().Set("Access-Control-Max-Age", "86400")
 	if r.Method == http.MethodOptions {
 		w.WriteHeader(http.StatusNoContent)
-		return
-	}
-	if r.Method != http.MethodGet {
-		w.WriteHeader(http.StatusMethodNotAllowed)
 		return
 	}
 	if time.Now().After(s.expires) {
 		w.WriteHeader(http.StatusGone)
 		return
 	}
-	secret := strings.TrimSpace(r.URL.Query().Get("secret"))
-	if secret == "" {
-		w.WriteHeader(http.StatusBadRequest)
-		_, _ = w.Write([]byte("missing secret"))
-		return
-	}
+
+	secret := callbackSecret(r)
 	s.mu.Lock()
-	// The web console creates this secret. It is then bound to our ticket by
-	// the upstream exchange; it is not a locally generated OAuth state.
-	matches := !s.received || secret == s.secret
-	if matches {
+	first := !s.received
+	if first {
 		s.secret = secret
 		s.received = true
+		s.callbackAt = time.Now()
 	}
 	s.mu.Unlock()
-	if !matches {
-		w.WriteHeader(http.StatusForbidden)
-		_, _ = w.Write([]byte("invalid secret"))
-		return
+
+	if first {
+		if secret == "" {
+			logWarn("the browser callback carried no secret; exchanging the ticket anyway", map[string]any{"state": s.state})
+		}
+		// The extension stops accepting callbacks once it has one; a second
+		// browser hit must not be able to replace the bound secret.
+		s.closeListener()
 	}
+
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(http.StatusOK)
 	_, _ = w.Write([]byte(`{"status":"success","message":"Secret received"}`))
 }
 
-// poll exchanges the ticket for a credential once the secret arrives.
+// callbackSecret extracts the secret from the callback request. The console
+// redirects the browser with it as a query parameter; a JSON or form body is
+// also accepted so a proxied, scripted or content-type-less callback still
+// works. An empty result is not an error: the secret is optional here.
+func callbackSecret(r *http.Request) string {
+	if secret := strings.TrimSpace(r.URL.Query().Get("secret")); secret != "" {
+		return secret
+	}
+	if r.Body == nil {
+		return ""
+	}
+	raw, errRead := io.ReadAll(io.LimitReader(r.Body, 64<<10))
+	if errRead != nil || len(bytes.TrimSpace(raw)) == 0 {
+		return ""
+	}
+	var body struct {
+		Secret string `json:"secret"`
+	}
+	if json.Unmarshal(raw, &body) == nil && strings.TrimSpace(body.Secret) != "" {
+		return strings.TrimSpace(body.Secret)
+	}
+	if strings.Contains(r.Header.Get("Content-Type"), "form-urlencoded") {
+		if errParse := r.ParseForm(); errParse == nil {
+			if secret := strings.TrimSpace(r.PostForm.Get("secret")); secret != "" {
+				return secret
+			}
+		}
+	}
+	if values, errParse := url.ParseQuery(string(raw)); errParse == nil {
+		return strings.TrimSpace(values.Get("secret"))
+	}
+	return ""
+}
+
+// closeListener stops accepting callbacks without ending the login session: the
+// ticket exchange still has to run.
+func (s *loginSession) closeListener() {
+	s.mu.Lock()
+	already := s.closedListen
+	s.closedListen = true
+	server := s.server
+	s.mu.Unlock()
+	if already || server == nil {
+		return
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	_ = server.Shutdown(ctx)
+}
+
+// progress renders the observable state of the flow for the panel.
+func (s *loginSession) progress() string {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.progressLocked()
+}
+
+// progressLocked is progress for callers that already hold the session lock.
+func (s *loginSession) progressLocked() string {
+	switch {
+	case s.credential != nil:
+		return "授权成功，账号已写入 CPA。"
+	case s.err != "":
+		return s.err
+	case !s.received:
+		return "等待浏览器完成授权回调（" + s.callbackURL + "）。"
+	case s.attempts == 0:
+		return "已收到浏览器回调，正在换取凭证…"
+	case s.lastStatus == http.StatusOK:
+		return "已收到回调，凭证尚未就绪，正在重试…"
+	case s.lastMessage != "":
+		return fmt.Sprintf("已收到回调，换取凭证返回 HTTP %d：%s", s.lastStatus, s.lastMessage)
+	default:
+		return fmt.Sprintf("已收到回调，换取凭证返回 HTTP %d，正在重试…", s.lastStatus)
+	}
+}
+
+// poll exchanges the ticket for a credential once the secret arrives, retrying
+// until the login window closes. Every attempt is recorded so the management
+// API can explain a flow that is not progressing instead of leaving it silent.
 func (s *loginSession) poll(ctx context.Context) {
 	defer s.stop()
 	cfg := config()
@@ -447,41 +579,54 @@ func (s *loginSession) poll(ctx context.Context) {
 		case <-ctx.Done():
 			s.mu.Lock()
 			if s.credential == nil && s.err == "" {
-				s.err = "login session expired or was cancelled"
+				if !s.received {
+					s.err = "登录超时：浏览器没有把授权结果回传到 " + s.callbackURL +
+						"。如果 CPA 运行在容器或远程主机上，请在面板中粘贴浏览器地址栏里的回调地址。"
+				} else if s.lastMessage != "" {
+					s.err = fmt.Sprintf("登录超时：换取凭证一直返回 HTTP %d（%s）。", s.lastStatus, s.lastMessage)
+				} else {
+					s.err = "登录超时：未能换取凭证。"
+				}
 			}
 			s.mu.Unlock()
 			return
 		case <-ticker.C:
 		}
+
 		s.mu.Lock()
 		received := s.received
 		s.mu.Unlock()
 		if !received {
 			continue
 		}
-		cred, retry, errPoll := s.exchangeTicket(cfg)
-		if errPoll != nil && !retry {
-			s.mu.Lock()
-			s.err = errPoll.Error()
-			s.mu.Unlock()
-			return
+		cred, retry, status, message, errPoll := s.exchangeTicket(cfg)
+		s.mu.Lock()
+		s.attempts++
+		s.lastStatus = status
+		if message != "" {
+			s.lastMessage = message
 		}
 		if cred != nil {
-			s.mu.Lock()
 			s.credential = cred
-			s.mu.Unlock()
+		} else if errPoll != nil && !retry {
+			s.err = errPoll.Error()
+		}
+		done := s.credential != nil || s.err != ""
+		s.mu.Unlock()
+		if done {
 			return
 		}
 	}
 }
 
-// exchangeTicket performs one ticket poll. retry reports whether another
-// attempt is worthwhile.
-func (s *loginSession) exchangeTicket(cfg *Config) (*credential, bool, error) {
+// exchangeTicket performs one ticket poll. retry reports whether another attempt
+// is worthwhile; the status and a short body excerpt are returned for progress
+// reporting even when the exchange keeps failing.
+func (s *loginSession) exchangeTicket(cfg *Config) (*credential, bool, int, string, error) {
 	endpoint := strings.TrimRight(cfg.BaseURL, "/") + "/snap-manager/v1/login/ticket"
 	parsed, errParse := url.Parse(endpoint)
 	if errParse != nil {
-		return nil, false, errParse
+		return nil, false, 0, "", errParse
 	}
 	query := parsed.Query()
 	query.Set("ticket_id", s.ticketID)
@@ -490,6 +635,9 @@ func (s *loginSession) exchangeTicket(cfg *Config) (*credential, bool, error) {
 	s.mu.Unlock()
 	parsed.RawQuery = query.Encode()
 
+	// This request is intentionally unsigned: it is exactly what the extension
+	// sends (plugin identity headers and the ticket/secret pair), and the ticket
+	// is the credential here, not an AK/SK pair.
 	headers := map[string]string{
 		"Content-Type":   "application/json;charset=UTF-8",
 		"plugin-name":    cfg.PluginName,
@@ -498,23 +646,21 @@ func (s *loginSession) exchangeTicket(cfg *Config) (*credential, bool, error) {
 	}
 	response, errDo := hostHTTPDo(http.MethodGet, parsed.String(), headers, nil)
 	if errDo != nil {
-		return nil, true, nil
+		return nil, true, 0, truncate(errDo.Error(), 200), nil
 	}
 	if response.StatusCode != http.StatusOK {
-		// The ticket is not ready yet; keep polling until the deadline.
-		if response.StatusCode == http.StatusUnauthorized || response.StatusCode == http.StatusForbidden {
-			return nil, false, fmt.Errorf("sign-in was rejected by the CodeArts gateway (HTTP %d): %s", response.StatusCode, truncate(string(response.Body), 300))
-		}
-		return nil, true, nil
+		// The ticket is not ready yet; keep polling until the deadline, exactly
+		// like the extension, and report the last status for the panel.
+		return nil, true, response.StatusCode, truncate(string(response.Body), 300), nil
 	}
 	cred, errDecode := decodeCredentialResponse(response.Body)
 	if errDecode != nil {
-		return nil, true, nil
+		return nil, true, response.StatusCode, truncate(errDecode.Error(), 200), nil
 	}
 	if !cred.valid() {
-		return nil, true, nil
+		return nil, true, response.StatusCode, "凭证字段不完整", nil
 	}
-	return &cred, false, nil
+	return &cred, false, response.StatusCode, "", nil
 }
 
 func (s *loginSession) stop() {
@@ -528,7 +674,9 @@ func (s *loginSession) stop() {
 		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
 		_ = s.server.Shutdown(ctx)
 		cancel()
-	} else if s.listener != nil {
+		return
+	}
+	if s.listener != nil {
 		_ = s.listener.Close()
 	}
 }
@@ -641,7 +789,14 @@ func refreshDeadline(cred *credential) time.Time {
 	return time.Now().Add(time.Hour)
 }
 
-// buildLoginURL mirrors the URL the official extension opens.
+// buildLoginURL mirrors the URL the official extension opens:
+//
+//	${codeartsWebUrl}/doer/redirect?ticket_id=..&IdeaType=vscode&auth_callback_url=..&plugin-name=..&plugin-version=..
+//
+// The parameters are sent in the extension's order. Values are percent-encoded
+// rather than interpolated literally as the extension does, so a callback URL
+// cannot inject further query parameters into the console URL; the console
+// accepts both forms (it re-serialises the URL after decoding it anyway).
 func buildLoginURL(cfg *Config, ticketID, callbackURL string) string {
 	base := cfg.WebLoginBase
 	if base == "" {
@@ -657,7 +812,21 @@ func buildLoginURL(cfg *Config, ticketID, callbackURL string) string {
 	query.Set("auth_callback_url", callbackURL)
 	query.Set("plugin-name", cfg.PluginName)
 	query.Set("plugin-version", cfg.PluginVersion)
-	return base + "?" + query.Encode()
+	return base + "?" + encodeLoginQuery(query)
+}
+
+// encodeLoginQuery renders the query in the extension's parameter order, with
+// %20 for spaces (the console's own URLs use %20 rather than "+").
+func encodeLoginQuery(values url.Values) string {
+	var parts []string
+	for _, key := range []string{"ticket_id", "IdeaType", "auth_callback_url", "plugin-name", "plugin-version"} {
+		value := values.Get(key)
+		if value == "" {
+			continue
+		}
+		parts = append(parts, key+"="+strings.ReplaceAll(url.QueryEscape(value), "+", "%20"))
+	}
+	return strings.Join(parts, "&")
 }
 
 func normalizeProvider(provider string) string {
