@@ -118,19 +118,20 @@ const panelTemplate = `<!doctype html>
     <ol class="steps">
       <li>点击「开始授权」，下方会出现登录链接。</li>
       <li>打开链接，在 CodeArts 控制台完成登录授权。</li>
-      <li>本机 CPA 会自动接收回调；远程 CPA 请复制浏览器最终的 localhost 地址并在下方提交。</li>
+      <li>本机 CPA 会自动接收回调；远程 CPA 请复制浏览器最终的 localhost 地址并在本页下方提交。请保持本页打开。</li>
     </ol>
     <div class="status" id="loginStatus">尚未开始。请先填写管理密钥。</div>
     <div id="loginLinkBox" hidden style="margin-top:8px">
       <a id="loginURL" target="_blank" rel="noopener noreferrer">点此打开华为授权页面</a>
     </div>
 
-    <details>
+    <details open>
       <summary>授权页面打不开 127.0.0.1（CPA 在容器 / 远程服务器上）</summary>
       <p>OAuth 完成后会跳到一个无法打开的 <span class="mono">http://127.0.0.1:端口/oauth/callback?code=...&amp;state=...</span> 页面。这是远程部署的预期行为：把地址栏里的完整地址复制下来，粘贴到下面，CPA 会用其中的一次性 code 换取并保存凭证。</p>
       <textarea id="callbackURL" autocomplete="off" placeholder="http://127.0.0.1:40000/oauth/callback?code=...&state=..."></textarea>
       <div style="margin-top:8px"><button id="submitCallback">提交回调地址，完成授权</button></div>
       <p class="sub" style="margin:8px 0 0">authorization code 为一次性凭证，请立即提交且不要分享；无需把回调端口映射到公网。</p>
+      <p class="sub" style="margin:8px 0 0">请在本页开始授权并提交回调。CPA 主界面的通用回调框无法匹配华为返回的登录状态，可能误报「请更新」。</p>
     </details>
   </div>
 
@@ -311,12 +312,15 @@ const panelTemplate = `<!doctype html>
     el.className = "status" + (kind ? " " + kind : "");
   }
   function pollLogin() {
+    loginTimer = null;
     if (!loginState) return;
+    var polledState = loginState;
     if (Date.now() > loginDeadline) {
       setLoginStatus("授权已超时，请重新点击「开始授权」。", "err");
       loginState = ""; return;
     }
     call("/v0/management/get-auth-status?state=" + encodeURIComponent(loginState)).then(function (r) {
+      if (loginState !== polledState) return;
       if (r.status === "ok") {
         setLoginStatus("授权成功，账号已写入 CPA。", "ok");
         document.getElementById("callbackURL").value = "";
@@ -329,15 +333,19 @@ const panelTemplate = `<!doctype html>
       // "wait" carries no detail, so the plugin's own poll route explains which
       // stage the flow is in (waiting for the browser, or exchanging the code).
       call(BASE + "/login/status?state=" + encodeURIComponent(loginState)).then(function (d) {
-        if (d && d.message) setLoginStatus(d.message);
+        if (loginState === polledState && d && d.message) setLoginStatus(d.message);
       }).catch(function () {});
       loginTimer = setTimeout(pollLogin, 2000);
     }).catch(function (e) {
+      if (loginState !== polledState) return;
       setLoginStatus("查询授权状态失败：" + e.message, "err");
+      loginTimer = setTimeout(pollLogin, 2000);
     });
   }
   document.getElementById("login").onclick = function () {
     clearTimeout(loginTimer);
+    loginTimer = null; loginState = "";
+    document.getElementById("callbackURL").value = "";
     setLoginStatus("正在创建授权链接…");
     call("/v0/management/" + P + "-auth-url").then(function (r) {
       loginState = r.state; loginDeadline = Date.now() + 300000;
@@ -357,7 +365,8 @@ const panelTemplate = `<!doctype html>
       .then(function () {
         document.getElementById("callbackURL").value = "";
         setLoginStatus("已收到回调地址，正在换取凭证…");
-        if (!loginTimer) pollLogin();
+        // The existing polling loop keeps running, including transient errors.
+        // Do not start another poll while the current request is still in flight.
       })
       .catch(function (e) { say("提交回调地址失败：" + e.message, "err"); });
   };

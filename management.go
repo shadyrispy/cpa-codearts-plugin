@@ -187,7 +187,9 @@ func handleLoginCallback(req pluginapi.ManagementRequest) pluginapi.ManagementRe
 		return errorJSON(400, "invalid callback request")
 	}
 	loginMu.Lock()
-	session := loginSessions[body.State]
+	// Only the state saved when CPA started this login selects the session.
+	// Huawei's query-string state belongs to its own authorization flow.
+	session := loginSessions[strings.TrimSpace(body.State)]
 	loginMu.Unlock()
 	if session == nil || time.Now().After(session.expires) {
 		return errorJSON(400, "unknown or expired login state")
@@ -196,10 +198,7 @@ func handleLoginCallback(req pluginapi.ManagementRequest) pluginapi.ManagementRe
 	if err != nil || (u.Path != codeArtsOAuthCallback && u.Path != "/authentication") {
 		return errorJSON(400, "paste the full localhost callback URL, for example http://127.0.0.1:40000/oauth/callback?code=...&state=...")
 	}
-	// The host must be either the socket the listener actually bound or the
-	// address the plugin advertised to the console (login_callback_base); those
-	// differ whenever a deployment publishes a different host.
-	if submitted := u.Host; submitted != session.bindAddr && submitted != callbackHost(session.callbackURL) {
+	if !callbackAddressMatches(u, session.callbackURL) {
 		return errorJSON(400, "that callback URL belongs to a different sign-in attempt")
 	}
 	code := strings.TrimSpace(u.Query().Get("code"))
@@ -208,6 +207,10 @@ func handleLoginCallback(req pluginapi.ManagementRequest) pluginapi.ManagementRe
 		return errorJSON(400, "callback URL contains neither an OAuth code nor a legacy secret")
 	}
 	session.mu.Lock()
+	if session.err != "" {
+		session.mu.Unlock()
+		return errorJSON(409, "login has already failed; start a new authorization")
+	}
 	if session.received {
 		session.mu.Unlock()
 		return errorJSON(409, "callback already received")
@@ -221,13 +224,23 @@ func handleLoginCallback(req pluginapi.ManagementRequest) pluginapi.ManagementRe
 	return jsonResponse(200, []byte(`{"success":true}`))
 }
 
-// callbackHost extracts the host:port of an advertised callback URL.
-func callbackHost(rawURL string) string {
-	parsed, errParse := url.Parse(strings.TrimSpace(rawURL))
-	if errParse != nil {
-		return ""
+// callbackAddressMatches accepts loopback spelling changes without accepting
+// a different port, scheme, or remote host. The submitted URL is never fetched;
+// token exchange must keep using the original advertised redirect URI.
+func callbackAddressMatches(submitted *url.URL, advertised string) bool {
+	expected, errParse := url.Parse(advertised)
+	if errParse != nil || submitted == nil || submitted.User != nil || submitted.Fragment != "" ||
+		(submitted.Scheme != "http" && submitted.Scheme != "https") ||
+		submitted.Scheme != expected.Scheme || submitted.Hostname() == "" || submitted.Port() != expected.Port() {
+		return false
 	}
-	return parsed.Host
+	if strings.EqualFold(submitted.Hostname(), expected.Hostname()) {
+		return true
+	}
+	isLoopback := func(host string) bool {
+		return strings.EqualFold(host, "localhost") || host == "127.0.0.1" || host == "::1"
+	}
+	return isLoopback(submitted.Hostname()) && isLoopback(expected.Hostname())
 }
 
 // handleLoginStatus reports the stage of one sign-in flow. CPA's own

@@ -155,9 +155,9 @@ func authLoginStart(request []byte) ([]byte, error) {
 	}
 	port := listener.Addr().(*net.TCPAddr).Port
 	state := randomHex(16)
-	callbackURL := fmt.Sprintf("http://127.0.0.1:%d%s?state=%s", port, codeArtsOAuthCallback, url.QueryEscape(state))
+	callbackURL := fmt.Sprintf("http://127.0.0.1:%d%s", port, codeArtsOAuthCallback)
 	if cfg.LoginCallbackBase != "" {
-		callbackURL = cfg.LoginCallbackBase + codeArtsOAuthCallback + "?state=" + url.QueryEscape(state)
+		callbackURL = cfg.LoginCallbackBase + codeArtsOAuthCallback
 	}
 
 	ticketID := randomUUIDv4()
@@ -345,10 +345,10 @@ func authLoginPoll(request []byte) ([]byte, error) {
 	})
 }
 
-// consumeHostOAuthCallback imports the callback file written by CPA v7.3.4+
-// when its built-in OAuth dialog submits a localhost redirect URL. The plugin's
-// own panel still sends the same code directly through its management route,
-// which keeps older CPA versions working.
+// consumeHostOAuthCallback imports a callback submitted with the CPA session
+// state explicitly supplied. Huawei's callback state is independent of this
+// state, so the stock CPA UI cannot submit the unmodified Huawei URL here.
+// The CodeArts panel submits through the plugin's authenticated route instead.
 func (s *loginSession) consumeHostOAuthCallback(authDir string) error {
 	if s == nil || strings.TrimSpace(authDir) == "" || strings.TrimSpace(s.state) == "" {
 		return nil

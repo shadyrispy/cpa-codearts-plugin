@@ -96,12 +96,12 @@ func TestBuildLoginURLMatchesExtension(t *testing.T) {
 		CodeChallenge:       "challenge-value",
 		CodeChallengeMethod: codeArtsOAuthPKCEMethod,
 	}}
-	got := buildLoginURL(cfg, "f4415ec8-6377-43f7-b909-dc90d177aa50", "http://127.0.0.1:40605/oauth/callback?state=plugin-state", ctx)
+	got := buildLoginURL(cfg, "f4415ec8-6377-43f7-b909-dc90d177aa50", "http://127.0.0.1:40605/oauth/callback", ctx)
 	want := "https://codearts.huaweicloud.com/portal/authorize" +
 		"?theme=2&locale=en&uri_scheme=vscode-codebot&client_id=vscode-codebot&port=40605" +
 		"&code_challenge=challenge-value&code_challenge_method=SHA-256" +
 		"&ticket_id=f4415ec8-6377-43f7-b909-dc90d177aa50" +
-		"&auth_callback_url=http%3A%2F%2F127.0.0.1%3A40605%2Foauth%2Fcallback%3Fstate%3Dplugin-state" +
+		"&auth_callback_url=http%3A%2F%2F127.0.0.1%3A40605%2Foauth%2Fcallback" +
 		"&plugin-name=snap_vscode&plugin-version=26.9.101"
 	if got != want {
 		t.Fatalf("login URL mismatch:\n got %s\nwant %s", got, want)
@@ -113,8 +113,11 @@ func TestBuildLoginURLMatchesExtension(t *testing.T) {
 	if parsed.Path != "/portal/authorize" {
 		t.Fatalf("wrong login path: %s", parsed.Path)
 	}
-	if callback := parsed.Query().Get("auth_callback_url"); callback != "http://127.0.0.1:40605/oauth/callback?state=plugin-state" {
+	if callback := parsed.Query().Get("auth_callback_url"); callback != "http://127.0.0.1:40605/oauth/callback" {
 		t.Fatalf("OAuth callback URL did not survive encoding: %q", callback)
+	}
+	if parsed.Query().Has("state") {
+		t.Fatalf("authorization URL must match the official portal protocol: %s", got)
 	}
 	if parsed.Query().Get("plugin-name") != "snap_vscode" || parsed.Query().Get("client_id") != codeArtsOAuthClientID {
 		t.Fatalf("plugin identity or idea type changed: %s", got)

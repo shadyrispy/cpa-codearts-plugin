@@ -233,10 +233,13 @@ Responses clients (`/v1/responses`), with tool calls and usage preserved.
    The authorization code is single-use, so submit it immediately and do not
    share it.
 
-   CPA `v7.3.4+` can also accept the same URL in its built-in OAuth callback
-   dialog. On older hosts such as `v7.3.2`, that generic endpoint does not exist;
-   open `/v0/resource/plugins/codearts-provider/panel` and use the CodeArts
-   panel's callback box instead.
+   Start and finish authorization in the CodeArts panel above. Huawei generates
+   its own callback `state`, distinct from the CPA login state. CPA's generic
+   callback box looks up the Huawei state and returns `404 unknown or expired
+   state`, misleadingly displayed as an upgrade suggestion. Upgrading CPA alone
+   does not fix this. The CodeArts panel keeps the original CPA state separately
+   and accepts both `localhost` and `127.0.0.1` at the advertised port. Keep the
+   panel open until CPA confirms that the account was saved.
 
    An AK/SK pair you already hold can also be imported as a credential file
    instead of authorizing in a browser. The file name is up to you; the
@@ -838,9 +841,11 @@ Rebuild the library before running it: the test loads the file named by
   No callback port is exposed on the server. Each flow holds a listener and two
   goroutines, so at most 8 concurrent flows are kept; starting a 9th drops the
   flow closest to expiry.
-- **The built-in CPA callback dialog requires CPA v7.3.4 or newer.** Older CPA
-  versions return 404 from `/v0/management/oauth-callback`; the plugin-specific
-  CodeArts panel remains compatible with those hosts.
+- **Use the CodeArts panel's callback box.** Huawei's callback state is not CPA's
+  session state. The generic CPA dialog may display an upgrade hint for a session
+  lookup failure even though its callback endpoint exists. Advanced callers of
+  the generic endpoint must explicitly supply the original CPA `state` alongside
+  `provider` and `redirect_url`; the plugin can consume the resulting callback file.
 - **A pending sign-in can always be explained.** `GET /login/status?state=` (and
   the panel) reports whether the plugin is still waiting for the browser callback
   or already exchanging the authorization code, including the last HTTP status

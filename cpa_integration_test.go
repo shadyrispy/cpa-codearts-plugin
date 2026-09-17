@@ -46,6 +46,13 @@ func TestCPAIntegration(t *testing.T) {
 				http.Error(w, "wrong OAuth exchange", 400)
 				return
 			}
+			if r.Form.Get("grant_type") == "authorization_code" {
+				redirect, parseErr := url.Parse(r.Form.Get("redirect_uri"))
+				if parseErr != nil || redirect.Hostname() != "127.0.0.1" || redirect.Path != codeArtsOAuthCallback || redirect.RawQuery != "" {
+					http.Error(w, "token exchange changed the original redirect URI", 400)
+					return
+				}
+			}
 			w.Header().Set("Content-Type", "application/json")
 			fmt.Fprintf(w, `{"credentials":{"access_key_id":"login-ak","secret_access_key":"login-sk","security_token":"login-sts","expiration":"2030-01-01T00:00:00Z"},"refresh_token":%q}`, refreshToken)
 			return
@@ -303,16 +310,22 @@ func TestCPAIntegration(t *testing.T) {
 		t.Fatal(err)
 	}
 	query := callback.Query()
-	if query.Get("state") != login.State {
-		t.Fatalf("callback URL does not carry the CPA login state: %s", callback)
+	if callback.RawQuery != "" {
+		t.Fatal("redirect URI must not embed the CPA state")
 	}
+	// Huawei generates an independent state; browsers may spell 127.0.0.1 as
+	// localhost. Neither must change the CPA session or original token redirect.
+	callback.Host = "localhost:" + callback.Port()
 	query.Set("code", "browser-authorization-code")
-	query.Add("state", "portal-state")
+	query.Set("state", "huawei-generated-state")
 	callback.RawQuery = query.Encode()
-	// Use CPA v7.3.4+'s generic callback submission, as its built-in OAuth UI
-	// does for plugin auth providers.
 	callbackBody, _ := json.Marshal(map[string]string{"provider": providerID, "redirect_url": callback.String()})
 	status, body = request("POST", "/v0/management/oauth-callback", string(callbackBody))
+	if status != http.StatusNotFound || !bytes.Contains(body, []byte("unknown or expired state")) {
+		t.Fatalf("generic callback should reject Huawei's unrelated state: %d %s", status, body)
+	}
+	callbackBody, _ = json.Marshal(map[string]string{"state": login.State, "callback_url": callback.String()})
+	status, body = request("POST", "/v0/management/codearts-provider/login/callback", string(callbackBody))
 	if status != 200 {
 		t.Fatalf("callback failed: %d %s", status, body)
 	}
@@ -361,7 +374,7 @@ func TestCPAIntegration(t *testing.T) {
 	beforeCalls := loginCalls.Load()
 	secondQuery := secondCallback.Query()
 	secondQuery.Set("code", "second-authorization-code")
-	secondQuery.Add("state", "second-portal-state")
+	secondQuery.Set("state", "second-huawei-state")
 	secondCallback.RawQuery = secondQuery.Encode()
 	callbackResp, err := client.Get(secondCallback.String())
 	if err != nil {
