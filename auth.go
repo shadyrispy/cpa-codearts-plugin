@@ -11,6 +11,8 @@ import (
 	"net"
 	"net/http"
 	"net/url"
+	"os"
+	"path/filepath"
 	"strings"
 	"sync"
 	"time"
@@ -33,6 +35,7 @@ type loginSession struct {
 	secret            string
 	authorizationCode string
 	oauthContext      *oauthLoginContext
+	hostAuthDir       string
 
 	mu       sync.Mutex
 	listener net.Listener
@@ -151,13 +154,13 @@ func authLoginStart(request []byte) ([]byte, error) {
 		return failEnvelope("login_unavailable", "failed to bind the browser callback listener on "+bindAddr+": "+errListen.Error(), http.StatusInternalServerError)
 	}
 	port := listener.Addr().(*net.TCPAddr).Port
-	callbackURL := fmt.Sprintf("http://127.0.0.1:%d%s", port, codeArtsOAuthCallback)
+	state := randomHex(16)
+	callbackURL := fmt.Sprintf("http://127.0.0.1:%d%s?state=%s", port, codeArtsOAuthCallback, url.QueryEscape(state))
 	if cfg.LoginCallbackBase != "" {
-		callbackURL = cfg.LoginCallbackBase + codeArtsOAuthCallback
+		callbackURL = cfg.LoginCallbackBase + codeArtsOAuthCallback + "?state=" + url.QueryEscape(state)
 	}
 
 	ticketID := randomUUIDv4()
-	state := randomHex(16)
 	ctx, cancel := context.WithTimeout(context.Background(), cfg.loginTimeout())
 
 	session := &loginSession{
@@ -169,6 +172,7 @@ func authLoginStart(request []byte) ([]byte, error) {
 		bindAddr:     listener.Addr().String(),
 		expires:      time.Now().Add(cfg.loginTimeout()),
 		oauthContext: oauthContext,
+		hostAuthDir:  strings.TrimSpace(req.Host.AuthDir),
 	}
 	mux := http.NewServeMux()
 	mux.HandleFunc(codeArtsOAuthCallback, session.handleCallback)
@@ -269,6 +273,13 @@ func authLoginPoll(request []byte) ([]byte, error) {
 			Message: "the login flow expired before it completed",
 		})
 	}
+	if errCallback := session.consumeHostOAuthCallback(firstNonEmptyString(req.Host.AuthDir, session.hostAuthDir)); errCallback != nil {
+		session.mu.Lock()
+		if session.err == "" {
+			session.err = errCallback.Error()
+		}
+		session.mu.Unlock()
+	}
 
 	session.mu.Lock()
 	cred := session.credential
@@ -332,6 +343,64 @@ func authLoginPoll(request []byte) ([]byte, error) {
 			NextRefreshAfter: refreshDeadline(cred),
 		},
 	})
+}
+
+// consumeHostOAuthCallback imports the callback file written by CPA v7.3.4+
+// when its built-in OAuth dialog submits a localhost redirect URL. The plugin's
+// own panel still sends the same code directly through its management route,
+// which keeps older CPA versions working.
+func (s *loginSession) consumeHostOAuthCallback(authDir string) error {
+	if s == nil || strings.TrimSpace(authDir) == "" || strings.TrimSpace(s.state) == "" {
+		return nil
+	}
+	path := filepath.Join(authDir, fmt.Sprintf(".oauth-%s-%s.oauth", providerID, s.state))
+	file, errOpen := os.Open(path)
+	if os.IsNotExist(errOpen) {
+		return nil
+	}
+	if errOpen != nil {
+		return fmt.Errorf("read CPA OAuth callback: %w", errOpen)
+	}
+	raw, errRead := io.ReadAll(io.LimitReader(file, 64<<10))
+	errClose := file.Close()
+	if errRead != nil {
+		return fmt.Errorf("read CPA OAuth callback: %w", errRead)
+	}
+	if errClose != nil {
+		return fmt.Errorf("close CPA OAuth callback: %w", errClose)
+	}
+	var callback struct {
+		Code  string `json:"code"`
+		State string `json:"state"`
+		Error string `json:"error"`
+	}
+	if errDecode := json.Unmarshal(raw, &callback); errDecode != nil {
+		return fmt.Errorf("decode CPA OAuth callback: %w", errDecode)
+	}
+	if strings.TrimSpace(callback.State) != s.state {
+		return fmt.Errorf("CPA OAuth callback state does not match this login")
+	}
+	code := strings.TrimSpace(callback.Code)
+	callbackError := strings.TrimSpace(callback.Error)
+	if code == "" && callbackError == "" {
+		return fmt.Errorf("CPA OAuth callback contains neither code nor error")
+	}
+	if errRemove := os.Remove(path); errRemove != nil && !os.IsNotExist(errRemove) {
+		return fmt.Errorf("remove consumed CPA OAuth callback: %w", errRemove)
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.received || s.err != "" {
+		return nil
+	}
+	if callbackError != "" {
+		s.err = "CodeArts OAuth authorization failed: " + callbackError
+		return nil
+	}
+	s.authorizationCode = code
+	s.received = true
+	s.callbackAt = time.Now()
+	return nil
 }
 
 // authRefresh renews the temporary AK/SK pair through the CodeArts token renew

@@ -9,6 +9,8 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"net/url"
+	"os"
+	"path/filepath"
 	"strings"
 	"sync/atomic"
 	"testing"
@@ -94,12 +96,12 @@ func TestBuildLoginURLMatchesExtension(t *testing.T) {
 		CodeChallenge:       "challenge-value",
 		CodeChallengeMethod: codeArtsOAuthPKCEMethod,
 	}}
-	got := buildLoginURL(cfg, "f4415ec8-6377-43f7-b909-dc90d177aa50", "http://127.0.0.1:40605/oauth/callback", ctx)
+	got := buildLoginURL(cfg, "f4415ec8-6377-43f7-b909-dc90d177aa50", "http://127.0.0.1:40605/oauth/callback?state=plugin-state", ctx)
 	want := "https://codearts.huaweicloud.com/portal/authorize" +
 		"?theme=2&locale=en&uri_scheme=vscode-codebot&client_id=vscode-codebot&port=40605" +
 		"&code_challenge=challenge-value&code_challenge_method=SHA-256" +
 		"&ticket_id=f4415ec8-6377-43f7-b909-dc90d177aa50" +
-		"&auth_callback_url=http%3A%2F%2F127.0.0.1%3A40605%2Foauth%2Fcallback" +
+		"&auth_callback_url=http%3A%2F%2F127.0.0.1%3A40605%2Foauth%2Fcallback%3Fstate%3Dplugin-state" +
 		"&plugin-name=snap_vscode&plugin-version=26.9.101"
 	if got != want {
 		t.Fatalf("login URL mismatch:\n got %s\nwant %s", got, want)
@@ -111,11 +113,29 @@ func TestBuildLoginURLMatchesExtension(t *testing.T) {
 	if parsed.Path != "/portal/authorize" {
 		t.Fatalf("wrong login path: %s", parsed.Path)
 	}
-	if callback := parsed.Query().Get("auth_callback_url"); callback != "http://127.0.0.1:40605/oauth/callback" {
+	if callback := parsed.Query().Get("auth_callback_url"); callback != "http://127.0.0.1:40605/oauth/callback?state=plugin-state" {
 		t.Fatalf("OAuth callback URL did not survive encoding: %q", callback)
 	}
 	if parsed.Query().Get("plugin-name") != "snap_vscode" || parsed.Query().Get("client_id") != codeArtsOAuthClientID {
 		t.Fatalf("plugin identity or idea type changed: %s", got)
+	}
+}
+
+func TestConsumeHostOAuthCallback(t *testing.T) {
+	authDir := t.TempDir()
+	session := &loginSession{state: "plugin-state", expires: time.Now().Add(time.Minute)}
+	path := filepath.Join(authDir, ".oauth-"+providerID+"-"+session.state+".oauth")
+	if errWrite := os.WriteFile(path, []byte(`{"code":"host-code","state":"plugin-state","error":""}`), 0600); errWrite != nil {
+		t.Fatal(errWrite)
+	}
+	if errConsume := session.consumeHostOAuthCallback(authDir); errConsume != nil {
+		t.Fatal(errConsume)
+	}
+	if !session.received || session.authorizationCode != "host-code" || session.callbackAt.IsZero() {
+		t.Fatalf("host callback was not imported: %+v", session)
+	}
+	if _, errStat := os.Stat(path); !os.IsNotExist(errStat) {
+		t.Fatalf("consumed callback file still exists: %v", errStat)
 	}
 }
 

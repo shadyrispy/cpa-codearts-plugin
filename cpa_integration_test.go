@@ -13,6 +13,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"sync/atomic"
 	"testing"
@@ -96,7 +97,17 @@ func TestCPAIntegration(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err = os.WriteFile(filepath.Join(pluginDir, "codearts-provider.dll"), library, 0600); err != nil {
+	libraryExt := strings.ToLower(filepath.Ext(dll))
+	if libraryExt == "" {
+		if runtime.GOOS == "windows" {
+			libraryExt = ".dll"
+		} else if runtime.GOOS == "darwin" {
+			libraryExt = ".dylib"
+		} else {
+			libraryExt = ".so"
+		}
+	}
+	if err = os.WriteFile(filepath.Join(pluginDir, "codearts-provider"+libraryExt), library, 0600); err != nil {
 		t.Fatal(err)
 	}
 	listener, err := net.Listen("tcp", "127.0.0.1:0")
@@ -292,12 +303,16 @@ func TestCPAIntegration(t *testing.T) {
 		t.Fatal(err)
 	}
 	query := callback.Query()
+	if query.Get("state") != login.State {
+		t.Fatalf("callback URL does not carry the CPA login state: %s", callback)
+	}
 	query.Set("code", "browser-authorization-code")
-	query.Set("state", "portal-state")
+	query.Add("state", "portal-state")
 	callback.RawQuery = query.Encode()
-	// Use the protected callback submission also used by remote deployments.
-	callbackBody, _ := json.Marshal(map[string]string{"state": login.State, "callback_url": callback.String()})
-	status, body = request("POST", "/v0/management/codearts-provider/login/callback", string(callbackBody))
+	// Use CPA v7.3.4+'s generic callback submission, as its built-in OAuth UI
+	// does for plugin auth providers.
+	callbackBody, _ := json.Marshal(map[string]string{"provider": providerID, "redirect_url": callback.String()})
+	status, body = request("POST", "/v0/management/oauth-callback", string(callbackBody))
 	if status != 200 {
 		t.Fatalf("callback failed: %d %s", status, body)
 	}
@@ -346,7 +361,7 @@ func TestCPAIntegration(t *testing.T) {
 	beforeCalls := loginCalls.Load()
 	secondQuery := secondCallback.Query()
 	secondQuery.Set("code", "second-authorization-code")
-	secondQuery.Set("state", "second-portal-state")
+	secondQuery.Add("state", "second-portal-state")
 	secondCallback.RawQuery = secondQuery.Encode()
 	callbackResp, err := client.Get(secondCallback.String())
 	if err != nil {

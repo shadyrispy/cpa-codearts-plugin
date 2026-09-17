@@ -233,6 +233,11 @@ Responses clients (`/v1/responses`), with tool calls and usage preserved.
    The authorization code is single-use, so submit it immediately and do not
    share it.
 
+   CPA `v7.3.4+` can also accept the same URL in its built-in OAuth callback
+   dialog. On older hosts such as `v7.3.2`, that generic endpoint does not exist;
+   open `/v0/resource/plugins/codearts-provider/panel` and use the CodeArts
+   panel's callback box instead.
+
    An AK/SK pair you already hold can also be imported as a credential file
    instead of authorizing in a browser. The file name is up to you; the
    auto-generated name for a browser sign-in is
@@ -833,6 +838,9 @@ Rebuild the library before running it: the test loads the file named by
   No callback port is exposed on the server. Each flow holds a listener and two
   goroutines, so at most 8 concurrent flows are kept; starting a 9th drops the
   flow closest to expiry.
+- **The built-in CPA callback dialog requires CPA v7.3.4 or newer.** Older CPA
+  versions return 404 from `/v0/management/oauth-callback`; the plugin-specific
+  CodeArts panel remains compatible with those hosts.
 - **A pending sign-in can always be explained.** `GET /login/status?state=` (and
   the panel) reports whether the plugin is still waiting for the browser callback
   or already exchanging the authorization code, including the last HTTP status
