@@ -340,7 +340,11 @@ schedule:
 ```
 
 `checkin_url` may be absolute or a path resolved against `base_url`. The request
-is signed the same way as every other upstream call. Because the upstream
+is signed the same way as every other upstream call. **With more than one stored
+credential, set `checkin_all_accounts: true`**: the allowance belongs to each
+account separately, and by default the claim runs once, for whichever credential
+resolves first. Partial results are reported per account (`2 claimed, 0 already`,
+or `1 claimed, 1 failed: <account>: …`) rather than collapsing to one status. Because the upstream
 contract is unpublished, the outcome is judged by the markers above rather than
 by HTTP status alone: a bare `200` without the success marker is reported as a
 failure, so a silently rejected claim never looks like a success.
@@ -621,6 +625,8 @@ example.
 | `schedule.tasks[].checkin_body` / `checkin_headers` | — | Body and extra headers for the claim request. |
 | `schedule.tasks[].checkin_success_marker` | — | Substring that must appear on a real claim. |
 | `schedule.tasks[].checkin_already_marker` | — | Substring meaning "already claimed"; counted as success. |
+| `schedule.tasks[].checkin_all_accounts` | `false` | Claim once per stored credential. The allowance is per Huawei Cloud account, so multi-account setups need this or only one account ever claims. Off by default because an unknown claim URL is not necessarily per-account. |
+| `schedule.tasks[].checkin_auth_index` | — | Restrict the claim to one credential, matched against auth index, file name or label. |
 
 ## Publishing to the CLIProxyAPI plugin store
 

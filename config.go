@@ -166,6 +166,13 @@ type ScheduleTask struct {
 	// CheckinAlreadyMarker is a substring indicating the benefit was already
 	// claimed today. Matching it counts as success rather than a failure.
 	CheckinAlreadyMarker string `yaml:"checkin_already_marker" json:"checkin_already_marker"`
+	// CheckinAllAccounts runs the claim once per stored credential. The benefit
+	// allowance is granted per Huawei Cloud account, so a deployment with several
+	// accounts only collects one account's worth without this.
+	CheckinAllAccounts bool `yaml:"checkin_all_accounts" json:"checkin_all_accounts"`
+	// CheckinAuthIndex restricts the claim to one credential, matched against the
+	// auth index, file name or label. Empty means "not restricted".
+	CheckinAuthIndex string `yaml:"checkin_auth_index" json:"checkin_auth_index"`
 }
 
 // isEnabled reports whether the task is on. An omitted flag means enabled, so a

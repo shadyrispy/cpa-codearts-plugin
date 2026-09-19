@@ -199,18 +199,28 @@ plugins:
             type: "checkin"
             cron: "5 0 * * *"                          # 00:05 daily
             checkin_method: "POST"
-            # Absolute, or a path resolved against base_url.
-            checkin_url: "/v1/activity/benefit/daily/claim"
-            checkin_body: '{"activityCode":"daily_sign_in"}'
+            # Absolute, or a path resolved against base_url. The 限时福利 claim
+            # lives on the open gateway and takes an empty body; it is idempotent,
+            # so running it twice a day is harmless.
+            checkin_url: "https://opengw.developer.huaweicloud.com/api/v1/benefit/claim"
+            checkin_body: ""
             checkin_headers: {}
               # x-snap-traceid: "..."   # only if the page sends one
             # Text that appears only on a real claim. With this set, a bare HTTP
             # 200 that lacks the marker is reported as a failure rather than a
             # silent success.
-            checkin_success_marker: ""
+            checkin_success_marker: '"error_msg":"success"'
             # Text meaning "already claimed today". Matching it counts as
             # success, so a twice-a-day schedule does not look like a failure.
             checkin_already_marker: ""
+            # The allowance is granted per Huawei Cloud account, so a deployment
+            # with several credentials has to claim for each of them. Off by
+            # default: an unknown claim URL is not necessarily per-account, and
+            # repeating it for every credential is the pattern upstream throttles.
+            checkin_all_accounts: true
+            # Or pin one account by auth index, file name or label. Empty means
+            # "not restricted".
+            checkin_auth_index: ""
             enabled: false
 
           # Escape hatch: schedule any CodeArts gateway endpoint. `path` is
