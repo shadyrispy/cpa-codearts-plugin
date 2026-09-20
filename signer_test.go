@@ -2,9 +2,13 @@ package main
 
 import (
 	"encoding/base64"
+	"io"
+	"net/http"
+	"net/http/httptest"
 	"net/url"
 	"strings"
 	"testing"
+	"time"
 )
 
 // TestSignRequestMatchesReferenceVector pins the signer to the exact canonical
@@ -118,6 +122,65 @@ func TestSignRequestRejectsIncompleteCredential(t *testing.T) {
 	_, errSign := signRequest("POST", "https://example.invalid/x", nil, nil, &credential{AccessKeyID: "only-ak"}, false)
 	if errSign == nil {
 		t.Fatal("expected an error for a credential without a secret key")
+	}
+}
+
+// The real CPA host assigns the plugin's header map directly to http.Request.
+// A lower-case "host" key bypasses net/http's canonical Host exclusion and is
+// sent in addition to the built-in Host header, which an HTTP/1 server rejects
+// before its handler runs. A mocked host callback cannot catch this regression.
+func TestHostSignedRequestSurvivesCPAHTTPSerialization(t *testing.T) {
+	for _, suppliedHostKey := range []string{"", "host", "Host", "hOsT"} {
+		name := suppliedHostKey
+		if name == "" {
+			name = "injected-host"
+		}
+		t.Run(name, func(t *testing.T) {
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				if r.Host == "" || !strings.Contains(r.Header.Get("Authorization"), "SignedHeaders=host;x-sdk-date;x-security-token,") || r.Header.Get("X-Security-Token") != "fixture-sts" {
+					http.Error(w, "missing signed gateway headers", http.StatusUnauthorized)
+					return
+				}
+				w.WriteHeader(http.StatusOK)
+				_, _ = io.WriteString(w, "accepted")
+			}))
+			defer server.Close()
+			endpoint := server.URL + "/api/v1/gateway/config"
+			u, err := url.Parse(endpoint)
+			if err != nil {
+				t.Fatal(err)
+			}
+			var headers map[string]string
+			if suppliedHostKey != "" {
+				headers = map[string]string{suppliedHostKey: u.Host}
+			}
+			cred := &credential{AccessKeyID: "fixture-ak", SecretAccessKey: "fixture-sk", SecurityToken: "fixture-sts"}
+			signed, err := signRequest(http.MethodGet, endpoint, headers, nil, cred, true)
+			if err != nil {
+				t.Fatal(err)
+			}
+			req, err := http.NewRequest(http.MethodGet, endpoint, nil)
+			if err != nil {
+				t.Fatal(err)
+			}
+			// Keep the direct assignment used by CPA, rather than Header.Set,
+			// which would hide incorrectly cased keys by canonicalizing them.
+			req.Header = http.Header(toHeaderMap(signed))
+			client := server.Client()
+			client.Timeout = 2 * time.Second
+			resp, err := client.Do(req)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer resp.Body.Close()
+			body, err := io.ReadAll(resp.Body)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if resp.StatusCode != http.StatusOK || string(body) != "accepted" {
+				t.Fatalf("host-signed request rejected after real HTTP serialization: status=%d body=%q", resp.StatusCode, body)
+			}
+		})
 	}
 }
 

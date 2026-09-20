@@ -15,6 +15,7 @@ import (
 	"path/filepath"
 	"runtime"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -31,6 +32,13 @@ func TestCPAIntegration(t *testing.T) {
 	}
 	var chatCalls, loginCalls atomic.Int32
 	var nextStatus atomic.Int32
+	var sessionMu sync.Mutex
+	activeSessions := map[string]bool{}
+	sessionStarts := map[string]int{}
+	sessionFinishes := map[string]int{}
+	agentModels := modelFixture(t, "agent-detail")
+	gatewayModels := modelFixture(t, "gateway-config")
+	agentList := modelFixture(t, "useragents")
 	profile, _ := json.Marshal(oauthIdentity{AccountID: "tenant", PrincipalID: "browser-id", PrincipalURN: "iam::tenant:browser-user"})
 	claims, _ := json.Marshal(map[string]string{"user_profile": base64.RawURLEncoding.EncodeToString(profile)})
 	refreshToken := "e30." + base64.RawURLEncoding.EncodeToString(claims) + ".signature"
@@ -62,19 +70,78 @@ func TestCPAIntegration(t *testing.T) {
 			return
 		}
 		switch r.URL.Path {
+		case "/snap-manager/v1/chat-session/heartbeat":
+			sessionID := strings.TrimSpace(r.Header.Get("user-session-id"))
+			body, _ := io.ReadAll(r.Body)
+			if r.Method != http.MethodPut || sessionID == "" || string(body) != "{}" {
+				http.Error(w, "invalid chat session heartbeat", http.StatusBadRequest)
+				return
+			}
+			sessionMu.Lock()
+			defer sessionMu.Unlock()
+			switch r.URL.Query().Get("status") {
+			case "busy":
+				if !activeSessions[sessionID] {
+					if len(activeSessions) >= 3 {
+						http.Error(w, "TM.00001041: session limit is 3", http.StatusBadRequest)
+						return
+					}
+					activeSessions[sessionID] = true
+					sessionStarts[sessionID]++
+				}
+			case "idle":
+				if activeSessions[sessionID] {
+					delete(activeSessions, sessionID)
+					sessionFinishes[sessionID]++
+				}
+			default:
+				http.Error(w, "invalid chat session status", http.StatusBadRequest)
+				return
+			}
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = io.WriteString(w, `{"status":"ok"}`)
+		case "/v1/agent-center/agents/useragents":
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = w.Write(agentList)
 		case "/v1/agent-center/agents/detail":
 			w.Header().Set("Content-Type", "application/json")
-			fmt.Fprint(w, `{"gpts":{"models":[{"model_alias":"audit-model","model_name":"Audit Model","model_parameters":{"enabled":true,"context_window":128000,"max_tokens":8192,"supports_images":true}}]},"sub_agents":[]}`)
+			_, _ = w.Write(agentModels)
+		case "/v1/benefit-gateway-config":
+			fmt.Fprint(w, `{"enabled":true}`)
+		case "/api/v1/gateway/config":
+			if !strings.Contains(r.Header.Get("Authorization"), "SignedHeaders=host;x-sdk-date;x-security-token") {
+				http.Error(w, "incorrect benefit gateway signature", 401)
+				return
+			}
+			_, _ = w.Write(gatewayModels)
 		case agentModePath:
 			chatCalls.Add(1)
+			sessionMu.Lock()
+			busy := activeSessions[r.Header.Get("user-session-id")]
+			sessionMu.Unlock()
+			if !busy {
+				http.Error(w, "chat did not use an active busy session", http.StatusBadRequest)
+				return
+			}
 			if status := nextStatus.Load(); status != 0 {
 				http.Error(w, "fixture rate limit", int(status))
 				return
 			}
 			body, _ := io.ReadAll(r.Body)
 			var request map[string]json.RawMessage
-			if json.Unmarshal(body, &request) != nil || string(request["model"]) != `"audit-model"` {
+			if json.Unmarshal(body, &request) != nil {
 				http.Error(w, "wrong model", 400)
+				return
+			}
+			var requested string
+			_ = json.Unmarshal(request["model"], &requested)
+			if requested != "GLM-5.2" && requested != "glm-5.3-flash" {
+				http.Error(w, "model alias was not resolved", 400)
+				return
+			}
+			benefit := requested == "glm-5.3-flash"
+			if (r.Header.Get("maas_type") == "benefit") != benefit || r.Header.Get("model-id") != requested || r.Header.Get("model-name") != requested {
+				http.Error(w, "wrong model routing headers", 400)
 				return
 			}
 			w.Header().Set("Content-Type", "text/event-stream")
@@ -124,12 +191,27 @@ func TestCPAIntegration(t *testing.T) {
 	port := listener.Addr().(*net.TCPAddr).Port
 	listener.Close()
 	configPath := filepath.Join(dir, "config.yaml")
-	configYAML := fmt.Sprintf("host: 127.0.0.1\nport: %d\nauth-dir: %q\napi-keys: [audit-client]\nremote-management:\n  allow-remote: false\n  secret-key: audit-admin\n  disable-control-panel: true\nrequest-retry: 0\nplugins:\n  enabled: true\n  dir: %q\n  configs:\n    codearts-provider:\n      enabled: true\n      base_url: %q\n      oauth_token_url: %q\n      discover_models: true\n", port, filepath.ToSlash(authDir), filepath.ToSlash(pluginDir), upstream.URL, upstream.URL+"/v1/oauth2/tokens")
+	const staticModelConfig = "      model_map: {audit-model: GLM-5.2}\n      models: [{id: audit-model, display_name: Audit alias}]\n"
+	configYAML := fmt.Sprintf("host: 127.0.0.1\nport: %d\nauth-dir: %q\napi-keys: [audit-client]\nremote-management:\n  allow-remote: false\n  secret-key: audit-admin\n  disable-control-panel: true\nrequest-retry: 0\nplugins:\n  enabled: true\n  dir: %q\n  configs:\n    codearts-provider:\n      enabled: true\n      base_url: %q\n      benefit_gateway_url: %q\n      oauth_token_url: %q\n      discover_models: true\n", port, filepath.ToSlash(authDir), filepath.ToSlash(pluginDir), upstream.URL, upstream.URL, upstream.URL+"/v1/oauth2/tokens") + staticModelConfig
 	if err = os.WriteFile(configPath, []byte(configYAML), 0600); err != nil {
 		t.Fatal(err)
 	}
 	base := fmt.Sprintf("http://127.0.0.1:%d", port)
 	client := &http.Client{Timeout: 15 * time.Second}
+	assertSessionsIdle := func() {
+		t.Helper()
+		deadline := time.Now().Add(3 * time.Second)
+		for time.Now().Before(deadline) {
+			sessionMu.Lock()
+			remaining := len(activeSessions)
+			sessionMu.Unlock()
+			if remaining == 0 {
+				return
+			}
+			time.Sleep(10 * time.Millisecond)
+		}
+		t.Fatal("chat terminated without releasing its busy session")
+	}
 	request := func(method, path, body string) (int, []byte) {
 		t.Helper()
 		req, err := http.NewRequest(method, base+path, strings.NewReader(body))
@@ -150,6 +232,9 @@ func TestCPAIntegration(t *testing.T) {
 		b, err := io.ReadAll(resp.Body)
 		if err != nil {
 			t.Fatal(err)
+		}
+		if path == "/v1/chat/completions" || path == "/v1/messages" {
+			assertSessionsIdle()
 		}
 		return resp.StatusCode, b
 	}
@@ -202,24 +287,76 @@ func TestCPAIntegration(t *testing.T) {
 		t.Fatalf("plugin not enabled: %d %s", status, body)
 	}
 	t.Log("actual CPA loaded and enabled the DLL")
-	status, body = request("POST", "/v0/management/codearts-provider/import", `{"access_key_id":"import-ak","secret_access_key":"import-sk","user_name":"imported","name":"codearts-provider-integration.json"}`)
+	status, body = request("POST", "/v0/management/codearts-provider/import", `{"access_key_id":"import-ak","secret_access_key":"import-sk","security_token":"import-sts","expires_at":"2030-01-01T00:00:00Z","user_name":"imported","name":"codearts-provider-integration.json"}`)
 	if status != 200 {
 		t.Fatalf("import failed: %d %s", status, body)
 	}
-	assertModel := func() {
+	assertModels := func(expectedIDs ...string) {
 		t.Helper()
 		deadline := time.Now().Add(15 * time.Second)
 		for time.Now().Before(deadline) {
 			status, body = request("GET", "/v1/models", "")
-			if status == 200 && bytes.Contains(body, []byte(`"audit-model"`)) {
+			complete := status == http.StatusOK
+			for _, modelID := range expectedIDs {
+				complete = complete && bytes.Contains(body, []byte(`"`+modelID+`"`))
+			}
+			if complete {
 				return
 			}
 			time.Sleep(200 * time.Millisecond)
 		}
+		_, accountsBody := request("GET", "/v0/management/codearts-provider/accounts", "")
+		var accounts struct {
+			Accounts []struct {
+				AuthIndex string `json:"auth_index"`
+			} `json:"accounts"`
+		}
+		if json.Unmarshal(accountsBody, &accounts) == nil {
+			for _, account := range accounts.Accounts {
+				catalogStatus, catalogBody := request("GET", "/v0/management/codearts-provider/models?auth_index="+url.QueryEscape(account.AuthIndex), "")
+				var catalog modelCatalogResult
+				if json.Unmarshal(catalogBody, &catalog) == nil {
+					t.Logf("account catalog diagnostic: status=%d source=%s warnings=%v", catalogStatus, catalog.Source, catalog.Warnings)
+				}
+			}
+		}
 		t.Fatalf("discovered model missing: %d %s", status, body)
 	}
-	assertModel()
+	assertModels("audit-model", "glm-5.3-flash")
+	capturedModelIDs := []string{"GLM-5.2", "glm-5.2-sft-harmony", "openpangu-2.0-pro", "openpangu-2.0-flash", "deepseek-v4-flash-0731", "deepseek-v4-pro-0813", "glm-5.3-flash"}
+	for _, modelID := range capturedModelIDs {
+		if !bytes.Contains(body, []byte(`"`+modelID+`"`)) {
+			t.Fatalf("captured model %s is missing from CPA catalog: %s", modelID, body)
+		}
+	}
+	if bytes.Contains(body, []byte("PanguDev_COM_QC2")) {
+		t.Fatal("CPA advertised the obsolete default model")
+	}
 	t.Log("imported nested credential and discovered account models")
+	status, body = request("POST", "/v1/chat/completions", `{"model":"glm-5.3-flash","messages":[{"role":"user","content":"hello"}]}`)
+	if status != 200 || !bytes.Contains(body, []byte("hello from fixture")) {
+		t.Fatalf("benefit model routing failed: %d %s", status, body)
+	}
+	t.Log("all seven captured model IDs appeared and benefit routing passed through CPA")
+	status, body = request("GET", "/v0/management/codearts-provider/accounts", "")
+	var accountList struct {
+		Accounts []struct {
+			AuthIndex string `json:"auth_index"`
+		} `json:"accounts"`
+	}
+	if json.Unmarshal(body, &accountList) != nil || status != 200 || len(accountList.Accounts) != 1 {
+		t.Fatalf("account inventory failed: %d %s", status, body)
+	}
+	status, body = request("GET", "/v0/management/codearts-provider/models?auth_index="+url.QueryEscape(accountList.Accounts[0].AuthIndex), "")
+	var visibleCatalog modelCatalogResult
+	if json.Unmarshal(body, &visibleCatalog) != nil || status != 200 || len(visibleCatalog.Models) != 8 || visibleCatalog.Source != "discovered" || len(visibleCatalog.Warnings) != 0 {
+		t.Fatalf("panel account catalog differs from registered models: %d %s", status, body)
+	}
+	for _, secret := range []string{"import-ak", "import-sk", "import-sts", "access_key_id", "oauth_context"} {
+		if bytes.Contains(body, []byte(secret)) {
+			t.Fatal("model diagnostics exposed credential material")
+		}
+	}
 	for _, stream := range []bool{false, true} {
 		status, body = request("POST", "/v1/chat/completions", fmt.Sprintf(`{"model":"audit-model","messages":[{"role":"user","content":"hello"}],"stream":%t,"stream_options":{"include_usage":true}}`, stream))
 		if status != 200 || !bytes.Contains(body, []byte("hello from fixture")) || !bytes.Contains(body, []byte(`"total_tokens":18`)) {
@@ -279,14 +416,33 @@ func TestCPAIntegration(t *testing.T) {
 	if status != 200 || !bytes.Contains(body, []byte(`"type":"tool_use"`)) || !bytes.Contains(body, []byte(`"partial_json"`)) || !bytes.Contains(body, []byte(`"stop_reason":"tool_use"`)) {
 		t.Fatalf("anthropic tool stream failed: %d %s", status, body)
 	}
-	status, body = request("POST", "/v1/messages/count_tokens", `{"model":"audit-model","messages":[{"role":"user","content":"hello"}]}`)
-	if status != 200 || !bytes.Contains(body, []byte(`"input_tokens"`)) {
-		t.Fatalf("anthropic count_tokens shape is wrong: %d %s", status, body)
+	beforeCountCalls := chatCalls.Load()
+	countThroughCPA := func(payload string) int {
+		t.Helper()
+		countStatus, countBody := request("POST", "/v1/messages/count_tokens", payload)
+		var result struct {
+			InputTokens int  `json:"input_tokens"`
+			Estimated   bool `json:"estimated"`
+		}
+		if countStatus != 200 || json.Unmarshal(countBody, &result) != nil || result.InputTokens <= 0 || !result.Estimated {
+			t.Fatalf("anthropic count_tokens lost its estimate: %d %s", countStatus, countBody)
+		}
+		return result.InputTokens
+	}
+	baseCount := countThroughCPA(`{"model":"audit-model","messages":[{"role":"user","content":"hello"}]}`)
+	if actual := countThroughCPA(`{"model":"audit-model","max_tokens":100000,"temperature":0.2,"metadata":{"user_id":"` + strings.Repeat("tracking", 200) + `"},"messages":[{"role":"user","content":"hello"}]}`); actual != baseCount {
+		t.Fatalf("CPA counted transport metadata or output options: got %d want %d", actual, baseCount)
+	}
+	if actual := countThroughCPA(`{"model":"audit-model","messages":[{"role":"user","content":"` + strings.Repeat("中文", 200) + `"}]}`); actual <= baseCount {
+		t.Fatal("CPA count did not grow with actual input")
+	}
+	if chatCalls.Load() != beforeCountCalls {
+		t.Fatal("token counting sent a generation request upstream")
 	}
 	t.Log("Anthropic streams carry the full event sequence, tool blocks and count_tokens")
 	stop()
 	start()
-	assertModel()
+	assertModels("audit-model", "glm-5.3-flash")
 	status, body = request("POST", "/v1/chat/completions", `{"model":"audit-model","messages":[{"role":"user","content":"after restart"}]}`)
 	if status != 200 || !bytes.Contains(body, []byte("hello from fixture")) {
 		t.Fatalf("restart lost credential: %d %s", status, body)
@@ -426,8 +582,42 @@ func TestCPAIntegration(t *testing.T) {
 	if status != 429 {
 		t.Fatalf("CPA lost upstream 429: %d %s", status, body)
 	}
+	if !bytes.Contains(body, []byte("fixture rate limit")) {
+		t.Fatalf("CPA lost the upstream error reason: %s", body)
+	}
 	t.Log("CPA preserved upstream rate-limit status for streaming clients")
 	if chatCalls.Load() < 4 {
 		t.Fatal("chat requests did not reach the upstream")
 	}
+
+	// An empty static model list is the shipped default. Restart the actual
+	// host without the test alias so static registration cannot mask failures
+	// to register or execute models discovered from saved accounts.
+	stop()
+	configYAML = strings.Replace(configYAML, staticModelConfig, "", 1)
+	if err = os.WriteFile(configPath, []byte(configYAML), 0600); err != nil {
+		t.Fatal(err)
+	}
+	nextStatus.Store(0)
+	start()
+	assertModels(capturedModelIDs...)
+	for _, unexpected := range []string{"audit-model", "PanguDev_COM_QC2"} {
+		if bytes.Contains(body, []byte(`"`+unexpected+`"`)) {
+			t.Fatalf("empty static configuration advertised %s: %s", unexpected, body)
+		}
+	}
+	for _, modelID := range []string{"GLM-5.2", "glm-5.3-flash", "GLM-5.2", "glm-5.3-flash"} {
+		status, body = request("POST", "/v1/chat/completions", fmt.Sprintf(`{"model":%q,"messages":[{"role":"user","content":"without static aliases"}]}`, modelID))
+		if status != http.StatusOK || !bytes.Contains(body, []byte("hello from fixture")) {
+			t.Fatalf("discovered model %s was not callable without static configuration: %d %s", modelID, status, body)
+		}
+	}
+	sessionMu.Lock()
+	defer sessionMu.Unlock()
+	for sessionID, starts := range sessionStarts {
+		if sessionFinishes[sessionID] != starts {
+			t.Fatalf("chat session lifecycle is unbalanced: busy=%d idle=%d", starts, sessionFinishes[sessionID])
+		}
+	}
+	t.Log("empty static model configuration registered all seven models and executed agent and benefit requests")
 }

@@ -57,9 +57,24 @@ func registrationResponse() map[string]any {
 					Description: "CodeArts agent UUID or alias used by the native protocol.",
 				},
 				{
+					Name:        "discover_models",
+					Type:        pluginapi.ConfigFieldTypeBoolean,
+					Description: "Discover each account's Agent Center and benefit gateway models. Enabled by default; no models are invented when discovery fails.",
+				},
+				{
+					Name:        "benefit_gateway_url",
+					Type:        pluginapi.ConfigFieldTypeString,
+					Description: "Benefit model catalog base, default https://opengw.developer.huaweicloud.com. Empty disables this catalog; chats use the CodeArts base_url.",
+				},
+				{
+					Name:        "model_agent_ids",
+					Type:        pluginapi.ConfigFieldTypeArray,
+					Description: "Optional Agent Center catalog IDs. Empty discovers the account's agents automatically.",
+				},
+				{
 					Name:        "default_model_id",
 					Type:        pluginapi.ConfigFieldTypeString,
-					Description: "Upstream model_id sent when the requested model has no explicit mapping.",
+					Description: "Optional upstream model ID for requests that omit a model. Empty by default.",
 				},
 				{
 					Name:        "models",
@@ -79,7 +94,7 @@ func registrationResponse() map[string]any {
 				{
 					Name:        "sign_host",
 					Type:        pluginapi.ConfigFieldTypeBoolean,
-					Description: "Include the host header in the signed header set. Off by default because the official extension does not sign host.",
+					Description: "Include host in regional API signatures. Benefit gateway requests always sign host independently of this setting.",
 				},
 				{
 					Name:        "is_confidential",
@@ -90,6 +105,11 @@ func registrationResponse() map[string]any {
 					Name:        "heartbeat",
 					Type:        pluginapi.ConfigFieldTypeBoolean,
 					Description: "Request upstream SSE heartbeat comment frames.",
+				},
+				{
+					Name:        "chat_session_heartbeat",
+					Type:        pluginapi.ConfigFieldTypeBoolean,
+					Description: "Report each chat session as busy/idle so completed requests release upstream concurrency slots. Enabled by default in agent mode.",
 				},
 				{
 					Name:        "request_timeout_seconds",
@@ -121,8 +141,8 @@ func modelRegistration() pluginapi.ModelRegistrationResponse {
 }
 
 // staticModels returns the provider-native static model list. The upstream model
-// catalogue is tenant specific and normally fetched at runtime by the official
-// IDE plugin, so the plugin advertises the configured list instead.
+// catalogue is account specific. Only explicit operator overrides are static;
+// the default list is empty and model.for_auth supplies the discovered catalog.
 func staticModels() pluginapi.ModelResponse {
 	return pluginapi.ModelResponse{
 		Provider: providerID,

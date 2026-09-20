@@ -89,6 +89,9 @@ func TestStreamResponseWireKeys(t *testing.T) {
 // payload against pluginapi.ModelRegistrationResponse, which is untagged and
 // therefore uses Go field names on the wire.
 func TestModelRegistrationDecodesAsHostExpects(t *testing.T) {
+	cfg := defaultConfig()
+	cfg.Models = []ModelConfig{{ID: "wire-test-model", Name: "wire-test-model"}}
+	useModelTestConfig(t, cfg)
 	raw, errMarshal := json.Marshal(modelRegistration())
 	if errMarshal != nil {
 		t.Fatalf("marshal model registration: %v", errMarshal)

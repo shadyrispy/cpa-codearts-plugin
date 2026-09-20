@@ -15,6 +15,9 @@ type Config struct {
 	// BaseURL is the CodeArts Doer regional API endpoint. Both the native chat
 	// API and the OpenAI-compatible agent API are served from this host.
 	BaseURL string `yaml:"base_url" json:"base_url"`
+	// BenefitGatewayURL supplies the optional second catalog used by CodeArts.
+	// Chat requests still go through BaseURL with the benefit routing header.
+	BenefitGatewayURL string `yaml:"benefit_gateway_url" json:"benefit_gateway_url"`
 	// WebLoginBase is the web console used to start the browser login flow.
 	WebLoginBase string `yaml:"web_login_base" json:"web_login_base"`
 	// OAuthTokenURL and OAuthIdentityURL are the Huawei STS endpoints used by
@@ -41,14 +44,13 @@ type Config struct {
 	IDEBaseURL string `yaml:"ide_base_url" json:"ide_base_url"`
 	// AgentID is the CodeArts agent UUID or alias used by the native protocol.
 	AgentID string `yaml:"agent_id" json:"agent_id"`
-	// DefaultModelID is the upstream model_id sent when the requested model has
-	// no explicit upstream mapping.
+	// DefaultModelID is the explicit fallback for a request with no model ID.
 	DefaultModelID string `yaml:"default_model_id" json:"default_model_id"`
 	// ModelMap maps client-facing model IDs to upstream model IDs.
 	ModelMap map[string]string `yaml:"model_map" json:"model_map"`
 	// Models is the static model list advertised to CLIProxyAPI.
 	Models []ModelConfig `yaml:"models" json:"models"`
-	// DiscoverModels queries the signed Agent Center detail endpoints per account.
+	// DiscoverModels queries Agent Center and the optional benefit catalog per account.
 	DiscoverModels bool     `yaml:"discover_models" json:"discover_models"`
 	ModelAgentIDs  []string `yaml:"model_agent_ids" json:"model_agent_ids"`
 	// RequestTimeoutSeconds bounds a single upstream request.
@@ -68,9 +70,12 @@ type Config struct {
 	LoginCallbackBase string `yaml:"login_callback_base" json:"login_callback_base"`
 	// Heartbeat enables the upstream SSE heartbeat comment frames.
 	Heartbeat bool `yaml:"heartbeat" json:"heartbeat"`
-	// SignHost adds the `host` header to the signed header set. The official
-	// extension does not sign `host`, so the default is false; enable it for
-	// deployments whose gateway requires host to be covered by the signature.
+	// ChatSessionHeartbeat reports busy/idle for each plugin-owned chat session,
+	// releasing its upstream concurrency slot when the request finishes.
+	ChatSessionHeartbeat bool `yaml:"chat_session_heartbeat" json:"chat_session_heartbeat"`
+	// SignHost adds `host` to regional API signatures (default false for
+	// compatibility). Benefit gateway requests always sign host, independently
+	// of this setting, matching the gateway's official client protocol.
 	SignHost bool `yaml:"sign_host" json:"sign_host"`
 	// InsistMissingCredentials lets the executor proceed with an unsigned
 	// request when no credential is available. Useful only for debugging.
@@ -201,6 +206,8 @@ type ModelConfig struct {
 	ContextLength   int64  `yaml:"context_length" json:"context_length"`
 	MaxOutputTokens int64  `yaml:"max_output_tokens" json:"max_output_tokens"`
 	SupportsImages  bool   `yaml:"supports_images" json:"supports_images"`
+	// Source is discovered metadata, never a user-supplied endpoint or secret.
+	Source string `yaml:"-" json:"source,omitempty"`
 }
 
 // defaultConfig returns the built-in defaults. The upstream model list is
@@ -209,6 +216,7 @@ type ModelConfig struct {
 func defaultConfig() *Config {
 	return &Config{
 		BaseURL:               "https://snap-access.cn-north-4.myhuaweicloud.com",
+		BenefitGatewayURL:     "https://opengw.developer.huaweicloud.com",
 		WebLoginBase:          "https://codearts.huaweicloud.com",
 		OAuthTokenURL:         codeArtsOAuthTokenURL,
 		OAuthIdentityURL:      codeArtsOAuthIdentityURL,
@@ -217,25 +225,12 @@ func defaultConfig() *Config {
 		PluginVersion:         "26.9.101",
 		Language:              "en-us",
 		AgentID:               "Pangu_Doer_in_CodeArts",
-		DefaultModelID:        "PanguDev_COM_QC2",
 		RequestTimeoutSeconds: 600,
 		LoginTimeoutSeconds:   300,
 		Heartbeat:             true,
-		Models:                defaultModels(),
+		ChatSessionHeartbeat:  true,
+		Models:                []ModelConfig{},
 		DiscoverModels:        true,
-	}
-}
-
-func defaultModels() []ModelConfig {
-	return []ModelConfig{
-		{
-			ID:              "PanguDev_COM_QC2",
-			Name:            "PanguDev_COM_QC2",
-			DisplayName:     "Pangu Dev (CodeArts)",
-			Description:     "Huawei CodeArts Doer chat model served through the CodeArts Doer gateway.",
-			ContextLength:   128000,
-			MaxOutputTokens: 8192,
-		},
 	}
 }
 
@@ -271,6 +266,7 @@ func (c *Config) normalize() {
 		return
 	}
 	c.BaseURL = strings.TrimRight(strings.TrimSpace(c.BaseURL), "/")
+	c.BenefitGatewayURL = strings.TrimRight(strings.TrimSpace(c.BenefitGatewayURL), "/")
 	c.WebLoginBase = strings.TrimRight(strings.TrimSpace(c.WebLoginBase), "/")
 	c.OAuthTokenURL = strings.TrimSpace(c.OAuthTokenURL)
 	c.OAuthIdentityURL = strings.TrimSpace(c.OAuthIdentityURL)
@@ -317,8 +313,14 @@ func (c *Config) normalize() {
 		c.LoginCallbackPort = 0
 	}
 	c.LoginCallbackBase = strings.TrimRight(strings.TrimSpace(c.LoginCallbackBase), "/")
-	if len(c.Models) == 0 {
-		c.Models = defaultModels()
+	// Migrate only the exact model preset shipped in older example configs.
+	// An explicit static setup (discover_models:false) remains untouched.
+	const oldPreset = "PanguDev_COM_QC2"
+	oldMap := len(c.ModelMap) == 0 || (len(c.ModelMap) == 1 && c.ModelMap["pangu-dev"] == oldPreset)
+	if c.DiscoverModels && len(c.Models) == 1 && c.Models[0].ID == oldPreset && c.DefaultModelID == oldPreset && oldMap {
+		c.Models = nil
+		c.DefaultModelID = ""
+		c.ModelMap = nil
 	}
 	for index := range c.Models {
 		model := &c.Models[index]
@@ -338,7 +340,7 @@ func (c *Config) normalize() {
 			model.MaxOutputTokens = 8192
 		}
 	}
-	if c.DefaultModelID == "" {
+	if c.DefaultModelID == "" && len(c.Models) > 0 {
 		c.DefaultModelID = c.Models[0].ID
 	}
 	c.Schedule.normalize()

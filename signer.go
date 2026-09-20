@@ -87,8 +87,19 @@ func signRequest(method, rawURL string, headers map[string]string, body []byte, 
 	}
 	if includeHost {
 		if _, ok := lookHeaderFold(out, "host"); !ok {
-			out["host"] = parsed.Host
+			out["Host"] = parsed.Host
 		}
+	}
+	// The host passes this map directly to net/http. Its serializer excludes
+	// only the canonical "Host" key when emitting the URL's Host header; a
+	// lower-case key would be written as a second Host and rejected with 400.
+	if host, ok := lookHeaderFold(out, "host"); ok {
+		for name := range out {
+			if strings.EqualFold(name, "host") {
+				delete(out, name)
+			}
+		}
+		out["Host"] = host
 	}
 
 	// Lower-case canonical view; later duplicates win, matching the reference

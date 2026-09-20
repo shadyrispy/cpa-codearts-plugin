@@ -69,32 +69,33 @@ plugins:
       # Upstream agent to talk to. Used by the native protocol only.
       agent_id: "Pangu_Doer_in_CodeArts"
 
-      # Upstream model_id used when the requested model has no explicit mapping.
-      default_model_id: "PanguDev_COM_QC2"
+      # Optional ID for requests without a model. Normally clients select an
+      # actual ID from /v1/models, so no default is needed.
+      default_model_id: ""
 
       # Client-facing ID -> upstream model_id. Add an entry per model you want to
       # expose under a friendlier alias.
-      model_map:
-        "pangu-dev": "PanguDev_COM_QC2"
+      model_map: {}
 
-      # Models advertised to CLIProxyAPI. The upstream catalogue is tenant
-      # specific, so adjust this list to the models your account can reach.
-      models:
-        - id: "PanguDev_COM_QC2"
-          name: "PanguDev_COM_QC2"
-          display_name: "Pangu Dev (CodeArts)"
-          description: "Huawei CodeArts Doer chat model."
-          context_length: 128000
-          max_output_tokens: 8192
+      # Optional explicit static models or aliases. Empty by default so a
+      # failed discovery never fabricates a Pangu model. Use the panel's
+      # account-model view to see IDs, names, sources and discovery warnings.
+      models: []
 
-      # Ask the upstream Agent Center for this account's model list on
-      # model.for_auth instead of advertising the static list above. Results are
-      # cached per account for 5 minutes; any failure falls back to `models`.
+      # Discover the account's agents, their visible models, and (when enabled
+      # for this account) the benefit gateway catalog. Full results are cached
+      # for 5 minutes; partial failures are retried after 30 seconds. Explicit
+      # `models` are the only fallback on total failure and are labeled as such.
       discover_models: true
 
-      # Agent IDs queried for discovery. Empty uses the extension's own Act and
-      # Plan agents. Set these when your tenant uses different agents.
+      # Empty discovers real agent IDs from the account's paginated agent list.
+      # An explicit list overrides agent discovery; native mode uses agent_id.
       model_agent_ids: []
+
+      # Optional second model catalog. The account's benefit-gateway-config
+      # flag must also be enabled. Empty disables this catalog. Chat still goes
+      # through base_url with maas_type: benefit, as in the official extension.
+      benefit_gateway_url: "https://opengw.developer.huaweicloud.com"
 
       # ---------------------------------------------------------------------
       # Transport / signing
@@ -103,9 +104,14 @@ plugins:
       # Ask the upstream for SSE heartbeat comment frames.
       heartbeat: true
 
-      # Include `host` in the signature's SignedHeaders list. Off by default
-      # because the official extension does not sign `host`; turn it on only if
-      # your gateway rejects the default.
+      # Manage an independent upstream session for each request: busy while
+      # generating, idle after completion/failure/cancellation. Keep enabled
+      # to release the account's concurrent-chat slots promptly.
+      chat_session_heartbeat: true
+
+      # Include `host` in regional API signatures. Defaults to false for
+      # compatibility with existing configurations; captured 26.9.101 requests
+      # sign it. Benefit catalog requests always sign host, regardless of this.
       sign_host: false
 
       # Set the is_confidential header (KIA / confidential-code mode).
@@ -165,11 +171,10 @@ plugins:
             cron: "*/30 * * * *"
             enabled: true
 
-          # Daily benefit check-in (每日签到). The claim UI is a server-hosted
-          # page ("Wish Wall") and the extension performs no claim request, so
-          # there is no endpoint to hard-code. Capture the real request once
-          # (browser devtools -> Network -> copy as cURL while claiming), then
-          # fill in the fields below. Disabled until you do.
+          # Activity-specific benefit check-in (每日签到). Model discovery never
+          # claims an entitlement. Configure a verified claim request and its
+          # signing requirements here, or claim in the official client.
+          # Disabled until configured.
           - id: "daily-checkin"
             type: "checkin"
             cron: "5 0 * * *"                          # 00:05 daily

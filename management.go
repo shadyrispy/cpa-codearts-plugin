@@ -33,6 +33,11 @@ func managementRoutes() []map[string]any {
 			"Description": "List CodeArts Doer accounts with subscription, quota and credential expiry.",
 		},
 		{
+			"Method":      http.MethodGet,
+			"Path":        "/codearts-provider/models",
+			"Description": "Read the account model catalog with sources and discovery warnings (query: auth_index).",
+		},
+		{
 			"Method":      http.MethodPost,
 			"Path":        "/codearts-provider/quota/refresh",
 			"Description": "Refresh the cached quota snapshot for one or all accounts (body: {auth_index}).",
@@ -119,7 +124,10 @@ func managementRegistration() map[string]any {
 // req.Path is the full path the host received, so routes are matched on their
 // suffix after the plugin's own namespace.
 func managementHandle(request []byte) ([]byte, error) {
-	var req pluginapi.ManagementRequest
+	var req struct {
+		pluginapi.ManagementRequest
+		HostCallbackID string `json:"host_callback_id"`
+	}
 	if len(request) > 0 {
 		if errUnmarshal := json.Unmarshal(request, &req); errUnmarshal != nil {
 			return nil, fmt.Errorf("decode management request: %w", errUnmarshal)
@@ -138,32 +146,34 @@ func managementHandle(request []byte) ([]byte, error) {
 		return okEnvelope(htmlResponse(panelHTML()))
 	case route == "/accounts" && method == http.MethodGet:
 		return okEnvelope(handleAccounts())
+	case route == "/models" && method == http.MethodGet:
+		return okEnvelope(handleAccountModels(req.Query, req.HostCallbackID))
 	case route == "/login/callback" && method == http.MethodPost:
-		return okEnvelope(handleLoginCallback(req))
+		return okEnvelope(handleLoginCallback(req.ManagementRequest))
 	case route == "/login/status" && method == http.MethodGet:
 		return okEnvelope(handleLoginStatus(req.Query))
 	case route == "/quota" && method == http.MethodGet:
 		return okEnvelope(handleQuotaGet(req.Query))
 	case route == "/quota/refresh" && method == http.MethodPost:
-		return okEnvelope(handleQuotaRefresh(req))
+		return okEnvelope(handleQuotaRefresh(req.ManagementRequest))
 	case route == "/schedule" && method == http.MethodGet:
 		return okEnvelope(handleScheduleGet())
 	case route == "/schedule/run" && method == http.MethodPost:
-		return okEnvelope(handleScheduleRun(req))
+		return okEnvelope(handleScheduleRun(req.ManagementRequest))
 	case route == "/checkin" && method == http.MethodPost:
-		return okEnvelope(handleCheckin(req))
+		return okEnvelope(handleCheckin(req.ManagementRequest))
 	case route == "/benefits" && method == http.MethodGet:
 		return okEnvelope(handleBenefits())
 	case route == "/usage" && method == http.MethodGet:
 		return okEnvelope(handleUsage())
 	case route == "/schedule/config" && method == http.MethodPost:
-		return okEnvelope(handleScheduleConfig(req))
+		return okEnvelope(handleScheduleConfig(req.ManagementRequest))
 	case route == "/import" && method == http.MethodPost:
-		return okEnvelope(handleImport(req))
+		return okEnvelope(handleImport(req.ManagementRequest))
 	case route == "/export" && method == http.MethodGet:
 		return okEnvelope(handleExport())
 	case route == "/delete" && method == http.MethodPost:
-		return okEnvelope(handleDelete(req))
+		return okEnvelope(handleDelete(req.ManagementRequest))
 	}
 
 	body, _ := json.Marshal(map[string]any{
@@ -423,6 +433,36 @@ func handleAccounts() pluginapi.ManagementResponse {
 		"accounts": views,
 	})
 	return jsonResponse(http.StatusOK, body)
+}
+
+func handleAccountModels(query url.Values, callbackID string) pluginapi.ManagementResponse {
+	authIndex := strings.TrimSpace(query.Get("auth_index"))
+	if authIndex == "" {
+		return errorJSON(http.StatusBadRequest, "auth_index is required")
+	}
+	files, errList := hostAuthList()
+	if errList != nil {
+		return errorJSON(http.StatusBadGateway, "could not read the account inventory")
+	}
+	for _, file := range files {
+		if file.AuthIndex != authIndex || (normalizeProvider(file.Provider) != providerID && normalizeProvider(file.Type) != providerID) {
+			continue
+		}
+		storage, errGet := hostAuthGet(authIndex)
+		if errGet != nil {
+			return errorJSON(http.StatusBadGateway, "could not read the account credential")
+		}
+		cred, errCred := credentialFromStorage(storage)
+		if errCred != nil || !cred.valid() {
+			return errorJSON(http.StatusBadRequest, "the account credential is incomplete")
+		}
+		catalog := accountModelCatalog(config(), cred, callbackID)
+		return jsonResponse(http.StatusOK, mustJSON(map[string]any{
+			"auth_index": authIndex, "models": catalog.Models, "count": len(catalog.Models),
+			"source": catalog.Source, "warnings": catalog.Warnings, "fetched_at": catalog.FetchedAt,
+		}))
+	}
+	return errorJSON(http.StatusNotFound, "unknown CodeArts auth_index")
 }
 
 func handleQuotaGet(query map[string][]string) pluginapi.ManagementResponse {
@@ -794,10 +834,8 @@ func handleUsage() pluginapi.ManagementResponse {
 
 // handleCheckin claims the daily benefit by running a checkin task now.
 //
-// There is no upstream API documented for this and the extension performs no
-// such call itself (it opens a server-hosted activity page), so the claim is
-// driven entirely by the configured checkin task. When none is configured the
-// response explains exactly how to enable it rather than failing silently.
+// Claims are driven by explicit checkin task configuration. Reading a model
+// catalog must never trigger an entitlement claim as a side effect.
 func handleCheckin(req pluginapi.ManagementRequest) pluginapi.ManagementResponse {
 	var body struct {
 		Task string `json:"task"`
@@ -823,7 +861,7 @@ func handleCheckin(req pluginapi.ManagementRequest) pluginapi.ManagementResponse
 			"configured": false,
 			"error":      "no checkin task is configured",
 			"how_to_enable": []string{
-				"The CodeArts Doer extension implements no check-in API; the daily benefit page (the \"Wish Wall\") is a server-hosted web app.",
+				"Model discovery does not claim benefits. Claim eligible benefits in the official client or configure an activity-specific checkin task.",
 				"Open the activity page in your browser, use the browser devtools Network tab, click the daily claim, and copy the request URL, method, body and headers.",
 				"Add a schedule task of type \"checkin\" with checkin_url (and checkin_body/checkin_headers if the request needs them).",
 				"Then call this route again, or let cron claim it automatically.",
@@ -991,6 +1029,10 @@ func statusPage(cfg *Config) pluginapi.ManagementResponse {
 			"request_timeout_s": cfg.RequestTimeoutSeconds,
 		},
 		"models": models,
+		"model_catalog": map[string]any{
+			"scope": "configured_only", "discovery_enabled": cfg.DiscoverModels,
+			"account_catalog_path": managementBasePath + "/" + providerID + "/models?auth_index=...",
+		},
 		"schedule": map[string]any{
 			"enabled":  cfg.Schedule.Enabled,
 			"timezone": firstNonEmptyString(cfg.Schedule.Timezone, time.Local.String()),
@@ -1000,7 +1042,7 @@ func statusPage(cfg *Config) pluginapi.ManagementResponse {
 		// never advertise a different capability set than the plugin declares.
 		"capabilities": declaredCapabilities(),
 		"notes": []string{
-			"Daily check-in is driven by the configurable checkin task: the claim UI is a server-hosted page and the extension performs no claim request.",
+			"Model discovery does not claim benefits; claims require the official client or an explicitly configured checkin task.",
 			"Recurring work is driven by the plugin's own cron scheduler because the plugin ABI provides no timer.",
 			"Resource pages are not admin-authenticated, so no credential material is shown here.",
 			"Sign in with GET /v0/management/" + providerID + "-auth-url (admin key required) and open the returned url.",

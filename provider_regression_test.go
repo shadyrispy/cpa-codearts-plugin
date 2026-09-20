@@ -356,9 +356,12 @@ func TestAccountModelDiscoveryIsolation(t *testing.T) {
 	cfg.BaseURL = "https://discovery.test"
 	requests := 0
 	testHost(t, func(method string, request any) (json.RawMessage, error) {
-		requests++
 		req := request.(map[string]any)
 		u, _ := url.Parse(req["url"].(string))
+		if u.Path == "/v1/benefit-gateway-config" {
+			return json.Marshal(modelJSON([]byte(`{"enabled":false}`)))
+		}
+		requests++
 		if u.Path != "/v1/agent-center/agents/detail" || u.Query().Get("agent_id") != "agent" {
 			t.Fatal("wrong discovery contract")
 		}
@@ -370,7 +373,7 @@ func TestAccountModelDiscoveryIsolation(t *testing.T) {
 		if strings.Contains(headers["Authorization"][0], "Access=account-b") {
 			model = "tenant-b"
 		}
-		return json.Marshal(hostHTTPResponse{StatusCode: http.StatusOK, Body: []byte(`{"gpts":{"models":[{"model_alias":"` + model + `","model_id":"internal-id","model_name":"Test","model_parameters":{"enabled":true,"supports_images":true,"context_window":200000,"max_tokens":16000}},{"model_alias":"disabled","model_parameters":{"enabled":false}}]}}`)})
+		return json.Marshal(hostHTTPResponse{StatusCode: http.StatusOK, Body: []byte(`{"gpts":{"models":[{"model_alias":"` + model + `","model_id":"internal-id","model_name":"Test","model_parameters":{"enabled":true,"display_enabled":true,"supports_images":true,"context_window":200000,"max_tokens":16000}},{"model_alias":"disabled","model_parameters":{"enabled":false}}]}}`)})
 	})
 	a := &credential{AccessKeyID: "account-a", SecretAccessKey: "test"}
 	b := &credential{AccessKeyID: "account-b", SecretAccessKey: "test"}
@@ -750,6 +753,10 @@ func TestAgentPreservesToolConversationAndImages(t *testing.T) {
 }
 
 func TestStreamRejectsUpstreamBeforeAccepting(t *testing.T) {
+	cfg := defaultConfig()
+	cfg.DiscoverModels = false
+	cfg.ChatSessionHeartbeat = false
+	useModelTestConfig(t, cfg)
 	for _, status := range []int{401, 403, 429, 503} {
 		t.Run(http.StatusText(status), func(t *testing.T) {
 			closed := false
@@ -757,6 +764,8 @@ func TestStreamRejectsUpstreamBeforeAccepting(t *testing.T) {
 				switch method {
 				case "host.http.do_stream":
 					return json.Marshal(hostHTTPStreamOpen{StatusCode: status, StreamID: "upstream"})
+				case "host.http.stream_read":
+					return json.RawMessage(`{"done":true}`), nil
 				case "host.http.stream_close":
 					closed = true
 					return json.RawMessage(`{}`), nil
@@ -789,6 +798,8 @@ func TestStreamRejectsUpstreamBeforeAccepting(t *testing.T) {
 func TestStreamTimeoutTerminatesOnce(t *testing.T) {
 	previous := currentConfig.Load()
 	short := defaultConfig()
+	short.DiscoverModels = false
+	short.ChatSessionHeartbeat = false
 	short.RequestTimeoutSeconds = 1
 	short.BaseURL = "https://timeout.test"
 	currentConfig.Store(short)
@@ -949,6 +960,9 @@ func TestModelDiscoveryFallsBackToConfiguredModels(t *testing.T) {
 			if method != "host.http.do" {
 				t.Fatalf("unexpected callback %s", method)
 			}
+			if strings.Contains(request.(map[string]any)["url"].(string), "/v1/benefit-gateway-config") {
+				return json.Marshal(modelJSON([]byte(`{"enabled":false}`)))
+			}
 			return json.Marshal(hostHTTPResponse{StatusCode: http.StatusOK, Body: []byte(`{"gpts":{"models":[{"model_alias":"off","model_parameters":{"enabled":false}}]}}`)})
 		})
 		raw, err := modelsForAuth(request)
@@ -964,10 +978,13 @@ func TestModelDiscoveryFallsBackToConfiguredModels(t *testing.T) {
 			if method != "host.http.do" {
 				t.Fatalf("unexpected callback %s", method)
 			}
+			if strings.Contains(request.(map[string]any)["url"].(string), "/v1/benefit-gateway-config") {
+				return json.Marshal(modelJSON([]byte(`{"enabled":false}`)))
+			}
 			if calls.Add(1) == 1 {
 				return nil, fmt.Errorf("first agent unavailable")
 			}
-			return json.Marshal(hostHTTPResponse{StatusCode: http.StatusOK, Body: []byte(`{"gpts":{"models":[{"model_alias":"partial-model","model_name":"Partial","model_parameters":{"enabled":true,"context_window":1000,"max_tokens":100}}]}}`)})
+			return json.Marshal(hostHTTPResponse{StatusCode: http.StatusOK, Body: []byte(`{"gpts":{"models":[{"model_alias":"partial-model","model_name":"Partial","model_parameters":{"enabled":true,"display_enabled":true,"context_window":1000,"max_tokens":100}}]}}`)})
 		})
 		raw, err := modelsForAuth(request)
 		response := testEnvelopeResult[pluginapi.ModelResponse](t, raw, err)

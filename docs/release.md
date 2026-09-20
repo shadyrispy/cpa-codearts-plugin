@@ -66,6 +66,9 @@ bash tools/package-release.sh 0.1.1
 ```
 
 The version argument must match the tag you are about to create, minus the `v`.
+It must also match `pluginVersion` in `main.go` and the `version` fields in both
+`registry.json` and `registry-entry.json`. The release workflow checks all three;
+`release.bat` synchronizes them automatically.
 
 Platforms without a usable toolchain are **skipped with a warning** rather than
 producing a broken archive, so a partial build is safe but check the output:
@@ -87,6 +90,10 @@ CLIProxyAPI `dlopen()`s the library into its own process. The official
 CLIProxyAPI `Dockerfile` runs on Debian, so the release asset is a glibc build;
 an Alpine deployment needs the musl build instead.
 
+The minimum required GLIBC version depends on the build toolchain. CI uses the
+GCC supplied by its Ubuntu runner, so inspect the actual artifact and confirm
+that the target container provides its required versions.
+
 ```bash
 # glibc (default; zig cc is only needed when cross-compiling from another OS)
 CC_linux_amd64="zig cc -target x86_64-linux-gnu.2.17" \
@@ -102,6 +109,7 @@ Check the result before publishing:
 
 ```bash
 readelf -d codearts-provider.so | grep NEEDED   # libc.so.6 => glibc, libc.so => musl
+readelf --version-info codearts-provider.so    # required GLIBC symbol versions
 objdump -T codearts-provider.so | grep cliproxy # the four ABI exports must be present
 ```
 
@@ -187,17 +195,20 @@ curl -s https://api.github.com/repos/zyxzjyzjj/cpa-codearts-plugin/releases/late
 
 ## 6. Publish the next version
 
-Release assets come from the **latest** release, so the registry entry does not
-change when you ship an update — only when metadata like the description does.
+Release assets come from the **latest** release. Keep the source version and
+both registry versions in sync with every new tag so the release workflow can
+validate them. Choose a version whose local and remote tags do not exist; for
+example, after publishing `0.1.7`:
 
-```bash
-# bump the version in code, then:
-bash tools/package-release.sh 0.1.1
-git add -A && git commit -m "release: v0.1.1"
-git tag v0.1.1 && git push origin master && git push origin v0.1.1
-gh release create v0.1.1 --title "v0.1.1" --notes "Fixes ..." \
-  release-assets/codearts-provider_0.1.1_*.zip release-assets/checksums.txt
+```bat
+release.bat 0.1.8 --dry-run
+release.bat 0.1.8 --yes
 ```
+
+The second command synchronizes the three version fields, commits and pushes
+the source, and pushes the tag that triggers the automated build and Release.
+For a manual release, update those same three fields before following the
+build, tag and upload steps above.
 
 Installing the update through the gateway:
 

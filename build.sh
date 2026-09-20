@@ -21,9 +21,10 @@
 #   musl (alpine images):
 #     CC="zig cc -target x86_64-linux-musl" ./build.sh linux amd64
 #
-# The glibc build links against libc.so.6/libpthread.so.0/libresolv.so.2 and needs
-# no symbol newer than GLIBC_2.3.2. Verify the result with:
+# Native GCC builds inherit their toolchain's glibc requirements. Check each
+# artifact's dependencies and symbol versions before using it in an older image:
 #   readelf -d plugins/linux/amd64/codearts-provider.so | grep NEEDED
+#   readelf --version-info plugins/linux/amd64/codearts-provider.so
 #   objdump -T plugins/linux/amd64/codearts-provider.so | grep cliproxy
 set -euo pipefail
 

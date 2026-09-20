@@ -246,6 +246,8 @@ const panelTemplate = `<!doctype html>
         meter("代码补全额度", a.code_completions_percent) +
         meter("对话消息额度", a.chat_messages_percent) +
         (a.quota_error ? '<div class="meta err">额度查询失败：' + esc(a.quota_error) + '</div>' : '') +
+        '<div style="margin-top:9px"><button data-models="' + esc(a.auth_index) + '">查看账号模型</button></div>' +
+        '<div data-model-list="' + esc(a.auth_index) + '" class="meta">模型列表从此账号的华为服务获取。</div>' +
         '<div class="meta mono">' + esc(a.auth_index) + '</div>' +
         '<div style="margin-top:9px"><button class="danger" data-del="' + esc(a.auth_index) + '">删除账号</button></div>' +
         '</div>';
@@ -398,6 +400,28 @@ const panelTemplate = `<!doctype html>
   document.addEventListener("click", function (ev) {
     var t = ev.target;
     if (!t || t.tagName !== "BUTTON") return;
+    var modelAccount = t.getAttribute("data-models");
+    if (modelAccount) {
+      var modelBox = t.parentNode.nextElementSibling;
+      t.disabled = true;
+      modelBox.textContent = "正在获取模型…";
+      call(BASE + "/models?auth_index=" + encodeURIComponent(modelAccount)).then(function (catalog) {
+        var items = (catalog && catalog.models) || [];
+        var warnings = (catalog && catalog.warnings) || [];
+        var source = catalog && catalog.source;
+        var note = source === "configured" ? "配置中的模型（本次未从账号发现）" : "账号返回的模型";
+        modelBox.innerHTML = '<div>' + esc(note) + '：' + items.length + ' 个</div>' +
+          items.map(function (m) {
+            var origin = m.source === "benefit" ? "福利网关" : (m.source === "agent" ? "CodeArts" : "手动配置");
+            return '<div style="margin-top:5px">' + esc(m.display_name || m.id) + ' · ' + esc(origin) +
+              '<div class="mono">' + esc(m.id) + '</div></div>';
+          }).join("") +
+          (!items.length ? '<div>暂无可用模型，请检查授权和下方发现结果。</div>' : '') +
+          warnings.map(function (warning) { return '<div class="err">' + esc(warning) + '</div>'; }).join("");
+      }).catch(function (e) { modelBox.textContent = "模型获取失败：" + e.message; })
+        .finally(function () { t.disabled = false; });
+      return;
+    }
     var del = t.getAttribute("data-del");
     var run = t.getAttribute("data-run");
     if (del) {

@@ -83,7 +83,7 @@ import (
 // normalizes provider identifiers.
 const providerID = "codearts-provider"
 
-const pluginVersion = "0.1.6"
+const pluginVersion = "0.1.7"
 
 var (
 	// currentConfig holds the last configuration delivered by the host. It is
@@ -203,11 +203,13 @@ func handleMethod(method string, request []byte) ([]byte, error) {
 		shutdownScheduler()
 		stopLoginSessions()
 		closeAllActiveStreams()
+		stopAllChatSessions()
 		return okEnvelope(map[string]any{})
 
 	case pluginabi.MethodPluginShutdown:
 		stopLoginSessions()
 		closeAllActiveStreams()
+		stopAllChatSessions()
 		return okEnvelope(map[string]any{})
 
 	case pluginabi.MethodModelRegister:

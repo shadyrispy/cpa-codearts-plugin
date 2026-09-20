@@ -6,6 +6,8 @@ import (
 	"encoding/json"
 	"fmt"
 	"net/http"
+	"net/url"
+	"sort"
 	"strings"
 	"sync"
 	"time"
@@ -29,6 +31,7 @@ type executorRequest struct {
 	pluginapi.ExecutorRequest
 	StreamID       string `json:"stream_id,omitempty"`
 	HostCallbackID string `json:"host_callback_id,omitempty"`
+	ChatSessionID  string `json:"-"`
 }
 
 // executorExecute handles the non-streaming execution path. It always streams
@@ -52,6 +55,17 @@ func executorExecute(request []byte) ([]byte, error) {
 		)
 	}
 
+	chatSession, rejected, errSession := beginChatSession(cfg, req, cred)
+	if errSession != nil {
+		return failEnvelope("upstream_unreachable", "could not start the CodeArts chat session", http.StatusBadGateway)
+	}
+	if rejected != nil {
+		return upstreamHTTPErrorEnvelope(rejected, cred)
+	}
+	if chatSession != nil {
+		req.ChatSessionID = chatSession.ID()
+		defer chatSession.Stop()
+	}
 	upstreamBody, endpoint, headers, errBuild := buildUpstreamRequest(cfg, req, cred, true)
 	if errBuild != nil {
 		return failEnvelope("invalid_request", errBuild.Error(), http.StatusBadRequest)
@@ -62,16 +76,7 @@ func executorExecute(request []byte) ([]byte, error) {
 		return failEnvelope("upstream_unreachable", "upstream request failed: "+errDo.Error(), http.StatusBadGateway)
 	}
 	if response.StatusCode != http.StatusOK {
-		status := httpStatusFor(response.StatusCode)
-		code := "upstream_error"
-		if response.StatusCode == http.StatusUnauthorized {
-			code = "invalid_credential"
-		} else if response.StatusCode == http.StatusForbidden {
-			code = "insufficient_quota"
-		} else if response.StatusCode == http.StatusTooManyRequests {
-			code = "rate_limit_exceeded"
-		}
-		return failEnvelope(code, fmt.Sprintf("upstream returned HTTP %d: %s", response.StatusCode, truncate(string(response.Body), 500)), status)
+		return upstreamHTTPErrorEnvelope(response, cred)
 	}
 
 	payload, errAggregate := aggregateUpstream(cfg, req.Model, response.Body)
@@ -111,6 +116,22 @@ func executorExecuteStream(request []byte) ([]byte, error) {
 		return failEnvelope("missing_credential", "no CodeArts Doer credential is available for this model", http.StatusUnauthorized)
 	}
 
+	chatSession, rejected, errSession := beginChatSession(cfg, req, cred)
+	if errSession != nil {
+		return failEnvelope("upstream_unreachable", "could not start the CodeArts chat session", http.StatusBadGateway)
+	}
+	if rejected != nil {
+		return upstreamHTTPErrorEnvelope(rejected, cred)
+	}
+	handedOff := false
+	if chatSession != nil {
+		req.ChatSessionID = chatSession.ID()
+		defer func() {
+			if !handedOff {
+				chatSession.Stop()
+			}
+		}()
+	}
 	upstreamBody, endpoint, headers, errBuild := buildUpstreamRequest(cfg, req, cred, true)
 	if errBuild != nil {
 		return failEnvelope("invalid_request", errBuild.Error(), http.StatusBadRequest)
@@ -124,7 +145,7 @@ func executorExecuteStream(request []byte) ([]byte, error) {
 			return nil, fmt.Errorf("upstream request failed: %w", errDo)
 		}
 		if response.StatusCode != http.StatusOK {
-			return failEnvelope("upstream_error", fmt.Sprintf("upstream returned HTTP %d", response.StatusCode), httpStatusFor(response.StatusCode))
+			return upstreamHTTPErrorEnvelope(response, cred)
 		}
 		return bufferedStreamResponse(cfg, req.Model, clientProtocol(req.Format), response.Body)
 	}
@@ -136,15 +157,20 @@ func executorExecuteStream(request []byte) ([]byte, error) {
 		return failEnvelope("upstream_unreachable", errOpen.Error(), http.StatusBadGateway)
 	}
 	if open.StatusCode != http.StatusOK {
-		_ = hostHTTPStreamClose(open.StreamID)
-		return failEnvelope("upstream_error", fmt.Sprintf("upstream returned HTTP %d", open.StatusCode), httpStatusFor(open.StatusCode))
+		return upstreamHTTPErrorEnvelope(readUpstreamErrorResponse(cfg, open), cred)
 	}
-	stop, errRegister := registerActiveStream(req.StreamID, func() { _ = hostHTTPStreamClose(open.StreamID) })
+	stop, errRegister := registerActiveStream(req.StreamID, func() {
+		_ = hostHTTPStreamClose(open.StreamID)
+		if chatSession != nil {
+			chatSession.Stop()
+		}
+	})
 	if errRegister != nil {
 		_ = hostHTTPStreamClose(open.StreamID)
 		return nil, errRegister
 	}
 	session := &executorStreamSession{streamID: req.StreamID, stop: stop}
+	handedOff = true
 	go func() {
 		defer session.stop()
 		timer := time.AfterFunc(cfg.requestTimeout(), func() { session.fail("upstream request timed out") })
@@ -242,23 +268,26 @@ func bufferedStreamResponse(cfg *Config, model, protocol string, body []byte) ([
 	})
 }
 
-// executorCountTokens returns a conservative local estimate. CodeArts Doer does
-// not expose a token counting endpoint, so the plugin deliberately avoids
-// claiming an exact count.
+// executorCountTokens estimates model-visible input from one request body.
+// It does not call the upstream, allocate a chat session or consume quota.
 func executorCountTokens(request []byte) ([]byte, error) {
 	req, errDecode := decodeExecutorRequest(request)
 	if errDecode != nil {
 		return nil, errDecode
 	}
-	total := estimateTokens(req.Payload) + estimateTokens(req.OriginalRequest)
+	estimate := countInputTokens(req)
 	// Anthropic clients read input_tokens from the count response and the host
 	// forwards it unchanged for the declared claude output format.
 	result := map[string]any{
-		"total_tokens": total,
-		"note":         "estimated locally; CodeArts Doer does not expose a token counting endpoint",
+		"total_tokens": estimate.Tokens,
+		"estimated":    true,
+		"note":         "local input estimate; model-specific tokenization and hidden prompt overhead may differ",
+	}
+	if len(estimate.Warnings) > 0 {
+		result["warnings"] = estimate.Warnings
 	}
 	if clientProtocol(req.Format) == protocolClaude {
-		result["input_tokens"] = total
+		result["input_tokens"] = estimate.Tokens
 	}
 	payload, errMarshal := json.Marshal(result)
 	if errMarshal != nil {
@@ -288,6 +317,7 @@ func executorHTTPRequest(_ []byte) ([]byte, error) {
 // buildUpstreamRequest renders the upstream body, signs it and returns the
 // endpoint plus the complete header set to send.
 func buildUpstreamRequest(cfg *Config, req executorRequest, cred *credential, stream bool) ([]byte, string, map[string]string, error) {
+	req.Model = requestedModel(req)
 	endpoint := strings.TrimRight(cfg.BaseURL, "/")
 	var body []byte
 	var errBuild error
@@ -305,6 +335,49 @@ func buildUpstreamRequest(cfg *Config, req executorRequest, cred *credential, st
 	}
 
 	headers := baseUpstreamHeaders(cfg, req)
+	if cfg.APIMode != "native" {
+		modelID := cfg.upstreamModel(req.Model)
+		for key := range headers {
+			if strings.EqualFold(key, "model-id") || strings.EqualFold(key, "model-name") || strings.EqualFold(key, "x-model-id") {
+				delete(headers, key)
+			}
+		}
+		headers["model-id"] = modelID
+		headers["model-name"] = modelID
+		headers["x-model-id"] = modelID
+	}
+	if cfg.APIMode != "native" && cfg.DiscoverModels && cred.valid() {
+		modelID := cfg.upstreamModel(req.Model)
+		catalog := accountModelCatalog(cfg, cred, req.HostCallbackID)
+		var selected *ModelConfig
+		for i := range catalog.Models {
+			if catalog.Models[i].ID == modelID {
+				selected = &catalog.Models[i]
+				break
+			}
+		}
+		if selected == nil && catalog.Source == "configured" {
+			for i := range catalog.Models {
+				if catalog.Models[i].ID == req.Model {
+					selected = &catalog.Models[i]
+					break
+				}
+			}
+		}
+		if selected == nil {
+			return nil, "", nil, fmt.Errorf("model %q is not available in this account's catalog; check the CodeArts panel model discovery results", modelID)
+		}
+		if catalog.Source == "discovered" {
+			for key := range headers {
+				if strings.EqualFold(key, "maas_type") {
+					delete(headers, key)
+				}
+			}
+		}
+		if selected.Source == "benefit" {
+			headers["maas_type"] = "benefit"
+		}
+	}
 	if !cred.valid() {
 		// Debugging escape hatch: send the request unsigned.
 		logWarn("sending an unsigned upstream request because no credential is available", map[string]any{"endpoint": endpoint})
@@ -344,6 +417,14 @@ func baseUpstreamHeaders(cfg *Config, req executorRequest) map[string]string {
 		}
 		headers[trimmed] = value
 	}
+	if req.ChatSessionID != "" {
+		for key := range headers {
+			if strings.EqualFold(key, "user-session-id") {
+				delete(headers, key)
+			}
+		}
+		headers["User-Session-Id"] = req.ChatSessionID
+	}
 	// Some deployments expect the client-authorised model to travel as a
 	// header as well.
 	if model := strings.TrimSpace(req.Model); model != "" {
@@ -360,7 +441,11 @@ func buildAgentBody(cfg *Config, req executorRequest, stream bool) ([]byte, erro
 			return nil, fmt.Errorf("client request body is not valid JSON: %w", errUnmarshal)
 		}
 	}
-	payload["model"] = cfg.upstreamModel(req.Model)
+	model := cfg.upstreamModel(requestedModel(req))
+	if model == "" {
+		return nil, fmt.Errorf("model is required; select an ID from /v1/models")
+	}
+	payload["model"] = model
 	payload["stream"] = stream
 	if _, ok := payload["messages"]; !ok {
 		return nil, fmt.Errorf("client request body has no messages array")
@@ -370,6 +455,19 @@ func buildAgentBody(cfg *Config, req executorRequest, stream bool) ([]byte, erro
 		payload["stream_options"] = map[string]any{"include_usage": true}
 	}
 	return json.Marshal(payload)
+}
+
+// requestedModel preserves the client-selected ID when a caller supplies it in
+// the JSON payload instead of the host's separate Model field.
+func requestedModel(req executorRequest) string {
+	if model := strings.TrimSpace(req.Model); model != "" {
+		return model
+	}
+	var payload struct {
+		Model string `json:"model"`
+	}
+	_ = json.Unmarshal(req.Payload, &payload)
+	return strings.TrimSpace(payload.Model)
 }
 
 // nativeMessage is one CodeArts context block. The native protocol models user
@@ -445,7 +543,7 @@ func buildNativeBody(cfg *Config, req executorRequest, stream bool) ([]byte, err
 		return nil, fmt.Errorf("client request body contains no usable message content")
 	}
 
-	modelID := cfg.upstreamModel(req.Model)
+	modelID := cfg.upstreamModel(requestedModel(req))
 	body := map[string]any{
 		"chat_id":               strings.ReplaceAll(randomUUIDv4(), "-", ""),
 		"messages":              messages,
@@ -637,15 +735,6 @@ func decodeExecutorRequest(request []byte) (executorRequest, error) {
 	return req, nil
 }
 
-// estimateTokens approximates a token count from byte length. It is deliberately
-// conservative and clearly labelled as an estimate by the caller.
-func estimateTokens(data []byte) int {
-	if len(data) == 0 {
-		return 0
-	}
-	return len(data)/4 + 1
-}
-
 // ---------------------------------------------------------------------------
 // stream lifecycle
 // ---------------------------------------------------------------------------
@@ -688,11 +777,11 @@ func readUpstreamResponse(cfg *Config, callbackID, endpoint string, headers map[
 	if err != nil {
 		return nil, err
 	}
+	if open.StatusCode != http.StatusOK {
+		return readUpstreamErrorResponse(cfg, open), nil
+	}
 	defer hostHTTPStreamClose(open.StreamID)
 	resp := &hostHTTPResponse{StatusCode: open.StatusCode, Headers: open.Headers}
-	if open.StatusCode != http.StatusOK {
-		return resp, nil
-	}
 	ctx, cancel := context.WithTimeout(context.Background(), cfg.requestTimeout())
 	defer cancel()
 	stop := context.AfterFunc(ctx, func() { _ = hostHTTPStreamClose(open.StreamID) })
@@ -715,6 +804,136 @@ func readUpstreamResponse(cfg *Config, callbackID, endpoint string, headers map[
 	}
 }
 
+const (
+	upstreamErrorBodyLimit   = 8 << 10
+	upstreamErrorChunkLimit  = 128
+	upstreamErrorReadTimeout = 2 * time.Second
+)
+
+// Read diagnostic bytes from the already-open failed request. Error responses
+// do not need the normal ten-minute generation deadline or an unbounded body.
+// A slow/broken stream must never replace the upstream HTTP status with a 502.
+func readUpstreamErrorResponse(cfg *Config, open *hostHTTPStreamOpen) *hostHTTPResponse {
+	response := &hostHTTPResponse{StatusCode: open.StatusCode, Headers: open.Headers}
+	defer hostHTTPStreamClose(open.StreamID)
+	timeout := upstreamErrorReadTimeout
+	if cfg != nil && cfg.requestTimeout() > 0 && cfg.requestTimeout() < timeout {
+		timeout = cfg.requestTimeout()
+	}
+	timer := time.NewTimer(timeout)
+	defer timer.Stop()
+	type readResult struct {
+		payload []byte
+		done    bool
+		err     error
+	}
+	for reads := 0; reads < upstreamErrorChunkLimit; reads++ {
+		// A single buffered result lets a pending read exit after timeout and
+		// stream_close. Do not start another read until this one is consumed.
+		result := make(chan readResult, 1)
+		go func() {
+			payload, done, err := hostHTTPStreamRead(open.StreamID)
+			result <- readResult{payload: payload, done: done, err: err}
+		}()
+		select {
+		case <-timer.C:
+			response.ErrorReadNote = "error response read timed out"
+			return response
+		case chunk := <-result:
+			remaining := upstreamErrorBodyLimit - len(response.Body)
+			if len(chunk.payload) > remaining {
+				response.Body = append(response.Body, chunk.payload[:remaining]...)
+				response.ErrorReadNote = "error response truncated at 8 KiB"
+				return response
+			}
+			response.Body = append(response.Body, chunk.payload...)
+			if chunk.err != nil {
+				// Host errors can contain raw transport details. The partial
+				// upstream body is useful; a generic read note is sufficient.
+				response.ErrorReadNote = "error response read failed"
+				return response
+			}
+			if chunk.done {
+				return response
+			}
+			if len(response.Body) == upstreamErrorBodyLimit {
+				response.ErrorReadNote = "error response truncated at 8 KiB"
+				return response
+			}
+		}
+	}
+	response.ErrorReadNote = "error response stopped after too many chunks"
+	return response
+}
+
+func upstreamHTTPErrorEnvelope(response *hostHTTPResponse, cred *credential) ([]byte, error) {
+	code := "upstream_error"
+	switch response.StatusCode {
+	case http.StatusUnauthorized:
+		code = "invalid_credential"
+	case http.StatusForbidden:
+		code = "insufficient_quota"
+	case http.StatusTooManyRequests:
+		code = "rate_limit_exceeded"
+	}
+	message := fmt.Sprintf("upstream returned HTTP %d", response.StatusCode)
+	detail := redactUpstreamError(string(response.Body), cred, response.ErrorReadNote != "")
+	if detail = strings.TrimSpace(detail); detail != "" {
+		message += ": " + truncate(detail, upstreamErrorBodyLimit)
+	}
+	if response.ErrorReadNote != "" {
+		message += " (" + response.ErrorReadNote + ")"
+	}
+	return failEnvelope(code, message, httpStatusFor(response.StatusCode))
+}
+
+// Error bodies sometimes echo a rejected credential or request headers. Remove
+// this account's secret values, including JSON/form-encoded spellings, before
+// sending diagnostics to a downstream API client.
+func redactUpstreamError(message string, cred *credential, partial bool) string {
+	if cred == nil {
+		return message
+	}
+	secrets := []string{cred.AccessKeyID, cred.SecretAccessKey, cred.SecurityToken, cred.RefreshToken}
+	if oauth := cred.OAuthContext; oauth != nil {
+		secrets = append(secrets, oauth.PKCEPair.CodeVerifier, oauth.PKCEPair.CodeChallenge,
+			oauth.DPoPKeyPair.PrivateKeyJWK.D, oauth.DPoPKeyPair.PrivateKeyJWK.X,
+			oauth.DPoPKeyPair.PrivateKeyJWK.Y, oauth.DPoPKeyPair.PublicKeyJWK.X,
+			oauth.DPoPKeyPair.PublicKeyJWK.Y)
+	}
+	variants := map[string]bool{}
+	for _, secret := range secrets {
+		if secret == "" {
+			continue
+		}
+		variants[secret] = true
+		variants[url.QueryEscape(secret)] = true
+		encoded, _ := json.Marshal(secret)
+		variants[string(encoded[1:len(encoded)-1])] = true
+	}
+	secrets = secrets[:0]
+	for secret := range variants {
+		secrets = append(secrets, secret)
+	}
+	// Redact complete long values before their possible component substrings.
+	sort.Slice(secrets, func(i, j int) bool { return len(secrets[i]) > len(secrets[j]) })
+	for _, secret := range secrets {
+		message = strings.ReplaceAll(message, secret, "[REDACTED]")
+		if !partial {
+			continue
+		}
+		// The body bound or read failure can cut a credential in half. Also
+		// redact any known credential prefix at that final byte boundary.
+		for size := min(len(message), len(secret)-1); size > 0; size-- {
+			if strings.HasSuffix(message, secret[:size]) {
+				message = message[:len(message)-size] + "[REDACTED]"
+				break
+			}
+		}
+	}
+	return message
+}
+
 // ---------------------------------------------------------------------------
 // host callback wrappers
 // ---------------------------------------------------------------------------
@@ -726,6 +945,8 @@ type hostHTTPResponse struct {
 	StatusCode int                 `json:"StatusCode"`
 	Headers    map[string][]string `json:"Headers"`
 	Body       []byte              `json:"Body"`
+	// ErrorReadNote is local diagnostic metadata, never part of the host wire.
+	ErrorReadNote string `json:"-"`
 }
 
 // hostHTTPDo performs one buffered HTTP request through the host transport so
