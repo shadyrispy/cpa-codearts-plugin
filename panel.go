@@ -263,7 +263,10 @@ const panelTemplate = `<!doctype html>
       var bits = [];
       if (!out) bits.push(label + "：上游未给出百分比");
       var used = Number(m.used_tokens) || 0, allow = Number(m.allowance_tokens) || 0;
-      if (allow > 0) bits.push("token " + tokenCount(used) + " / " + tokenCount(allow));
+      // An allowance below the usage is an upstream sentinel rather than a real
+      // cap (a trial row reports 1 token against 1408 used), so it is not drawn
+      // as a fraction the account has somehow exceeded.
+      if (allow > 0 && used <= allow) bits.push("token " + tokenCount(used) + " / " + tokenCount(allow));
       else if (used > 0) bits.push("已用 " + tokenCount(used) + " token");
       return out + (bits.length ? '<div class="meta">' + bits.map(esc).join(" · ") + '</div>' : "");
     }).join("");

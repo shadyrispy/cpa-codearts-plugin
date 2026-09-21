@@ -94,10 +94,13 @@ type quotaMeter struct {
 // quotaMeterLabels localises known metric names; anything else keeps the raw
 // name, which is still more useful than hiding it.
 var quotaMeterLabels = map[string]string{
-	"usageDataCodeCompletions": "代码补全额度",
-	"usageDataChatMessages":    "对话消息额度",
-	"usageTokenChatMessages":   "对话 token 额度",
-	"usageTotalPackageCredit":  "套餐积分",
+	"usageDataCodeCompletions":   "代码补全额度",
+	"usageDataChatMessages":      "对话消息额度",
+	"usageTokenChatMessages":     "对话 token 额度",
+	"usageTotalPackageCredit":    "套餐积分",
+	"usageBasicPackageCredit":    "基础包积分",
+	"usageOnDemandPackageCredit": "按需付费积分",
+	"usageBonusPackageCredit":    "赠送积分",
 }
 
 // remainingFraction converts a meter into the host's "remaining fraction" model.
