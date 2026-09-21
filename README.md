@@ -310,8 +310,10 @@ Responses clients (`/v1/responses`), with tool calls and usage preserved.
 
 The 26.9.101 capture includes a benefit claim at the developer gateway before
 using a benefit model. Model discovery only reads the catalog; it does not
-perform that claim or guarantee an account has remaining benefit quota. Claim
-the entitlement in the official client when needed.
+perform that claim. The panel and `/accounts` do report the remaining allowance
+(see "Benefit allowance" below), so exhaustion is visible instead of surfacing
+as an empty reply. Claim the entitlement in the official client, or schedule the
+`checkin` task, when it is used up.
 
 The plugin's existing `checkin` task remains a configurable automation for a
 verified claim request. It is separate from model discovery and must be
@@ -489,6 +491,24 @@ quota model expects a `remainingFraction`, so the value is inverted
 to a full bucket. The plugin reports `supports_reset: false` because the upstream
 quota is bound to the subscription cycle and cannot be reset on demand — the
 reset route answers honestly instead of pretending success.
+
+### Benefit allowance
+
+The subscription document above does not know about the limited-time daily token
+pool, so an account can look untouched while every benefit model fails. The
+plugin therefore also reads
+
+```
+GET {benefit_gateway_url}/api/v1/user/tokens/balance
+```
+
+signed like the claim request, on every quota refresh, and carries it as
+`benefit` (with `benefit_error` when that one call fails) in `/accounts` and on
+the panel as a separate daily meter. Two upstream conventions are preserved:
+`daily_token_limit: 0` means **uncapped**, not exhausted, so it is shown as raw
+counters instead of an empty bar; and usage above the cap is reported as measured
+rather than clamped to 100%, because the gateway keeps counting past the cap and
+the overrun is the state an operator needs to see.
 
 ## Capability coverage
 

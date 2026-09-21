@@ -216,6 +216,42 @@ const panelTemplate = `<!doctype html>
     });
   }
 
+  function tokenCount(n) {
+    var v = Number(n);
+    if (!isFinite(v)) return "?";
+    if (Math.abs(v) >= 1e8) return (v / 1e8).toFixed(2) + " 亿";
+    if (Math.abs(v) >= 1e4) return (v / 1e4).toFixed(1) + " 万";
+    return String(Math.round(v));
+  }
+
+  // The benefit pool is a separate upstream account from the meters above, and
+  // an uncapped dimension must not be drawn as an empty bar.
+  function benefitBlock(a) {
+    var b = a.benefit;
+    if (!b) {
+      return a.benefit_error ? '<div class="meta err">福利额度查询失败：' + esc(a.benefit_error) + '</div>' : "";
+    }
+    var limit = Number(b.daily_token_limit);
+    var used = Number(b.daily_tokens_used);
+    var capped = limit > 0;
+    var out = capped ? meter("福利每日 token", Math.min(used / limit * 100, 100)) : "";
+    var bits = [];
+    if (capped) {
+      var left = limit - used;
+      bits.push("今日 " + tokenCount(used) + " / " + tokenCount(limit) +
+        (left <= 0 ? "（今日已用尽，次日重新领取后恢复）" : "（剩 " + tokenCount(left) + "）"));
+    } else {
+      bits.push("今日已用 " + tokenCount(used) + "（无日上限）");
+    }
+    var monthLimit = Number(b.monthly_token_limit);
+    bits.push(monthLimit > 0
+      ? "本月 " + tokenCount(b.monthly_tokens_used) + " / " + tokenCount(monthLimit)
+      : "本月累计 " + tokenCount(b.monthly_tokens_used) + "（无月上限）");
+    out += '<div class="meta">' + bits.join(" · ") + '</div>';
+    if (a.benefit_error) out += '<div class="meta err">福利额度刷新失败：' + esc(a.benefit_error) + '</div>';
+    return out;
+  }
+
   function meter(label, pct) {
     if (pct === null || pct === undefined || pct < 0) return "";
     var v = Number(pct);
@@ -245,6 +281,7 @@ const panelTemplate = `<!doctype html>
         (bits.length ? '<div class="meta">' + bits.join(" · ") + '</div>' : '') +
         meter("代码补全额度", a.code_completions_percent) +
         meter("对话消息额度", a.chat_messages_percent) +
+        benefitBlock(a) +
         (a.quota_error ? '<div class="meta err">额度查询失败：' + esc(a.quota_error) + '</div>' : '') +
         '<div style="margin-top:9px"><button data-models="' + esc(a.auth_index) + '">查看账号模型</button></div>' +
         '<div data-model-list="' + esc(a.auth_index) + '" class="meta">模型列表从此账号的华为服务获取。</div>' +

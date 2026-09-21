@@ -58,6 +58,14 @@ type quotaSnapshot struct {
 	// Features is the upstream feature enablement map.
 	Features map[string]bool `json:"features"`
 
+	// Benefit is the limited-time daily token pool from the benefit gateway. It
+	// is separate from the subscription meters above: a benefit model can be
+	// exhausted while every subscription meter still reads zero.
+	Benefit *benefitBalance `json:"benefit,omitempty"`
+	// BenefitError records a failed benefit allowance lookup without discarding
+	// the subscription snapshot that did succeed.
+	BenefitError string `json:"benefit_error,omitempty"`
+
 	// FetchedAt is when this snapshot was taken.
 	FetchedAt time.Time `json:"fetched_at"`
 	// Error records the last fetch failure for this account, if any.
@@ -174,6 +182,19 @@ func fetchQuotaSnapshot(authIndex string, cred *credential) (quotaSnapshot, erro
 	snapshot.FetchedAt = time.Now()
 	if cred != nil {
 		snapshot.Label = firstNonEmptyString(cred.UserName, cred.UserID)
+	}
+	// Read on every refresh, including the partial-failure path: the daily benefit
+	// pool is the quota that actually runs out mid-day, so a stale value would be
+	// the most misleading thing to keep showing. A failure here is recorded on the
+	// snapshot rather than failing the refresh, because the subscription meters
+	// above are still valid answers.
+	if cfg.APIMode != "native" {
+		balance, errBenefit := fetchBenefitBalance(cfg, cred)
+		if errBenefit != nil {
+			snapshot.BenefitError = errBenefit.Error()
+		} else {
+			snapshot.Benefit = &balance
+		}
 	}
 	quotas.put(snapshot)
 	return snapshot, nil
@@ -341,6 +362,15 @@ func toQuotaFetchResponse(snapshot quotaSnapshot) pluginapi.QuotaFetchResponse {
 			Description:       fmt.Sprintf("Chat messages used: %.1f%%", snapshot.ChatMessagesPercent),
 		})
 	}
+	if snapshot.Benefit != nil && snapshot.Benefit.DailyTokenLimit > 0 {
+		used := snapshot.Benefit.DailyPercent()
+		buckets = append(buckets, pluginapi.QuotaBucket{
+			Window:            "1d",
+			RemainingFraction: usedPercentToRemaining(used),
+			Description: fmt.Sprintf("Benefit tokens used: %.1f%% (%d of %d daily tokens)",
+				used, snapshot.Benefit.DailyTokensUsed, snapshot.Benefit.DailyTokenLimit),
+		})
+	}
 	if len(buckets) > 0 {
 		response.Groups = []pluginapi.QuotaGroup{
 			{DisplayName: "CodeArts Doer", Buckets: buckets},
@@ -350,6 +380,15 @@ func toQuotaFetchResponse(snapshot quotaSnapshot) pluginapi.QuotaFetchResponse {
 	response.Summary = []pluginapi.QuotaMetric{
 		{Key: "code_completions_used_percent", Label: "Code completions used (%)", Value: snapshot.CodeCompletionsPercent, Unit: "percent"},
 		{Key: "chat_messages_used_percent", Label: "Chat messages used (%)", Value: snapshot.ChatMessagesPercent, Unit: "percent"},
+	}
+	// Only a capped pool gets summary metrics: a "limit 0" reads as exhausted to
+	// the host, while it actually means this account has no daily cap. The panel
+	// still shows the raw counters for that case from /accounts.
+	if snapshot.Benefit != nil && snapshot.Benefit.DailyTokenLimit > 0 {
+		response.Summary = append(response.Summary,
+			pluginapi.QuotaMetric{Key: "benefit_daily_tokens_used", Label: "Benefit tokens used today", Value: float64(snapshot.Benefit.DailyTokensUsed), Unit: "tokens"},
+			pluginapi.QuotaMetric{Key: "benefit_daily_token_limit", Label: "Benefit daily token limit", Value: float64(snapshot.Benefit.DailyTokenLimit), Unit: "tokens"},
+		)
 	}
 	if snapshot.ResetDate != "" {
 		response.Summary = append(response.Summary, pluginapi.QuotaMetric{
