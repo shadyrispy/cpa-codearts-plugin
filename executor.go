@@ -54,6 +54,18 @@ func executorExecute(request []byte) ([]byte, error) {
 			http.StatusUnauthorized,
 		)
 	}
+	if cred.valid() {
+		refreshed, errRefresh := prepareCredentialForUse(req.AuthID, cred)
+		if errRefresh != nil {
+			logWarn("expired credential could not be refreshed before chat", map[string]any{"error": errRefresh.Error()})
+			return failEnvelope(
+				"credential_refresh_failed",
+				"the CodeArts credential expired and silent refresh failed; retry shortly or sign in again",
+				http.StatusServiceUnavailable,
+			)
+		}
+		cred = refreshed
+	}
 
 	chatSession, rejected, errSession := beginChatSession(cfg, req, cred)
 	if errSession != nil {
@@ -114,6 +126,18 @@ func executorExecuteStream(request []byte) ([]byte, error) {
 	}
 	if !cred.valid() && !cfg.InsistMissingCredentials {
 		return failEnvelope("missing_credential", "no CodeArts Doer credential is available for this model", http.StatusUnauthorized)
+	}
+	if cred.valid() {
+		refreshed, errRefresh := prepareCredentialForUse(req.AuthID, cred)
+		if errRefresh != nil {
+			logWarn("expired credential could not be refreshed before streaming chat", map[string]any{"error": errRefresh.Error()})
+			return failEnvelope(
+				"credential_refresh_failed",
+				"the CodeArts credential expired and silent refresh failed; retry shortly or sign in again",
+				http.StatusServiceUnavailable,
+			)
+		}
+		cred = refreshed
 	}
 
 	chatSession, rejected, errSession := beginChatSession(cfg, req, cred)

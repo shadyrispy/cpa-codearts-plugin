@@ -456,6 +456,11 @@ func handleAccountModels(query url.Values, callbackID string) pluginapi.Manageme
 		if errCred != nil || !cred.valid() {
 			return errorJSON(http.StatusBadRequest, "the account credential is incomplete")
 		}
+		refreshed, errRefresh := prepareCredentialForUse(authIndex, cred)
+		if errRefresh != nil {
+			return errorJSON(http.StatusServiceUnavailable, "the account credential expired and silent refresh failed")
+		}
+		cred = refreshed
 		catalog := accountModelCatalog(config(), cred, callbackID)
 		return jsonResponse(http.StatusOK, mustJSON(map[string]any{
 			"auth_index": authIndex, "models": catalog.Models, "count": len(catalog.Models),

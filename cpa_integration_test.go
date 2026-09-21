@@ -30,7 +30,7 @@ func TestCPAIntegration(t *testing.T) {
 	if executable == "" || dll == "" {
 		t.Skip("set CODEARTS_CPA_EXE and CODEARTS_PLUGIN_DLL for real-host integration")
 	}
-	var chatCalls, loginCalls atomic.Int32
+	var chatCalls, loginCalls, renewCalls atomic.Int32
 	var nextStatus atomic.Int32
 	var sessionMu sync.Mutex
 	activeSessions := map[string]bool{}
@@ -70,6 +70,10 @@ func TestCPAIntegration(t *testing.T) {
 			return
 		}
 		switch r.URL.Path {
+		case "/snap-manager/v1/token/renew":
+			renewCalls.Add(1)
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = io.WriteString(w, `{"credential":{"access":"renewed-ak","secret":"renewed-sk","securitytoken":"renewed-sts","expires_at":"2030-01-01T00:00:00Z"}}`)
 		case "/snap-manager/v1/chat-session/heartbeat":
 			sessionID := strings.TrimSpace(r.Header.Get("user-session-id"))
 			body, _ := io.ReadAll(r.Body)
@@ -287,7 +291,7 @@ func TestCPAIntegration(t *testing.T) {
 		t.Fatalf("plugin not enabled: %d %s", status, body)
 	}
 	t.Log("actual CPA loaded and enabled the DLL")
-	status, body = request("POST", "/v0/management/codearts-provider/import", `{"access_key_id":"import-ak","secret_access_key":"import-sk","security_token":"import-sts","expires_at":"2030-01-01T00:00:00Z","user_name":"imported","name":"codearts-provider-integration.json"}`)
+	status, body = request("POST", "/v0/management/codearts-provider/import", `{"access_key_id":"import-ak","secret_access_key":"import-sk","security_token":"import-sts","expires_at":"2000-01-01T00:00:00Z","user_name":"imported","name":"codearts-provider-integration.json"}`)
 	if status != 200 {
 		t.Fatalf("import failed: %d %s", status, body)
 	}
@@ -323,6 +327,10 @@ func TestCPAIntegration(t *testing.T) {
 		t.Fatalf("discovered model missing: %d %s", status, body)
 	}
 	assertModels("audit-model", "glm-5.3-flash")
+	if renewCalls.Load() != 1 {
+		t.Fatalf("expired credential was renewed %d times, want exactly once before model discovery", renewCalls.Load())
+	}
+	t.Log("expired stored credential was silently renewed and persisted before model discovery")
 	capturedModelIDs := []string{"GLM-5.2", "glm-5.2-sft-harmony", "openpangu-2.0-pro", "openpangu-2.0-flash", "deepseek-v4-flash-0731", "deepseek-v4-pro-0813", "glm-5.3-flash"}
 	for _, modelID := range capturedModelIDs {
 		if !bytes.Contains(body, []byte(`"`+modelID+`"`)) {

@@ -382,14 +382,15 @@ Three task types ship:
 
 | Type | What it does |
 | --- | --- |
-| `token_renew` | Renews temporary credentials using the saved OAuth proof context when available. The host uses the returned expiration to schedule renewal; the optional cron task defaults to hourly. OAuth credentials can expire sooner than older 24-hour credentials. |
+| `token_renew` | Renews temporary credentials using the saved OAuth proof context when available. Host metadata requests an hourly refresh, the enabled-by-default cron provides an independent hourly safety net, and model/chat/quota requests catch up before using an expired credential. |
 | `quota_refresh` | Refreshes the cached subscription/quota snapshot per account, keeping the panel and quota API cheap. |
 | `http` | Any request against the CodeArts gateway, optionally signed with the first available credential. The escape hatch for endpoints this plugin does not model yet. |
 | `checkin` | Claims the daily benefit by driving a request you capture from the activity page, with success/already markers so the outcome is judged accurately. |
 
-Defaults (used when `schedule.tasks` is omitted): `token_renew` hourly at :17 and
-`quota_refresh` every 30 minutes. Set `schedule.disable_defaults: true` to run
-only your own tasks.
+The scheduler is enabled by default. Its default tasks (used when
+`schedule.tasks` is omitted) are `token_renew` hourly at :17 and `quota_refresh`
+every 30 minutes. Set `schedule.enabled: false` to opt out entirely, or
+`schedule.disable_defaults: true` to run only your own tasks.
 
 ```yaml
 schedule:
@@ -565,9 +566,9 @@ discovery set `models: []`, `model_map: {}`, and `default_model_id: ""`.
 
 Three things were needed to fit the host's model rather than fight it:
 
-1. **The scheduler is self-driven.** The plugin ABI has no timer, so `schedule`
-   is implemented with `robfig/cron` inside the plugin. Nothing in the host
-   changes.
+1. **The general scheduler is self-driven.** Arbitrary `schedule` tasks use
+   `robfig/cron` inside the plugin. Credential renewal additionally participates
+   in the host auth refresh loop and has a request-time catch-up path.
 2. **The executor always streams upstream.** The CodeArts native protocol has no
    non-streaming variant, so `executor.execute` buffers and aggregates a stream
    internally. From the host's perspective it is an ordinary non-streaming
@@ -613,7 +614,7 @@ example.
 | `login_callback_base` | empty | Optional advanced override; leave empty for the recommended localhost flow. |
 | `extra_headers` | `{}` | Extra signed headers. |
 | `insist_missing_credentials` | `false` | Debug-only: send unsigned requests. |
-| `schedule.enabled` | `false` | Start the cron scheduler. |
+| `schedule.enabled` | `true` | Run the hourly credential renewal and quota refresh safety net; set false to opt out. |
 | `schedule.timezone` | host local | IANA zone the cron expressions are evaluated in. |
 | `schedule.tasks` | 2 defaults | Task list (`token_renew`, `quota_refresh`, `http`, `checkin`). |
 | `schedule.disable_defaults` | `false` | Suppress the built-in tasks when `tasks` is empty. |
@@ -827,12 +828,13 @@ Rebuild the library before running it: the test loads the file named by
   discovers and routes benefit models but does not automatically claim an
   activity. Use the official client to claim eligible benefits, or a verified
   `checkin` task configured for that activity.
-- **The plugin schedules its own work.** The plugin ABI has no timer, so
-  recurring tasks stop when the process stops. There is no catch-up run for ticks
-  missed while CLIProxyAPI was down. Credential renewal is therefore doubly
-  covered: the host's own `NextRefreshAfter` schedule (hourly for a temporary
-  AK/SK, parked 30 days out for a permanent key pair) plus `schedule.tasks`
-  `token_renew` when you enable the plugin's cron.
+- **Credential renewal has three independent triggers.** Temporary credentials
+  advertise `NextRefreshAfter` plus a one-hour refresh interval to the host; the
+  plugin's enabled-by-default cron runs `token_renew` hourly; and model, chat and
+  quota calls silently refresh an expired or nearly expired credential before
+  use. The last path catches up after downtime. Per-account locking and an
+  in-memory refreshed snapshot prevent simultaneous host/cron/request triggers
+  from rotating the same refresh token twice.
 - **`/delete` removes the file directly.** The ABI has no `host.auth.delete`, so
   deletion is performed on disk under strict guards: the path must be absolute,
   free of traversal segments, end in `.json`, and sit inside the auth directory.

@@ -176,9 +176,10 @@ func (t ScheduleTask) isEnabled() bool {
 }
 
 // defaultScheduleTasks is the built-in schedule used when tasks are not
-// specified. Token renewal mirrors the official extension's hourly renewal
-// cadence; the quota refresh keeps the subscription view warm for the panel and
-// the quota API.
+// specified. Token renewal mirrors the official extension's hourly cadence;
+// the quota refresh keeps the subscription view warm for the panel and quota
+// API. The scheduler is enabled by default because OAuth credentials may live
+// for only a few hours.
 func defaultScheduleTasks() []ScheduleTask {
 	on := true
 	return []ScheduleTask{
@@ -229,8 +230,11 @@ func defaultConfig() *Config {
 		LoginTimeoutSeconds:   300,
 		Heartbeat:             true,
 		ChatSessionHeartbeat:  true,
-		Models:                []ModelConfig{},
-		DiscoverModels:        true,
+		Schedule: ScheduleConfig{
+			Enabled: true,
+		},
+		Models:         []ModelConfig{},
+		DiscoverModels: true,
 	}
 }
 

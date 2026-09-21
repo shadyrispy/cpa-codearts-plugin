@@ -106,17 +106,11 @@ func authParse(request []byte) ([]byte, error) {
 	return okEnvelope(pluginapi.AuthParseResponse{
 		Handled: true,
 		Auth: pluginapi.AuthData{
-			Provider:    providerID,
-			FileName:    req.FileName,
-			Label:       label,
-			StorageJSON: storage,
-			Metadata: map[string]any{
-				"type":       providerID,
-				"user_name":  cred.UserName,
-				"user_id":    cred.UserID,
-				"domain_id":  cred.DomainID,
-				"login_type": cred.LoginType,
-			},
+			Provider:         providerID,
+			FileName:         req.FileName,
+			Label:            label,
+			StorageJSON:      storage,
+			Metadata:         credentialAuthMetadata(&cred),
 			NextRefreshAfter: refreshDeadline(&cred),
 		},
 	})
@@ -328,17 +322,11 @@ func authLoginPoll(request []byte) ([]byte, error) {
 		Status:  pluginapi.AuthLoginStatusSuccess,
 		Message: "signed in to CodeArts Doer",
 		Auth: pluginapi.AuthData{
-			Provider:    providerID,
-			Label:       label,
-			FileName:    credentialFileName(&stamped),
-			StorageJSON: storage,
-			Metadata: map[string]any{
-				"type":       providerID,
-				"user_name":  stamped.UserName,
-				"user_id":    stamped.UserID,
-				"domain_id":  stamped.DomainID,
-				"login_type": stamped.LoginType,
-			},
+			Provider:         providerID,
+			Label:            label,
+			FileName:         credentialFileName(&stamped),
+			StorageJSON:      storage,
+			Metadata:         credentialAuthMetadata(&stamped),
 			Attributes:       map[string]string{"provider_type": providerID},
 			NextRefreshAfter: refreshDeadline(cred),
 		},
@@ -403,9 +391,44 @@ func (s *loginSession) consumeHostOAuthCallback(authDir string) error {
 	return nil
 }
 
-// authRefresh renews the temporary AK/SK pair through the CodeArts token renew
-// endpoint, which the official extension calls every hour.
+// authRefresh serializes all refresh entry points for one account. The host
+// auto-refresh loop and a request-time catch-up can become due together; the
+// in-memory snapshot makes the second caller reuse the first caller's rotated
+// credential even before the host finishes persisting it.
 func authRefresh(request []byte) ([]byte, error) {
+	var req pluginapi.AuthRefreshRequest
+	if errUnmarshal := json.Unmarshal(request, &req); errUnmarshal != nil {
+		return nil, fmt.Errorf("decode auth refresh request: %w", errUnmarshal)
+	}
+	cred, errCred := credentialFromStorage(req.StorageJSON)
+	if errCred != nil {
+		return failEnvelope("invalid_credential", "stored credential could not be decoded: "+errCred.Error(), http.StatusUnauthorized)
+	}
+	if !cred.valid() {
+		return failEnvelope("invalid_credential", "stored credential is incomplete", http.StatusUnauthorized)
+	}
+	lockValue, _ := credentialRefreshLocks.LoadOrStore(credentialRefreshKey(cred), &sync.Mutex{})
+	lock := lockValue.(*sync.Mutex)
+	lock.Lock()
+	defer lock.Unlock()
+
+	current := latestStoredCredential(req.AuthID, cred)
+	if credentialMaterialChanged(cred, current) {
+		return authRefreshEnvelope(current)
+	}
+	raw, errRefresh := authRefreshUnlocked(request)
+	if errRefresh != nil {
+		return nil, errRefresh
+	}
+	if updated, errUpdated := credentialFromRefreshEnvelope(raw); errUpdated == nil {
+		rememberRefreshedCredential(updated)
+	}
+	return raw, nil
+}
+
+// authRefreshUnlocked renews the temporary AK/SK pair through the CodeArts
+// refresh endpoint. Callers must hold the per-account refresh lock.
+func authRefreshUnlocked(request []byte) ([]byte, error) {
 	var req pluginapi.AuthRefreshRequest
 	if errUnmarshal := json.Unmarshal(request, &req); errUnmarshal != nil {
 		return nil, fmt.Errorf("decode auth refresh request: %w", errUnmarshal)
@@ -442,16 +465,10 @@ func authRefresh(request []byte) ([]byte, error) {
 		}
 		return okEnvelope(pluginapi.AuthRefreshResponse{
 			Auth: pluginapi.AuthData{
-				Provider:    providerID,
-				Label:       cred.UserName,
-				StorageJSON: storage,
-				Metadata: map[string]any{
-					"type":       providerID,
-					"user_name":  cred.UserName,
-					"user_id":    cred.UserID,
-					"domain_id":  cred.DomainID,
-					"login_type": firstNonEmptyString(cred.LoginType, "AKSK"),
-				},
+				Provider:         providerID,
+				Label:            cred.UserName,
+				StorageJSON:      storage,
+				Metadata:         credentialAuthMetadata(cred),
 				NextRefreshAfter: refreshDeadline(cred),
 			},
 			NextRefreshAfter: refreshDeadline(cred),
@@ -515,16 +532,10 @@ func authRefreshEnvelope(updated *credential) ([]byte, error) {
 	}
 	return okEnvelope(pluginapi.AuthRefreshResponse{
 		Auth: pluginapi.AuthData{
-			Provider:    providerID,
-			Label:       updated.UserName,
-			StorageJSON: storage,
-			Metadata: map[string]any{
-				"type":       providerID,
-				"user_name":  updated.UserName,
-				"user_id":    updated.UserID,
-				"domain_id":  updated.DomainID,
-				"login_type": updated.LoginType,
-			},
+			Provider:         providerID,
+			Label:            updated.UserName,
+			StorageJSON:      storage,
+			Metadata:         credentialAuthMetadata(updated),
 			NextRefreshAfter: refreshDeadline(updated),
 		},
 		NextRefreshAfter: refreshDeadline(updated),
@@ -884,8 +895,9 @@ func stopLoginSessions() {
 }
 
 // refreshDeadline returns when the host should next renew the credential. The
-// extension renews hourly and the temporary credential lasts 24 hours, so an
-// hour before expiry is a safe point.
+// extension renews hourly. OAuth credentials can last only a few hours, so they
+// are scheduled at half-life (bounded to 30 minutes..2 hours); legacy temporary
+// credentials are renewed an hour before expiry.
 //
 // A credential without a security token is a permanent AK/SK pair; the renewal
 // endpoint does not apply to it, so it is parked far in the future instead of
@@ -917,6 +929,33 @@ func refreshDeadline(cred *credential) time.Time {
 		}
 	}
 	return time.Now().Add(time.Hour)
+}
+
+// credentialAuthMetadata contains only non-secret host scheduling and identity
+// fields. In particular, the OAuth refresh token and proof key remain inside
+// StorageJSON. CLIProxyAPI requires a refresh interval (or a built-in provider
+// policy) in addition to NextRefreshAfter before its generic refresh loop will
+// call a third-party auth provider when the deadline becomes due.
+func credentialAuthMetadata(cred *credential) map[string]any {
+	metadata := map[string]any{"type": providerID}
+	if cred == nil {
+		return metadata
+	}
+	metadata["user_name"] = cred.UserName
+	metadata["user_id"] = cred.UserID
+	metadata["domain_id"] = cred.DomainID
+	loginType := cred.LoginType
+	if strings.TrimSpace(cred.SecurityToken) == "" {
+		loginType = firstNonEmptyString(loginType, "AKSK")
+	}
+	metadata["login_type"] = loginType
+	if strings.TrimSpace(cred.ExpiresAt) != "" {
+		metadata["expires_at"] = cred.ExpiresAt
+	}
+	if strings.TrimSpace(cred.SecurityToken) != "" {
+		metadata["refresh_interval_seconds"] = int64(time.Hour / time.Second)
+	}
+	return metadata
 }
 
 // buildLoginURL mirrors CodeArts Agent 26.9.x WebLoginStrategy.openAuthorizeUrl.

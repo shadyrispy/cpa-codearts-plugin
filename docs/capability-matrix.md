@@ -9,7 +9,7 @@ real traffic through code that may not handle it.
 
 | Capability | Status | What it does here |
 | --- | --- | --- |
-| `auth_provider` | yes | OAuth authorization-code sign-in with PKCE + DPoP, refresh-token renewal, and legacy ticket compatibility. |
+| `auth_provider` | yes | OAuth authorization-code sign-in with PKCE + DPoP, hourly host/cron renewal, request-time expiry catch-up, and legacy ticket compatibility. |
 | `model_provider` | yes | Discovers account agents and their visible models, plus the enabled benefit gateway catalog. Explicit configured aliases retain the target route; no model is fabricated on discovery failure. |
 | `executor` | yes | Chat completions, streaming and non-streaming, both upstream protocols. Declares input `chat-completions` and outputs `chat-completions` + `claude`, so OpenAI, Anthropic and Responses clients are served (see below). |
 | `quota_provider` | yes | Subscription/quota view in the host's normalised quota shape. |
@@ -64,9 +64,9 @@ leaves the other two undeclared as explained above.
 
 Three things were needed to fit the host's model rather than fight it:
 
-1. **The scheduler is self-driven.** The plugin ABI has no timer, so `schedule`
-   is implemented with `robfig/cron` inside the plugin. Nothing in the host
-   changes.
+1. **The general scheduler is self-driven.** Arbitrary `schedule` tasks use
+   `robfig/cron` inside the plugin. Credential renewal additionally participates
+   in the host auth refresh loop and has a request-time catch-up path.
 2. **The executor always streams upstream.** The CodeArts native protocol has no
    non-streaming variant, so `executor.execute` buffers and aggregates a stream
    internally. From the host's perspective it is an ordinary non-streaming

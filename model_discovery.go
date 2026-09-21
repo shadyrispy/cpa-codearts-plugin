@@ -49,6 +49,16 @@ func modelsForAuth(raw []byte) ([]byte, error) {
 		return okEnvelope(pluginapi.ModelResponse{})
 	}
 	cred, _ := credentialFromStorage(req.StorageJSON)
+	if cred != nil && cred.valid() {
+		if refreshed, errRefresh := prepareCredentialForUse(req.AuthID, cred); errRefresh == nil {
+			cred = refreshed
+		} else {
+			logWarn("expired credential could not be refreshed before model discovery", map[string]any{
+				"auth_id": req.AuthID,
+				"error":   errRefresh.Error(),
+			})
+		}
+	}
 	catalog := accountModelCatalog(config(), cred, req.HostCallbackID)
 	if len(catalog.Warnings) > 0 {
 		logWarn("account model discovery incomplete", map[string]any{"auth_id": req.AuthID, "source": catalog.Source, "warnings": catalog.Warnings})

@@ -28,8 +28,8 @@ type TaskType string
 
 const (
 	// TaskTokenRenew renews the temporary AK/SK on every stored credential.
-	// The upstream credential lasts 24h and the official extension renews
-	// hourly, so this is the built-in default.
+	// The official extension renews hourly. OAuth credentials may expire much
+	// sooner than the legacy 24-hour credential, so this is enabled by default.
 	TaskTokenRenew TaskType = "token_renew"
 	// TaskQuotaRefresh fetches and caches the subscription/quota snapshot for
 	// every account, so the panel and quota API answer from cache.
@@ -611,46 +611,11 @@ func hostAuthSave(name string, payload []byte) error {
 // renewCredential performs the token/renew exchange for one credential and
 // persists the refreshed payload.
 func renewCredential(cred *credential) error {
-	cfg := config()
-	if strings.TrimSpace(cred.RefreshToken) != "" || cred.OAuthContext != nil {
-		updated, _, _, errRefresh := oauthRefreshCredential(cfg, cred)
-		if errRefresh != nil {
-			return errRefresh
-		}
-		return persistRenewedCredential(cred, updated)
+	updated, errRefresh := refreshCredentialViaProvider("", cred)
+	if errRefresh != nil {
+		return errRefresh
 	}
-	renewBody, errMarshal := json.Marshal(map[string]any{
-		"access":           cred.AccessKeyID,
-		"securitytoken":    cred.SecurityToken,
-		"duration_seconds": 24 * 60 * 60,
-	})
-	if errMarshal != nil {
-		return errMarshal
-	}
-	endpoint := strings.TrimRight(cfg.BaseURL, "/") + "/snap-manager/v1/token/renew"
-	headers, errSign := signRequest(http.MethodPost, endpoint, map[string]string{
-		"Content-Type": "application/json",
-		"Accept":       "application/json",
-	}, renewBody, cred, cfg.SignHost)
-	if errSign != nil {
-		return fmt.Errorf("sign renew request: %w", errSign)
-	}
-	response, errDo := hostHTTPDo(http.MethodPost, endpoint, headers, renewBody)
-	if errDo != nil {
-		return errDo
-	}
-	if response.StatusCode != http.StatusOK {
-		return fmt.Errorf("token renew returned HTTP %d", response.StatusCode)
-	}
-	updated, errDecode := decodeCredentialResponse(response.Body)
-	if errDecode != nil {
-		return errDecode
-	}
-	updated.DomainID = firstNonEmptyString(updated.DomainID, cred.DomainID)
-	updated.UserName = firstNonEmptyString(updated.UserName, cred.UserName)
-	updated.UserID = firstNonEmptyString(updated.UserID, cred.UserID)
-	updated.LoginType = firstNonEmptyString(updated.LoginType, cred.LoginType, "WEB")
-	return persistRenewedCredential(cred, &updated)
+	return persistRenewedCredential(cred, updated)
 }
 
 func persistRenewedCredential(previous, updated *credential) error {

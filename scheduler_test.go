@@ -209,7 +209,8 @@ schedule:
 }
 
 // TestScheduleConfigDefaultsFromYAML verifies that omitting the schedule block
-// still yields working defaults, so an existing config keeps renewing.
+// enables the safety-critical renewal defaults. An operator can still disable
+// the scheduler explicitly with schedule.enabled:false.
 func TestScheduleConfigDefaultsFromYAML(t *testing.T) {
 	request, _ := json.Marshal(map[string]any{
 		"config_yaml": encodeBase64([]byte("enabled: true\nbase_url: \"https://example.invalid\"\n")),
@@ -218,13 +219,24 @@ func TestScheduleConfigDefaultsFromYAML(t *testing.T) {
 	if errParse != nil {
 		t.Fatalf("parseConfig: %v", errParse)
 	}
-	if cfg.Schedule.Enabled {
-		t.Error("the scheduler must stay off unless explicitly enabled")
+	if !cfg.Schedule.Enabled {
+		t.Error("the default scheduler must keep temporary credentials renewed")
 	}
-	// Tasks are still populated so enabling the scheduler later has something
-	// to run.
 	if len(cfg.scheduleTasks()) == 0 {
-		t.Error("default tasks should be available even while the scheduler is off")
+		t.Error("default renewal tasks should be available")
+	}
+}
+
+func TestScheduleCanBeExplicitlyDisabled(t *testing.T) {
+	request, _ := json.Marshal(map[string]any{
+		"config_yaml": encodeBase64([]byte("enabled: true\nschedule:\n  enabled: false\n")),
+	})
+	cfg, errParse := parseConfig(request)
+	if errParse != nil {
+		t.Fatalf("parseConfig: %v", errParse)
+	}
+	if cfg.Schedule.Enabled {
+		t.Error("an explicit schedule.enabled:false must be preserved")
 	}
 }
 

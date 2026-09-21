@@ -121,6 +121,15 @@ func (c *quotaCache) forget(authIndex string) {
 // fetchQuotaSnapshot queries the statistics endpoint for one credential and
 // updates the cache. It returns the normalised snapshot.
 func fetchQuotaSnapshot(authIndex string, cred *credential) (quotaSnapshot, error) {
+	if cred != nil && cred.valid() {
+		refreshed, errRefresh := prepareCredentialForUse(authIndex, cred)
+		if errRefresh != nil {
+			errFetch := fmt.Errorf("credential expired and silent refresh failed: %w", errRefresh)
+			quotas.put(quotaSnapshot{AuthIndex: authIndex, FetchedAt: time.Now(), Error: errFetch.Error()})
+			return quotaSnapshot{}, errFetch
+		}
+		cred = refreshed
+	}
 	cfg := config()
 	endpoint := strings.TrimRight(cfg.BaseURL, "/") + "/snap-manager/v1/statistics/plugin"
 

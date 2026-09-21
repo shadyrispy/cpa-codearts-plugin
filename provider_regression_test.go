@@ -56,6 +56,14 @@ func TestCredentialPersistReloadAndRenew(t *testing.T) {
 		if !parsed.Handled {
 			t.Fatal("persisted/imported credential was not handled")
 		}
+		if parsed.Auth.Metadata["refresh_interval_seconds"] != float64(3600) && parsed.Auth.Metadata["refresh_interval_seconds"] != int64(3600) {
+			t.Fatalf("refresh interval metadata = %#v, want 3600 seconds", parsed.Auth.Metadata["refresh_interval_seconds"])
+		}
+		for _, secretKey := range []string{"refresh_token", "security_token", "secret_access_key", "oauth_context"} {
+			if _, leaked := parsed.Auth.Metadata[secretKey]; leaked {
+				t.Fatalf("secret field %q leaked into host metadata", secretKey)
+			}
+		}
 		stored, err := credentialFromStorage(parsed.Auth.StorageJSON)
 		if err != nil || !stored.valid() || stored.SecurityToken != cred.SecurityToken {
 			t.Fatal("credential did not round trip")
@@ -84,6 +92,74 @@ func TestCredentialPersistReloadAndRenew(t *testing.T) {
 	stored, _ := credentialFromStorage(parsed.Auth.StorageJSON)
 	if !parsed.Handled || stored.AccessKeyID != "renewed-ak" || stored.UserID != "id" {
 		t.Fatal("renewed credential/identity lost on reload")
+	}
+}
+
+func TestExpiredCredentialRefreshesOnceAndPersistsBeforeUse(t *testing.T) {
+	original := credential{
+		AccessKeyID:     "expired-ak",
+		SecretAccessKey: "expired-sk",
+		SecurityToken:   "expired-sts",
+		DomainID:        "domain",
+		UserID:          "user",
+		UserName:        "name",
+		LoginType:       "WEB",
+		ExpiresAt:       time.Now().Add(-time.Hour).UTC().Format(time.RFC3339),
+	}
+	stored, errBuild := buildAuthFileDocument(original)
+	if errBuild != nil {
+		t.Fatal(errBuild)
+	}
+	var renewCalls atomic.Int32
+	var saveCalls atomic.Int32
+	var saved []byte
+	testHost(t, func(method string, request any) (json.RawMessage, error) {
+		switch method {
+		case "host.auth.list":
+			return json.Marshal(map[string]any{"files": []pluginapi.HostAuthFileEntry{{
+				ID: "account-id", AuthIndex: "account-index", Name: "account.json", Provider: providerID, Type: providerID,
+			}}})
+		case "host.auth.get":
+			return json.Marshal(map[string]any{
+				"auth_index": "account-index",
+				"name":       "account.json",
+				"json":       json.RawMessage(stored),
+			})
+		case "host.auth.save":
+			payload := request.(map[string]any)
+			saved, _ = json.Marshal(payload["json"])
+			stored = append([]byte(nil), saved...)
+			saveCalls.Add(1)
+			return json.RawMessage(`{}`), nil
+		case "host.http.do":
+			renewCalls.Add(1)
+			return json.Marshal(hostHTTPResponse{StatusCode: http.StatusOK, Body: []byte(`{
+				"credential":{"access":"fresh-ak","secret":"fresh-sk","securitytoken":"fresh-sts","expires_at":"2030-01-01T00:00:00Z"}
+			}`)})
+		default:
+			return nil, fmt.Errorf("unexpected host callback %s", method)
+		}
+	})
+
+	updated, errRefresh := ensureFreshCredential("account-id", &original)
+	if errRefresh != nil {
+		t.Fatalf("ensureFreshCredential: %v", errRefresh)
+	}
+	if updated.AccessKeyID != "fresh-ak" || updated.SecurityToken != "fresh-sts" {
+		t.Fatalf("credential was not refreshed: %+v", updated)
+	}
+	if renewCalls.Load() != 1 || saveCalls.Load() != 1 || len(saved) == 0 {
+		t.Fatalf("renew calls=%d save calls=%d saved=%d", renewCalls.Load(), saveCalls.Load(), len(saved))
+	}
+
+	// A second request can still carry the stale executor storage. The per-account
+	// lock reloads the saved credential and must not exchange it a second time.
+	again, errAgain := ensureFreshCredential("account-id", &original)
+	if errAgain != nil {
+		t.Fatalf("second ensureFreshCredential: %v", errAgain)
+	}
+	if again.AccessKeyID != "fresh-ak" || renewCalls.Load() != 1 || saveCalls.Load() != 1 {
+		t.Fatalf("stale concurrent-style request refreshed again: credential=%+v renew=%d save=%d", again, renewCalls.Load(), saveCalls.Load())
 	}
 }
 
