@@ -7,6 +7,8 @@ import (
 	"github.com/router-for-me/CLIProxyAPI/v7/sdk/pluginapi"
 )
 
+const pluginRepositoryURL = "https://github.com/zyxzjyzjj/cpa-codearts-plugin"
+
 // registrationResponse advertises the plugin metadata and the capabilities the
 // plugin actually implements. Only implemented capabilities are declared:
 // CLIProxyAPI rejects or mis-routes a plugin that over-declares.
@@ -17,7 +19,7 @@ func registrationResponse() map[string]any {
 			Name:             "CodeArts",
 			Version:          pluginVersion,
 			Author:           "converted from huaweicloud.vscode-codebot",
-			GitHubRepository: "https://github.com/router-for-me/CLIProxyAPI",
+			GitHubRepository: pluginRepositoryURL,
 			ConfigFields: []pluginapi.ConfigField{
 				{
 					Name:        "base_url",

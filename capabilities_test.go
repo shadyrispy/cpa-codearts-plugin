@@ -8,6 +8,16 @@ import (
 	"github.com/router-for-me/CLIProxyAPI/v7/sdk/pluginapi"
 )
 
+func TestRegistrationMetadataUsesPluginRepository(t *testing.T) {
+	metadata, ok := registrationResponse()["metadata"].(pluginapi.Metadata)
+	if !ok {
+		t.Fatalf("registration metadata has unexpected type %T", registrationResponse()["metadata"])
+	}
+	if metadata.GitHubRepository != pluginRepositoryURL {
+		t.Fatalf("GitHub repository = %q, want %q", metadata.GitHubRepository, pluginRepositoryURL)
+	}
+}
+
 // TestSchedulerSkipsForeignProvider verifies the plugin scheduler only acts on
 // its own provider. Handling another provider's request would silently override
 // the host's own scheduling for a service this plugin knows nothing about.
