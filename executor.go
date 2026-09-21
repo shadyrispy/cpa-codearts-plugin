@@ -359,8 +359,11 @@ func buildUpstreamRequest(cfg *Config, req executorRequest, cred *credential, st
 	}
 
 	headers := baseUpstreamHeaders(cfg, req)
+	modelID := ""
+	configuredBenefit := false
 	if cfg.APIMode != "native" {
-		modelID := cfg.upstreamModel(req.Model)
+		modelID = cfg.upstreamModel(req.Model)
+		configuredBenefit = cfg.isConfiguredBenefitModel(req.Model)
 		for key := range headers {
 			if strings.EqualFold(key, "model-id") || strings.EqualFold(key, "model-name") || strings.EqualFold(key, "x-model-id") {
 				delete(headers, key)
@@ -369,10 +372,21 @@ func buildUpstreamRequest(cfg *Config, req executorRequest, cred *credential, st
 		headers["model-id"] = modelID
 		headers["model-name"] = modelID
 		headers["x-model-id"] = modelID
+		if configuredBenefit {
+			for key := range headers {
+				if strings.EqualFold(key, "maas_type") {
+					delete(headers, key)
+				}
+			}
+			headers["maas_type"] = "benefit"
+		}
 	}
-	if cfg.APIMode != "native" && cfg.DiscoverModels && cred.valid() {
-		modelID := cfg.upstreamModel(req.Model)
-		catalog := accountModelCatalog(cfg, cred, req.HostCallbackID)
+	if cfg.APIMode != "native" && cfg.DiscoverModels && cred.valid() && !configuredBenefit {
+		// Request routing must not start the optional benefit catalogue. A slow
+		// catalogue lookup would delay an otherwise valid Agent Center chat and,
+		// on older hosts, could outlive the executor callback. Explicit
+		// benefit_models are merged without I/O by this path.
+		catalog := accountAgentModelCatalog(cfg, cred, req.HostCallbackID)
 		var selected *ModelConfig
 		for i := range catalog.Models {
 			if catalog.Models[i].ID == modelID {

@@ -82,11 +82,15 @@ plugins:
       # account-model view to see IDs, names, sources and discovery warnings.
       models: []
 
-      # Discover the account's agents, their visible models, and (when enabled
-      # for this account) the benefit gateway catalog. Full results are cached
-      # for 5 minutes; partial failures are retried after 30 seconds. Explicit
-      # `models` are the only fallback on total failure and are labeled as such.
+      # Discover the account's agents and their visible models. CPA cold start
+      # and chat routing never wait on the optional benefit gateway. Agent
+      # results are cached for 5 minutes; partial failures retry after 30s.
       discover_models: true
+
+      # Also read the account-scoped /v1/model/builtin catalogue after Agent
+      # Center. Disable if this optional regional endpoint is slow; configured
+      # fallback models remain available.
+      discover_builtin_models: true
 
       # Empty discovers real agent IDs from the account's paginated agent list.
       # An explicit list overrides agent discovery; native mode uses agent_id.
@@ -96,6 +100,19 @@ plugins:
       # flag must also be enabled. Empty disables this catalog. Chat still goes
       # through base_url with maas_type: benefit, as in the official extension.
       benefit_gateway_url: "https://opengw.developer.huaweicloud.com"
+
+      # Restart-persistent last-known-good benefit models. Only add models that
+      # this account actually received from an explicit panel/API refresh. They
+      # are registered without querying the optional gateway and always route
+      # with maas_type: benefit. This list is plugin-wide: with multiple
+      # accounts, include only entitlements shared by every account.
+      benefit_models: []
+      # Example:
+      # benefit_models:
+      #   - id: "glm-5.3-flash"
+      #     display_name: "glm-5.3-flash"
+      #     context_length: 1048576
+      #     max_output_tokens: 131072
 
       # ---------------------------------------------------------------------
       # Transport / signing

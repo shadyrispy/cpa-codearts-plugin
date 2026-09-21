@@ -50,9 +50,19 @@ type Config struct {
 	ModelMap map[string]string `yaml:"model_map" json:"model_map"`
 	// Models is the static model list advertised to CLIProxyAPI.
 	Models []ModelConfig `yaml:"models" json:"models"`
-	// DiscoverModels queries Agent Center and the optional benefit catalog per account.
-	DiscoverModels bool     `yaml:"discover_models" json:"discover_models"`
-	ModelAgentIDs  []string `yaml:"model_agent_ids" json:"model_agent_ids"`
+	// BenefitModels is an operator-confirmed last-known-good benefit catalogue.
+	// Unlike live benefit discovery it is safe on CPA's cold-start model path:
+	// entries are routed with maas_type=benefit without making another network
+	// request. Live refresh remains available from the management models route.
+	BenefitModels []ModelConfig `yaml:"benefit_models" json:"benefit_models"`
+	// DiscoverModels queries Agent Center per account. Optional live benefit
+	// discovery is management-only so it cannot block registration or chat.
+	DiscoverModels bool `yaml:"discover_models" json:"discover_models"`
+	// DiscoverBuiltinModels controls the additional account-scoped
+	// /v1/model/builtin request. Operators can disable it if that endpoint is
+	// slow; Agent Center discovery and configured fallbacks remain available.
+	DiscoverBuiltinModels bool     `yaml:"discover_builtin_models" json:"discover_builtin_models"`
+	ModelAgentIDs         []string `yaml:"model_agent_ids" json:"model_agent_ids"`
 	// RequestTimeoutSeconds bounds a single upstream request.
 	RequestTimeoutSeconds int `yaml:"request_timeout_seconds" json:"request_timeout_seconds"`
 	// LoginTimeoutSeconds bounds the interactive browser login flow.
@@ -240,8 +250,9 @@ func defaultConfig() *Config {
 		Schedule: ScheduleConfig{
 			Enabled: true,
 		},
-		Models:         []ModelConfig{},
-		DiscoverModels: true,
+		Models:                []ModelConfig{},
+		DiscoverModels:        true,
+		DiscoverBuiltinModels: true,
 	}
 }
 
@@ -333,26 +344,44 @@ func (c *Config) normalize() {
 		c.DefaultModelID = ""
 		c.ModelMap = nil
 	}
-	for index := range c.Models {
-		model := &c.Models[index]
-		model.ID = strings.TrimSpace(model.ID)
-		model.Name = strings.TrimSpace(model.Name)
-		if model.Name == "" {
-			model.Name = model.ID
-		}
-		model.DisplayName = strings.TrimSpace(model.DisplayName)
-		if model.DisplayName == "" {
-			model.DisplayName = model.ID
-		}
-		if model.ContextLength <= 0 {
-			model.ContextLength = 128000
-		}
-		if model.MaxOutputTokens <= 0 {
-			model.MaxOutputTokens = 8192
+	normalizeModels := func(models []ModelConfig, source string) {
+		for index := range models {
+			model := &models[index]
+			model.Source = source
+			model.ID = strings.TrimSpace(model.ID)
+			model.Name = strings.TrimSpace(model.Name)
+			if model.Name == "" {
+				model.Name = model.ID
+			}
+			model.DisplayName = strings.TrimSpace(model.DisplayName)
+			if model.DisplayName == "" {
+				model.DisplayName = model.ID
+			}
+			if model.ContextLength <= 0 {
+				model.ContextLength = 128000
+			}
+			if model.MaxOutputTokens <= 0 {
+				model.MaxOutputTokens = 8192
+			}
 		}
 	}
-	if c.DefaultModelID == "" && len(c.Models) > 0 {
-		c.DefaultModelID = c.Models[0].ID
+	normalizeModels(c.Models, "")
+	normalizeModels(c.BenefitModels, "benefit")
+	if c.DefaultModelID == "" {
+		for _, model := range c.Models {
+			if model.ID != "" {
+				c.DefaultModelID = model.ID
+				break
+			}
+		}
+		if c.DefaultModelID == "" {
+			for _, model := range c.BenefitModels {
+				if model.ID != "" {
+					c.DefaultModelID = model.ID
+					break
+				}
+			}
+		}
 	}
 	c.Schedule.normalize()
 	c.Scheduler.normalize()
@@ -450,6 +479,22 @@ func (c *Config) upstreamModel(model string) string {
 		return model
 	}
 	return c.DefaultModelID
+}
+
+// isConfiguredBenefitModel performs the route check without live discovery.
+// It is intentionally independent of DiscoverModels so a fully static setup
+// still sends the required maas_type header.
+func (c *Config) isConfiguredBenefitModel(model string) bool {
+	if c == nil {
+		return false
+	}
+	target := c.upstreamModel(model)
+	for _, configured := range c.BenefitModels {
+		if configured.ID != "" && configured.ID == target {
+			return true
+		}
+	}
+	return false
 }
 
 func (c *Config) requestTimeout() time.Duration {

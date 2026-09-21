@@ -799,6 +799,9 @@ func checkinCredentials(task ScheduleTask) ([]checkinAccount, error) {
 		if normalizeProvider(file.Provider) != providerID && normalizeProvider(file.Type) != providerID {
 			continue
 		}
+		if file.Disabled || file.Unavailable {
+			continue
+		}
 		if wanted != "" && !strings.EqualFold(file.AuthIndex, wanted) &&
 			!strings.EqualFold(file.Name, wanted) && !strings.EqualFold(file.Label, wanted) {
 			continue
@@ -808,6 +811,10 @@ func checkinCredentials(task ScheduleTask) ([]checkinAccount, error) {
 			continue
 		}
 		cred, errCred := credentialFromStorage(storage)
+		if errCred != nil || !cred.valid() {
+			continue
+		}
+		cred, errCred = prepareCredentialForUse(file.AuthIndex, cred)
 		if errCred != nil || !cred.valid() {
 			continue
 		}

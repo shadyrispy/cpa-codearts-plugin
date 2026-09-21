@@ -10,7 +10,7 @@ real traffic through code that may not handle it.
 | Capability | Status | What it does here |
 | --- | --- | --- |
 | `auth_provider` | yes | OAuth authorization-code sign-in with PKCE + DPoP, hourly host/cron renewal, request-time expiry catch-up, and legacy ticket compatibility. |
-| `model_provider` | yes | Discovers account agents and their visible models, plus the enabled benefit gateway catalog. Explicit configured aliases retain the target route; no model is fabricated on discovery failure. |
+| `model_provider` | yes | Discovers account agents and their visible models on CPA's critical path. Benefit models come from operator-confirmed `benefit_models` or an explicit synchronous management refresh, so a slow optional gateway cannot empty the registry. Configured aliases retain the target route; no model is fabricated on Agent discovery failure. |
 | `executor` | yes | Chat completions, streaming and non-streaming, both upstream protocols. Declares input `chat-completions` and outputs `chat-completions` + `claude`, so OpenAI, Anthropic and Responses clients are served (see below). |
 | `quota_provider` | yes | Subscription/quota view in the host's normalised quota shape. |
 | `usage_plugin` | yes | Collects the host's exact per-request token records into a rollup. |

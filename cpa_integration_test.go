@@ -30,7 +30,7 @@ func TestCPAIntegration(t *testing.T) {
 	if executable == "" || dll == "" {
 		t.Skip("set CODEARTS_CPA_EXE and CODEARTS_PLUGIN_DLL for real-host integration")
 	}
-	var chatCalls, loginCalls, renewCalls atomic.Int32
+	var chatCalls, loginCalls, renewCalls, benefitCatalogCalls atomic.Int32
 	var nextStatus atomic.Int32
 	var sessionMu sync.Mutex
 	activeSessions := map[string]bool{}
@@ -39,6 +39,7 @@ func TestCPAIntegration(t *testing.T) {
 	agentModels := modelFixture(t, "agent-detail")
 	gatewayModels := modelFixture(t, "gateway-config")
 	agentList := modelFixture(t, "useragents")
+	builtinModels := modelFixture(t, "builtin")
 	profile, _ := json.Marshal(oauthIdentity{AccountID: "tenant", PrincipalID: "browser-id", PrincipalURN: "iam::tenant:browser-user"})
 	claims, _ := json.Marshal(map[string]string{"user_profile": base64.RawURLEncoding.EncodeToString(profile)})
 	refreshToken := "e30." + base64.RawURLEncoding.EncodeToString(claims) + ".signature"
@@ -110,7 +111,11 @@ func TestCPAIntegration(t *testing.T) {
 		case "/v1/agent-center/agents/detail":
 			w.Header().Set("Content-Type", "application/json")
 			_, _ = w.Write(agentModels)
+		case "/v1/model/builtin":
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = w.Write(builtinModels)
 		case "/v1/benefit-gateway-config":
+			benefitCatalogCalls.Add(1)
 			fmt.Fprint(w, `{"enabled":true}`)
 		case "/api/v1/gateway/config":
 			if !strings.Contains(r.Header.Get("Authorization"), "SignedHeaders=host;x-sdk-date;x-security-token") {
@@ -196,7 +201,8 @@ func TestCPAIntegration(t *testing.T) {
 	listener.Close()
 	configPath := filepath.Join(dir, "config.yaml")
 	const staticModelConfig = "      model_map: {audit-model: GLM-5.2}\n      models: [{id: audit-model, display_name: Audit alias}]\n"
-	configYAML := fmt.Sprintf("host: 127.0.0.1\nport: %d\nauth-dir: %q\napi-keys: [audit-client]\nremote-management:\n  allow-remote: false\n  secret-key: audit-admin\n  disable-control-panel: true\nrequest-retry: 0\nplugins:\n  enabled: true\n  dir: %q\n  configs:\n    codearts-provider:\n      enabled: true\n      base_url: %q\n      benefit_gateway_url: %q\n      oauth_token_url: %q\n      discover_models: true\n", port, filepath.ToSlash(authDir), filepath.ToSlash(pluginDir), upstream.URL, upstream.URL, upstream.URL+"/v1/oauth2/tokens") + staticModelConfig
+	const benefitModelConfig = "      benefit_models:\n        - {id: deepseek-v4-flash-0731, display_name: deepseek-v4-flash-0731, context_length: 1048576, max_output_tokens: 393216}\n        - {id: deepseek-v4-pro-0813, display_name: deepseek-v4-pro-0813, context_length: 1048576, max_output_tokens: 393216}\n        - {id: glm-5.3-flash, display_name: glm-5.3-flash, context_length: 1048576, max_output_tokens: 131072}\n"
+	configYAML := fmt.Sprintf("host: 127.0.0.1\nport: %d\nauth-dir: %q\napi-keys: [audit-client]\nremote-management:\n  allow-remote: false\n  secret-key: audit-admin\n  disable-control-panel: true\nrequest-retry: 0\nplugins:\n  enabled: true\n  dir: %q\n  configs:\n    codearts-provider:\n      enabled: true\n      base_url: %q\n      benefit_gateway_url: %q\n      oauth_token_url: %q\n      discover_models: true\n", port, filepath.ToSlash(authDir), filepath.ToSlash(pluginDir), upstream.URL, upstream.URL, upstream.URL+"/v1/oauth2/tokens") + benefitModelConfig + staticModelConfig
 	if err = os.WriteFile(configPath, []byte(configYAML), 0600); err != nil {
 		t.Fatal(err)
 	}
@@ -326,12 +332,14 @@ func TestCPAIntegration(t *testing.T) {
 		}
 		t.Fatalf("discovered model missing: %d %s", status, body)
 	}
-	assertModels("audit-model", "glm-5.3-flash")
+	// The alias and configured benefit model are static; GLM-5.2 proves the
+	// imported account has completed refresh plus live Agent discovery.
+	assertModels("audit-model", "glm-5.3-flash", "GLM-5.2")
 	if renewCalls.Load() != 1 {
 		t.Fatalf("expired credential was renewed %d times, want exactly once before model discovery", renewCalls.Load())
 	}
 	t.Log("expired stored credential was silently renewed and persisted before model discovery")
-	capturedModelIDs := []string{"GLM-5.2", "glm-5.2-sft-harmony", "openpangu-2.0-pro", "openpangu-2.0-flash", "deepseek-v4-flash-0731", "deepseek-v4-pro-0813", "glm-5.3-flash"}
+	capturedModelIDs := []string{"GLM-5.2", "glm-5.2-sft-harmony", "openpangu-2.0-pro", "openpangu-2.0-flash", "Qwen3-VL-235B", "kimi-k2.6-vl", "deepseek-v4-flash-0731", "deepseek-v4-pro-0813", "glm-5.3-flash"}
 	for _, modelID := range capturedModelIDs {
 		if !bytes.Contains(body, []byte(`"`+modelID+`"`)) {
 			t.Fatalf("captured model %s is missing from CPA catalog: %s", modelID, body)
@@ -345,7 +353,7 @@ func TestCPAIntegration(t *testing.T) {
 	if status != 200 || !bytes.Contains(body, []byte("hello from fixture")) {
 		t.Fatalf("benefit model routing failed: %d %s", status, body)
 	}
-	t.Log("all seven captured model IDs appeared and benefit routing passed through CPA")
+	t.Log("four Agent, two built-in and three configured benefit models appeared; benefit routing passed through CPA")
 	status, body = request("GET", "/v0/management/codearts-provider/accounts", "")
 	var accountList struct {
 		Accounts []struct {
@@ -357,7 +365,7 @@ func TestCPAIntegration(t *testing.T) {
 	}
 	status, body = request("GET", "/v0/management/codearts-provider/models?auth_index="+url.QueryEscape(accountList.Accounts[0].AuthIndex), "")
 	var visibleCatalog modelCatalogResult
-	if json.Unmarshal(body, &visibleCatalog) != nil || status != 200 || len(visibleCatalog.Models) != 8 || visibleCatalog.Source != "discovered" || len(visibleCatalog.Warnings) != 0 {
+	if json.Unmarshal(body, &visibleCatalog) != nil || status != 200 || len(visibleCatalog.Models) != 10 || visibleCatalog.Source != "discovered" || len(visibleCatalog.Warnings) != 0 {
 		t.Fatalf("panel account catalog differs from registered models: %d %s", status, body)
 	}
 	for _, secret := range []string{"import-ak", "import-sk", "import-sts", "access_key_id", "oauth_context"} {
@@ -627,5 +635,8 @@ func TestCPAIntegration(t *testing.T) {
 			t.Fatalf("chat session lifecycle is unbalanced: busy=%d idle=%d", starts, sessionFinishes[sessionID])
 		}
 	}
-	t.Log("empty static model configuration registered all seven models and executed agent and benefit requests")
+	if benefitCatalogCalls.Load() != 0 {
+		t.Fatalf("critical CPA paths issued %d live benefit catalogue requests", benefitCatalogCalls.Load())
+	}
+	t.Log("empty general static model configuration registered Agent, built-in and configured benefit models and executed both routes")
 }

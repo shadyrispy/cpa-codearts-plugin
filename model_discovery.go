@@ -37,16 +37,15 @@ var discoveredModels = struct {
 	entries map[string]modelCacheEntry
 }{entries: make(map[string]modelCacheEntry)}
 
-// benefitCatalogTimeout keeps an optional/slow benefit gateway from blocking
-// the account's already available Agent Center models until CPA abandons the
-// whole model.for_auth call. The request continues in its buffered goroutine and
-// a short cache TTL retries the missing source later.
-var benefitCatalogTimeout = 8 * time.Second
-
-type benefitCatalogResult struct {
-	models []ModelConfig
-	err    error
+type modelCatalogFlight struct {
+	mu   sync.Mutex
+	refs int
 }
+
+var modelCatalogFlights = struct {
+	sync.Mutex
+	entries map[string]*modelCatalogFlight
+}{entries: make(map[string]*modelCatalogFlight)}
 
 func modelsForAuth(raw []byte) ([]byte, error) {
 	var req struct {
@@ -70,7 +69,11 @@ func modelsForAuth(raw []byte) ([]byte, error) {
 			})
 		}
 	}
-	catalog := accountModelCatalog(config(), cred, req.HostCallbackID)
+	// CPA calls this on its cold-start registration path. Keep that path free of
+	// the optional benefit gateway: a slow request there must never hide working
+	// Agent Center models. Operator-confirmed benefit_models are still merged by
+	// accountAgentModelCatalog without network I/O.
+	catalog := accountAgentModelCatalog(config(), cred, req.HostCallbackID)
 	if len(catalog.Warnings) > 0 {
 		logWarn("account model discovery incomplete", map[string]any{"auth_id": req.AuthID, "source": catalog.Source, "warnings": catalog.Warnings})
 	}
@@ -78,6 +81,17 @@ func modelsForAuth(raw []byte) ([]byte, error) {
 }
 
 func accountModelCatalog(cfg *Config, cred *credential, callbackID string) modelCatalogResult {
+	return accountModelCatalogScoped(cfg, cred, callbackID, true)
+}
+
+// accountAgentModelCatalog is the bounded catalogue used by CPA registration
+// and request routing. It performs no live benefit-gateway I/O; that optional
+// source is queried only by an explicit management request.
+func accountAgentModelCatalog(cfg *Config, cred *credential, callbackID string) modelCatalogResult {
+	return accountModelCatalogScoped(cfg, cred, callbackID, false)
+}
+
+func accountModelCatalogScoped(cfg *Config, cred *credential, callbackID string, includeLiveBenefit bool) modelCatalogResult {
 	result := modelCatalogResult{Models: []ModelConfig{}, Source: "unavailable"}
 	if cfg == nil {
 		result.Warnings = []string{"Model discovery configuration is unavailable"}
@@ -85,7 +99,26 @@ func accountModelCatalog(cfg *Config, cred *credential, callbackID string) model
 	}
 	if cfg.DiscoverModels {
 		if cred.valid() {
-			result = discoverModelCatalog(cfg, cred, callbackID)
+			if includeLiveBenefit {
+				result = discoverModelCatalog(cfg, cred, callbackID)
+			} else {
+				result = discoverAgentModelCatalog(cfg, cred, callbackID)
+				// A successful explicit management refresh may have populated the
+				// full cache. Reuse only its already-fetched benefit entries; never
+				// perform benefit network I/O on this critical path.
+				if full, ok := cachedModelCatalog(modelCatalogCacheKey(cfg, cred, "full")); ok {
+					seen := make(map[string]bool, len(result.Models))
+					for _, model := range result.Models {
+						seen[model.ID] = true
+					}
+					for _, model := range full.Models {
+						if model.Source == "benefit" && !seen[model.ID] {
+							seen[model.ID] = true
+							result.Models = append(result.Models, model)
+						}
+					}
+				}
+			}
 		} else {
 			result.Warnings = []string{"Sign in to discover the models available to this account"}
 		}
@@ -93,26 +126,51 @@ func accountModelCatalog(cfg *Config, cred *credential, callbackID string) model
 	if len(result.Models) == 0 {
 		// Only the operator's explicit configuration may be used as a fallback;
 		// an unsuccessful request must not invent a supposedly available model.
-		if len(cfg.Models) > 0 {
-			result.Models = append([]ModelConfig(nil), cfg.Models...)
-			result.Source = "configured"
+		if len(cfg.Models) == 0 && len(cfg.BenefitModels) == 0 {
+			return result
 		}
-		return result
+		result.Models = append([]ModelConfig(nil), cfg.Models...)
+		result.Source = "configured"
 	}
 	// Keep explicit aliases only when their target was discovered for this
 	// account. Carry the target's route so aliases can invoke benefit models.
-	byID := make(map[string]ModelConfig, len(result.Models))
-	for _, model := range result.Models {
-		byID[model.ID] = model
+	byID := make(map[string]int, len(result.Models)+len(cfg.BenefitModels))
+	for index, model := range result.Models {
+		if model.ID != "" {
+			byID[model.ID] = index
+		}
+	}
+	// benefit_models are an explicit last-known-good catalogue. They are safe to
+	// merge on the cold-start path because doing so performs no network request.
+	// If an ID appears in both configured lists, the explicit benefit route wins.
+	for _, model := range cfg.BenefitModels {
+		if model.ID == "" {
+			continue
+		}
+		if index, exists := byID[model.ID]; exists {
+			result.Models[index].Source = "benefit"
+			continue
+		}
+		model.Source = "benefit"
+		result.Models = append(result.Models, model)
+		byID[model.ID] = len(result.Models) - 1
+	}
+	// Models present because they are explicit fallbacks may themselves be
+	// aliases. Resolve their source after benefit entries have been merged.
+	for index := range result.Models {
+		targetIndex, ok := byID[cfg.ModelMap[result.Models[index].ID]]
+		if ok {
+			result.Models[index].Source = result.Models[targetIndex].Source
+		}
 	}
 	for _, model := range cfg.Models {
-		target, ok := byID[cfg.ModelMap[model.ID]]
+		targetIndex, ok := byID[cfg.ModelMap[model.ID]]
 		if _, exists := byID[model.ID]; exists || !ok {
 			continue
 		}
-		model.Source = target.Source
+		model.Source = result.Models[targetIndex].Source
 		result.Models = append(result.Models, model)
-		byID[model.ID] = model
+		byID[model.ID] = len(result.Models) - 1
 	}
 	return result
 }
@@ -123,7 +181,7 @@ func discoverAccountModels(cfg *Config, cred *credential, callbackID string) ([]
 	if cfg == nil || !cred.valid() {
 		return nil, fmt.Errorf("model discovery requires configuration and an account credential")
 	}
-	result := discoverModelCatalog(cfg, cred, callbackID)
+	result := discoverAgentModelCatalog(cfg, cred, callbackID)
 	if len(result.Models) == 0 {
 		return nil, fmt.Errorf("%s", strings.Join(result.Warnings, "; "))
 	}
@@ -132,11 +190,12 @@ func discoverAccountModels(cfg *Config, cred *credential, callbackID string) ([]
 
 // Cache entries are isolated by the full discovery configuration and credential,
 // including rotated tokens. Only hashes are retained as keys.
-func modelCatalogCacheKey(cfg *Config, cred *credential) string {
+func modelCatalogCacheKey(cfg *Config, cred *credential, scope string) string {
 	data, _ := json.Marshal(struct {
 		Config     *Config
 		Credential *credential
-	}{cfg, cred})
+		Scope      string
+	}{cfg, cred, scope})
 	return sha256Hex(data)
 }
 
@@ -146,26 +205,73 @@ func cloneModelCatalog(catalog modelCatalogResult) modelCatalogResult {
 	return catalog
 }
 
-func discoverModelCatalog(cfg *Config, cred *credential, callbackID string) modelCatalogResult {
-	key := modelCatalogCacheKey(cfg, cred)
+func cachedModelCatalog(key string) (modelCatalogResult, bool) {
 	discoveredModels.Lock()
 	entry, ok := discoveredModels.entries[key]
 	discoveredModels.Unlock()
 	if ok && time.Now().Before(entry.expires) {
-		return cloneModelCatalog(entry.catalog)
+		return cloneModelCatalog(entry.catalog), true
+	}
+	return modelCatalogResult{}, false
+}
+
+func storeModelCatalog(key string, result modelCatalogResult) {
+	ttl := 5 * time.Minute
+	if len(result.Warnings) > 0 {
+		// Retry missing sources promptly without discarding working models.
+		ttl = 30 * time.Second
+	}
+	now := time.Now()
+	discoveredModels.Lock()
+	for cacheKey, value := range discoveredModels.entries {
+		if !now.Before(value.expires) {
+			delete(discoveredModels.entries, cacheKey)
+		}
+	}
+	if len(discoveredModels.entries) < 512 {
+		discoveredModels.entries[key] = modelCacheEntry{catalog: cloneModelCatalog(result), expires: now.Add(ttl)}
+	}
+	discoveredModels.Unlock()
+}
+
+// acquireModelCatalogFlight coalesces concurrent cache misses for the same
+// account/configuration. The reference count lets entries be removed safely:
+// a waiter increments refs before the current owner can delete the lock.
+func acquireModelCatalogFlight(key string) func() {
+	modelCatalogFlights.Lock()
+	flight := modelCatalogFlights.entries[key]
+	if flight == nil {
+		flight = &modelCatalogFlight{}
+		modelCatalogFlights.entries[key] = flight
+	}
+	flight.refs++
+	modelCatalogFlights.Unlock()
+	flight.mu.Lock()
+	return func() {
+		flight.mu.Unlock()
+		modelCatalogFlights.Lock()
+		flight.refs--
+		if flight.refs == 0 && modelCatalogFlights.entries[key] == flight {
+			delete(modelCatalogFlights.entries, key)
+		}
+		modelCatalogFlights.Unlock()
+	}
+}
+
+// discoverAgentModelCatalog is the only live discovery routine used by CPA's
+// registration and executor paths. It deliberately contains no benefit request
+// and therefore cannot leave an optional detached request behind.
+func discoverAgentModelCatalog(cfg *Config, cred *credential, callbackID string) modelCatalogResult {
+	key := modelCatalogCacheKey(cfg, cred, "agent")
+	if cached, ok := cachedModelCatalog(key); ok {
+		return cached
+	}
+	release := acquireModelCatalogFlight(key)
+	defer release()
+	if cached, ok := cachedModelCatalog(key); ok {
+		return cached
 	}
 	result := modelCatalogResult{Models: []ModelConfig{}, Source: "unavailable", FetchedAt: time.Now().UTC()}
-	var benefitResults <-chan benefitCatalogResult
-	var benefitTimer *time.Timer
-	if cfg.APIMode != "native" && cfg.BenefitGatewayURL != "" {
-		results := make(chan benefitCatalogResult, 1)
-		benefitResults = results
-		benefitTimer = time.NewTimer(benefitCatalogTimeout)
-		go func() {
-			models, err := discoverBenefitModels(cfg, cred, callbackID)
-			results <- benefitCatalogResult{models: models, err: err}
-		}()
-	}
 	ids := append([]string(nil), cfg.ModelAgentIDs...)
 	if len(ids) == 0 {
 		if cfg.APIMode == "native" {
@@ -208,24 +314,10 @@ func discoverModelCatalog(cfg *Config, cred *credential, callbackID string) mode
 		}
 		appendModels(models)
 	}
-	if benefitResults != nil {
-		select {
-		case benefit := <-benefitResults:
-			if benefitTimer != nil {
-				benefitTimer.Stop()
-			}
-			if benefit.err != nil {
-				result.Warnings = append(result.Warnings, "Benefit model catalog: "+benefit.err.Error())
-			}
-			appendModels(benefit.models)
-		case <-benefitTimer.C:
-			result.Warnings = append(result.Warnings, fmt.Sprintf("Benefit model catalog: timed out after %s", benefitCatalogTimeout))
-		}
-	}
 	// Merged last: appendModels keeps the first entry per id, so ids the agent
-	// and benefit catalogues also report keep the route those sources advertise,
-	// and the built-in list only contributes models nothing else reports.
-	if cfg.APIMode != "native" {
+	// catalogue also reports keep the Agent route, and the built-in list only
+	// contributes models Agent Center did not report.
+	if cfg.APIMode != "native" && cfg.DiscoverBuiltinModels {
 		builtin, errBuiltin := discoverBuiltinModels(cfg, cred, callbackID)
 		if errBuiltin != nil {
 			result.Warnings = append(result.Warnings, "Builtin model catalog: "+errBuiltin.Error())
@@ -234,25 +326,56 @@ func discoverModelCatalog(cfg *Config, cred *credential, callbackID string) mode
 	}
 	if len(result.Models) == 0 {
 		result.Warnings = append(result.Warnings, "No enabled models were returned for this account")
+		storeModelCatalog(key, result)
 		return result
 	}
 	result.Source = "discovered"
-	ttl := 5 * time.Minute
-	if len(result.Warnings) > 0 {
-		// Retry missing sources promptly without discarding the working models.
-		ttl = 30 * time.Second
+	storeModelCatalog(key, result)
+	return result
+}
+
+// discoverModelCatalog is the explicit full refresh used by management. Agent
+// models are obtained and cached first; the benefit request then runs
+// synchronously under the management callback context so cancellation reaches
+// host.http.do and no goroutine survives the call.
+func discoverModelCatalog(cfg *Config, cred *credential, callbackID string) modelCatalogResult {
+	key := modelCatalogCacheKey(cfg, cred, "full")
+	if cached, ok := cachedModelCatalog(key); ok {
+		return cached
 	}
-	now := time.Now()
-	discoveredModels.Lock()
-	for cacheKey, value := range discoveredModels.entries {
-		if !now.Before(value.expires) {
-			delete(discoveredModels.entries, cacheKey)
+	release := acquireModelCatalogFlight(key)
+	defer release()
+	if cached, ok := cachedModelCatalog(key); ok {
+		return cached
+	}
+	result := discoverAgentModelCatalog(cfg, cred, callbackID)
+	if cfg.APIMode != "native" && cfg.BenefitGatewayURL != "" {
+		models, err := discoverBenefitModels(cfg, cred, callbackID)
+		if err != nil {
+			result.Warnings = append(result.Warnings, "Benefit model catalog: "+err.Error())
+		} else {
+			seen := make(map[string]bool, len(result.Models))
+			for _, model := range result.Models {
+				seen[model.ID] = true
+			}
+			for _, model := range models {
+				if !seen[model.ID] {
+					seen[model.ID] = true
+					result.Models = append(result.Models, model)
+				}
+			}
 		}
 	}
-	if len(discoveredModels.entries) < 512 {
-		discoveredModels.entries[key] = modelCacheEntry{catalog: cloneModelCatalog(result), expires: now.Add(ttl)}
+	if len(result.Models) == 0 {
+		result.Source = "unavailable"
+		if len(result.Warnings) == 0 {
+			result.Warnings = append(result.Warnings, "No enabled models were returned for this account")
+		}
+		storeModelCatalog(key, result)
+		return result
 	}
-	discoveredModels.Unlock()
+	result.Source = "discovered"
+	storeModelCatalog(key, result)
 	return result
 }
 

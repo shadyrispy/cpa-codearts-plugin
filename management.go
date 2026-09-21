@@ -6,6 +6,7 @@ import (
 	"net/http"
 	"net/url"
 	"sort"
+	"strconv"
 	"strings"
 	"time"
 
@@ -35,7 +36,7 @@ func managementRoutes() []map[string]any {
 		{
 			"Method":      http.MethodGet,
 			"Path":        "/codearts-provider/models",
-			"Description": "Read the account model catalog with sources and discovery warnings (query: auth_index).",
+			"Description": "Read the account model catalog (query: auth_index; add include_benefit=true for a synchronous live benefit diagnostic).",
 		},
 		{
 			"Method":      http.MethodPost,
@@ -461,7 +462,18 @@ func handleAccountModels(query url.Values, callbackID string) pluginapi.Manageme
 			return errorJSON(http.StatusServiceUnavailable, "the account credential expired and silent refresh failed")
 		}
 		cred = refreshed
-		catalog := accountModelCatalog(config(), cred, callbackID)
+		includeLiveBenefit, _ := strconv.ParseBool(strings.TrimSpace(query.Get("include_benefit")))
+		catalog := accountAgentModelCatalog(config(), cred, callbackID)
+		if includeLiveBenefit {
+			// This is an explicit diagnostic refresh. It is synchronous so the
+			// management request context cancels host HTTP rather than leaving a
+			// detached benefit request behind. It never rewrites the credential:
+			// doing so could roll back an OAuth token rotated while this slow
+			// diagnostic was running. Persist confirmed entries explicitly through
+			// benefit_models instead.
+			_ = discoverModelCatalog(config(), cred, callbackID)
+			catalog = accountModelCatalog(config(), cred, callbackID)
+		}
 		return jsonResponse(http.StatusOK, mustJSON(map[string]any{
 			"auth_index": authIndex, "models": catalog.Models, "count": len(catalog.Models),
 			"source": catalog.Source, "warnings": catalog.Warnings, "fetched_at": catalog.FetchedAt,
@@ -1003,14 +1015,23 @@ func statusPage(cfg *Config) pluginapi.ManagementResponse {
 		ID            string `json:"id"`
 		DisplayName   string `json:"display_name"`
 		UpstreamModel string `json:"upstream_model"`
+		Source        string `json:"source"`
 	}
-	models := make([]modelView, 0, len(cfg.Models))
-	for _, model := range cfg.Models {
-		models = append(models, modelView{
-			ID:            model.ID,
-			DisplayName:   model.DisplayName,
-			UpstreamModel: cfg.upstreamModel(model.ID),
-		})
+	models := make([]modelView, 0, len(cfg.Models)+len(cfg.BenefitModels))
+	seenModels := make(map[string]bool, cap(models))
+	for _, source := range [][]ModelConfig{cfg.Models, cfg.BenefitModels} {
+		for _, model := range source {
+			if model.ID == "" || seenModels[model.ID] {
+				continue
+			}
+			seenModels[model.ID] = true
+			models = append(models, modelView{
+				ID:            model.ID,
+				DisplayName:   model.DisplayName,
+				UpstreamModel: cfg.upstreamModel(model.ID),
+				Source:        firstNonEmptyString(model.Source, "configured"),
+			})
+		}
 	}
 
 	payload := map[string]any{
@@ -1036,7 +1057,8 @@ func statusPage(cfg *Config) pluginapi.ManagementResponse {
 		"models": models,
 		"model_catalog": map[string]any{
 			"scope": "configured_only", "discovery_enabled": cfg.DiscoverModels,
-			"account_catalog_path": managementBasePath + "/" + providerID + "/models?auth_index=...",
+			"account_catalog_path":      managementBasePath + "/" + providerID + "/models?auth_index=...",
+			"live_benefit_refresh_path": managementBasePath + "/" + providerID + "/models?auth_index=...&include_benefit=true",
 		},
 		"schedule": map[string]any{
 			"enabled":  cfg.Schedule.Enabled,

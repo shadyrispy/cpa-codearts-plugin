@@ -61,7 +61,12 @@ func registrationResponse() map[string]any {
 				{
 					Name:        "discover_models",
 					Type:        pluginapi.ConfigFieldTypeBoolean,
-					Description: "Discover each account's Agent Center and benefit gateway models. Enabled by default; no models are invented when discovery fails.",
+					Description: "Discover each account's Agent Center models. Enabled by default; optional benefit discovery is explicit so it cannot block CPA startup.",
+				},
+				{
+					Name:        "discover_builtin_models",
+					Type:        pluginapi.ConfigFieldTypeBoolean,
+					Description: "Query the account-scoped /v1/model/builtin catalogue after Agent Center. Enabled by default; disable it if that endpoint is slow.",
 				},
 				{
 					Name:        "benefit_gateway_url",
@@ -82,6 +87,11 @@ func registrationResponse() map[string]any {
 					Name:        "models",
 					Type:        pluginapi.ConfigFieldTypeArray,
 					Description: "Static model list advertised to CLIProxyAPI.",
+				},
+				{
+					Name:        "benefit_models",
+					Type:        pluginapi.ConfigFieldTypeArray,
+					Description: "Operator-confirmed benefit models shared by all CodeArts accounts and routed with maas_type=benefit without blocking cold-start discovery.",
 				},
 				{
 					Name:        "model_map",
@@ -153,7 +163,19 @@ func staticModels() pluginapi.ModelResponse {
 }
 
 func modelInfos() []pluginapi.ModelInfo {
-	return infosForModels(config().Models)
+	cfg := config()
+	models := make([]ModelConfig, 0, len(cfg.Models)+len(cfg.BenefitModels))
+	seen := make(map[string]bool, cap(models))
+	for _, source := range [][]ModelConfig{cfg.Models, cfg.BenefitModels} {
+		for _, model := range source {
+			if model.ID == "" || seen[model.ID] {
+				continue
+			}
+			seen[model.ID] = true
+			models = append(models, model)
+		}
+	}
+	return infosForModels(models)
 }
 
 func infosForModels(models []ModelConfig) []pluginapi.ModelInfo {

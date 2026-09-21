@@ -13,7 +13,7 @@ plugin C ABI.
 | Capability | Purpose |
 | --- | --- |
 | `auth_provider` | OAuth authorization-code sign-in with PKCE + DPoP and refresh-token renewal, matching CodeArts Agent 26.9.101. |
-| `model_provider` | Discovers each account's visible Agent Center and enabled benefit models, with explicit configured aliases or fallbacks. |
+| `model_provider` | Discovers each account's visible Agent Center models; benefit models use explicit last-known-good configuration or an on-demand management refresh so an optional slow gateway cannot empty CPA's model registry. |
 | `executor` | Transports chat completions to the CodeArts gateway, streaming and non-streaming, and serves OpenAI Chat Completions, Anthropic Messages and OpenAI Responses clients. |
 | `quota_provider` | Serves the subscription/quota snapshot in CLIProxyAPI's normalised quota shape. |
 | `usage_plugin` | Collects the host's exact per-request token records into a rollup. |
@@ -502,7 +502,7 @@ real traffic through code that may not handle it.
 | Capability | Status | What it does here |
 | --- | --- | --- |
 | `auth_provider` | yes | OAuth authorization-code sign-in with PKCE + DPoP, refresh-token renewal, and legacy ticket compatibility. |
-| `model_provider` | yes | Discovers account-specific Agent Center and enabled benefit models; explicit configured aliases retain the target route. |
+| `model_provider` | yes | Discovers account-specific Agent Center models and merges operator-confirmed or explicitly refreshed benefit models; aliases retain the target route. |
 | `executor` | yes | Chat completions, streaming and non-streaming, both upstream protocols. |
 | `quota_provider` | yes | Subscription/quota view in the host's normalised quota shape. |
 | `usage_plugin` | yes | Collects the host's exact per-request token records into a rollup. |
@@ -542,23 +542,27 @@ The plugin discovers three sources, matching the captured
    `model_name` is retained as the display name. `model_agent_ids` can override
    the automatic agent list. The legacy Act/Plan IDs are only a list-failure or
    empty-list fallback.
-2. When snap `/v1/benefit-gateway-config` returns `enabled:true`, the plugin reads
-   `/api/v1/gateway/config` under `benefit_gateway_url` using the same account's
-   temporary credentials and the gateway's host-signed request format. These
-   are benefit models; their chat requests still use snap
-   `/api/v2/chat/completions`, with `maas_type: benefit`. The returned gateway
-   `base_url` does not redirect subscription chat traffic.
+2. The CPA cold-start and chat paths never query the optional benefit gateway.
+   Put account-confirmed entries in `benefit_models`; they are registered and
+   routed with `maas_type: benefit` without network I/O. An operator can request
+   a synchronous live diagnostic with
+   `GET /v0/management/codearts-provider/models?auth_index=...&include_benefit=true`.
+   That call checks snap `/v1/benefit-gateway-config`, then reads
+   `/api/v1/gateway/config` under `benefit_gateway_url` using the account's
+   temporary credentials and host-signed request format. A successful result is
+   reused from memory, but `benefit_models` is the restart-persistent LKG list.
+
+`benefit_models` is plugin-wide and is therefore offered to every configured
+CodeArts account. On a multi-account CPA, include only benefits shared by every
+account (or use separate CPA instances/configurations for different entitlement
+sets); otherwise the scheduler could select an account that lacks that benefit.
 3. `GET /v1/model/builtin` supplies `builtinModels` — the models the account may
    call directly. `Agent-Type: PromptCenter` is required: with any other agent
    type the gateway answers with that agent's restricted view, and an empty list
    is indistinguishable from "this account has no models". This source is what
    advertises, for example, `Qwen3-VL-235B` and `kimi-k2.6-vl`, which no agent
-   detail lists.
-
-It is merged last on purpose: discovery keeps the first entry per model id, so
-ids an earlier source also reports keep the route that source advertises. The
-live built-in list was verified not to contain the benefit models, so it cannot
-offer one to an account whose benefit gate is closed.
+   detail lists. It is merged after Agent Center; duplicate IDs retain their
+   earlier Agent route.
 
 The captured catalog contained four Agent Center models (GLM-5.2, its ArkTS
 variant, OpenPangu Pro and Flash), three benefit models (two DeepSeek variants
@@ -567,11 +571,12 @@ nothing else reports. This is a regression fixture, not a hardcoded universal li
 accounts and upstream catalogs can differ. Benefit discovery does not claim
 benefits; new accounts may need to claim the entitlement in the official client.
 
-Full catalogs are cached for five minutes per configuration and credential;
-partial results retain available models and warnings, and are retried after
-30 seconds. There is no default Pangu entry. Total failure returns an empty
-catalog, unless the operator explicitly configured `models` as a fallback.
-Configured aliases in `model_map` inherit the discovered target's route.
+Agent and explicit full catalogs are cached independently for five minutes per
+configuration and credential; partial results retain available models and
+warnings, and are retried after 30 seconds. There is no default Pangu entry.
+Total Agent failure returns an empty catalog unless the operator configured
+`models` as a fallback. `benefit_models` are operator-confirmed and always keep
+their benefit route. Configured aliases in `model_map` inherit the target route.
 
 Open the CodeArts panel and select **查看账号模型** to inspect IDs, display names,
 sources and warnings, or call the authenticated
@@ -620,7 +625,9 @@ example.
 | `default_model_id` | empty | Explicit fallback when a request omits its model. |
 | `model_map` | `{}` | Client-facing ID → upstream model_id. |
 | `models` | `[]` | Optional explicit static models or aliases; no invented fallback. |
-| `discover_models` | `true` | Discover Agent Center, enabled benefit and built-in models per account. |
+| `benefit_models` | `[]` | Restart-persistent benefit metadata shared by all configured CodeArts accounts and routed with `maas_type: benefit` without live discovery on critical paths. |
+| `discover_models` | `true` | Discover Agent Center and built-in models per account. Benefit discovery is explicit. |
+| `discover_builtin_models` | `true` | Query `/v1/model/builtin` after Agent Center; disable it if that endpoint is slow. |
 | `model_agent_ids` | `[]` | Explicit catalog IDs; empty discovers IDs from the account's agent list. |
 | `benefit_gateway_url` | `https://opengw.developer.huaweicloud.com` | Optional benefit catalog base; empty disables this source. |
 | `heartbeat` | `true` | Request upstream SSE heartbeat frames. |
@@ -845,9 +852,9 @@ Rebuild the library before running it: the test loads the file named by
   from completed calls remains unchanged. It does not truncate chat history or
   guarantee that a request fits the model's context window.
 - **Benefit model listing is separate from entitlement claiming.** The plugin
-  discovers and routes benefit models but does not automatically claim an
-  activity. Use the official client to claim eligible benefits, or a verified
-  `checkin` task configured for that activity.
+  routes configured or explicitly refreshed benefit models but does not
+  automatically claim an activity. Use the official client to claim eligible
+  benefits, or a verified `checkin` task configured for that activity.
 - **Credential renewal has three independent triggers.** Temporary credentials
   advertise `NextRefreshAfter` plus a one-hour refresh interval to the host; the
   plugin's enabled-by-default cron runs `token_renew` hourly; and model, chat and

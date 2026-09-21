@@ -1028,6 +1028,7 @@ func TestModelDiscoveryFallsBackToConfiguredModels(t *testing.T) {
 	})
 
 	t.Run("every agent fails", func(t *testing.T) {
+		resetModelCache(t)
 		testHost(t, func(method string, request any) (json.RawMessage, error) {
 			if method != "host.http.do" {
 				t.Fatalf("unexpected callback %s", method)
@@ -1042,6 +1043,7 @@ func TestModelDiscoveryFallsBackToConfiguredModels(t *testing.T) {
 	})
 
 	t.Run("agent returns no usable model", func(t *testing.T) {
+		resetModelCache(t)
 		testHost(t, func(method string, request any) (json.RawMessage, error) {
 			if method != "host.http.do" {
 				t.Fatalf("unexpected callback %s", method)
@@ -1059,6 +1061,7 @@ func TestModelDiscoveryFallsBackToConfiguredModels(t *testing.T) {
 	})
 
 	t.Run("one agent fails and one succeeds", func(t *testing.T) {
+		resetModelCache(t)
 		var calls atomic.Int32
 		testHost(t, func(method string, request any) (json.RawMessage, error) {
 			if method != "host.http.do" {

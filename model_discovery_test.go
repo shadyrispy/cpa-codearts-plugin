@@ -9,6 +9,7 @@ import (
 	"path/filepath"
 	"reflect"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -31,6 +32,9 @@ func resetModelCache(t *testing.T) {
 		discoveredModels.Lock()
 		discoveredModels.entries = map[string]modelCacheEntry{}
 		discoveredModels.Unlock()
+		modelCatalogFlights.Lock()
+		modelCatalogFlights.entries = map[string]*modelCatalogFlight{}
+		modelCatalogFlights.Unlock()
 	}
 	clear()
 	t.Cleanup(clear)
@@ -172,6 +176,10 @@ func TestCapturedAccountCatalogAndBenefitRouting(t *testing.T) {
 		t.Fatal("catalogue cache is not reused or exposes mutable storage")
 	}
 
+	// Changing routing configuration intentionally invalidates the live-cache
+	// key. Keep the account-confirmed benefit target as explicit LKG metadata so
+	// alias routing remains network-free on the executor path.
+	cfg.BenefitModels = []ModelConfig{{ID: "glm-5.3-flash", Name: "glm-5.3-flash", DisplayName: "glm-5.3-flash", Source: "benefit"}}
 	cfg.ModelMap = map[string]string{"friendly-flash": "glm-5.3-flash"}
 	req := executorRequest{}
 	req.Model = "friendly-flash"
@@ -218,44 +226,81 @@ func TestAgentModelsRespectVisibilityAndAliases(t *testing.T) {
 	}
 }
 
-func TestBenefitModelRoutingIsScopedToAccount(t *testing.T) {
+func TestConfiguredBenefitModelsNormalizeAsBenefitRoutes(t *testing.T) {
+	request := mustMarshal(t, map[string]any{
+		"config_yaml": []byte("benefit_models:\n  - id: glm-benefit\n"),
+	})
+	cfg, err := parseConfig(request)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(cfg.BenefitModels) != 1 {
+		t.Fatalf("benefit models = %+v", cfg.BenefitModels)
+	}
+	model := cfg.BenefitModels[0]
+	if model.ID != "glm-benefit" || model.Name != "glm-benefit" || model.DisplayName != "glm-benefit" || model.Source != "benefit" || model.ContextLength != 128000 || model.MaxOutputTokens != 8192 {
+		t.Fatalf("benefit model was not normalized for safe routing: %+v", model)
+	}
+}
+
+func TestBuiltinDiscoveryCanBeDisabled(t *testing.T) {
+	resetModelCache(t)
+	cfg := defaultConfig()
+	cfg.ModelAgentIDs = []string{"agent"}
+	cfg.DiscoverBuiltinModels = false
+	var builtinCalls atomic.Int32
+	agentFixture := modelFixture(t, "agent-detail")
+	modelTestHost(t, func(u *url.URL, _ http.Header) (hostHTTPResponse, error) {
+		switch u.Path {
+		case "/v1/agent-center/agents/detail":
+			return modelJSON(agentFixture), nil
+		case "/v1/model/builtin":
+			builtinCalls.Add(1)
+			return modelJSON(modelFixture(t, "builtin")), nil
+		default:
+			return hostHTTPResponse{}, fmt.Errorf("unexpected path %s", u.Path)
+		}
+	})
+	catalog := accountAgentModelCatalog(cfg, &credential{AccessKeyID: "no-builtin-ak", SecretAccessKey: "sk"}, "")
+	if len(catalog.Models) != 4 || builtinCalls.Load() != 0 {
+		t.Fatalf("disabled builtin discovery changed Agent catalogue: calls=%d catalogue=%+v", builtinCalls.Load(), catalog)
+	}
+}
+
+func TestConfiguredBenefitModelRoutesWithoutLiveDiscovery(t *testing.T) {
 	resetModelCache(t)
 	cfg := defaultConfig()
 	cfg.ModelAgentIDs = []string{"code-agent"}
-	modelTestHost(t, func(u *url.URL, headers http.Header) (hostHTTPResponse, error) {
-		switch u.Path {
-		case "/v1/agent-center/agents/detail":
-			return modelJSON(modelFixture(t, "agent-detail")), nil
-		case "/v1/benefit-gateway-config":
-			if strings.Contains(headers.Get("Authorization"), "Access=with-benefit,") {
-				return modelJSON([]byte(`{"enabled":true}`)), nil
-			}
-			return modelJSON([]byte(`{"enabled":false}`)), nil
-		case "/api/v1/gateway/config":
-			if !strings.Contains(headers.Get("Authorization"), "Access=with-benefit,") {
-				t.Fatal("queried benefit catalogue for an account whose gate is disabled")
-			}
-			return modelJSON(modelFixture(t, "gateway-config")), nil
-		case "/v1/model/builtin":
-			// The built-in catalogue never lists the limited-time benefit models
-			// (verified against the live gateway), so it must not hand one to an
-			// account whose benefit gate is closed.
-			return modelJSON([]byte(`{"builtinModels":[{"model_id":"builtin-only","model_name":"Builtin Only","enable":true}]}`)), nil
-		default:
-			t.Fatalf("unexpected account catalogue route %s", u.Path)
-			return hostHTTPResponse{}, nil
-		}
+	cfg.BenefitModels = []ModelConfig{{ID: "glm-5.3-flash", Name: "glm-5.3-flash", DisplayName: "glm-5.3-flash", Source: "benefit"}}
+	var liveCalls atomic.Int32
+	modelTestHost(t, func(u *url.URL, _ http.Header) (hostHTTPResponse, error) {
+		liveCalls.Add(1)
+		return hostHTTPResponse{}, fmt.Errorf("configured benefit routing queried live path %s", u.Path)
 	})
 	req := executorRequest{}
 	req.Model = "glm-5.3-flash"
 	req.Payload = []byte(`{"messages":[{"role":"user","content":"hello"}]}`)
-	withBenefit := &credential{AccessKeyID: "with-benefit", SecretAccessKey: "sk"}
-	withoutBenefit := &credential{AccessKeyID: "without-benefit", SecretAccessKey: "sk"}
-	if _, _, _, err := buildUpstreamRequest(cfg, req, withBenefit, true); err != nil {
+	cred := &credential{AccessKeyID: "configured-benefit", SecretAccessKey: "sk"}
+	_, _, headers, err := buildUpstreamRequest(cfg, req, cred, true)
+	if err != nil {
 		t.Fatal(err)
 	}
-	if _, _, _, err := buildUpstreamRequest(cfg, req, withoutBenefit, true); err == nil {
-		t.Fatal("an unavailable benefit model was routed using another account's catalogue")
+	if headers["maas_type"] != "benefit" {
+		t.Fatalf("configured benefit model lost its route: %+v", headers)
+	}
+	cfg.DiscoverModels = false
+	_, _, headers, err = buildUpstreamRequest(cfg, req, cred, true)
+	if err != nil || headers["maas_type"] != "benefit" {
+		t.Fatalf("static-mode benefit model lost its route: headers=%+v err=%v", headers, err)
+	}
+	cfg.ModelMap = map[string]string{"friendly-benefit": "glm-5.3-flash"}
+	req.Model = "friendly-benefit"
+	_, _, headers, err = buildUpstreamRequest(cfg, req, cred, true)
+	if err != nil || headers["maas_type"] != "benefit" {
+		t.Fatalf("configured benefit alias lost its route: headers=%+v err=%v", headers, err)
+	}
+	if liveCalls.Load() != 0 {
+		t.Fatalf("configured benefit routing issued %d live catalogue requests", liveCalls.Load())
 	}
 }
 
@@ -343,33 +388,168 @@ func TestPartialModelCatalogPreservesModelsAndWarnings(t *testing.T) {
 	}
 }
 
-func TestSlowBenefitCatalogDoesNotBlockAgentModels(t *testing.T) {
+func TestCriticalAgentCatalogNeverStartsLiveBenefitDiscovery(t *testing.T) {
 	resetModelCache(t)
 	cfg := defaultConfig()
 	cfg.ModelAgentIDs = []string{"agent"}
-	previousTimeout := benefitCatalogTimeout
-	benefitCatalogTimeout = 20 * time.Millisecond
-	t.Cleanup(func() { benefitCatalogTimeout = previousTimeout })
-	benefitFinished := make(chan struct{})
+	var benefitCalls atomic.Int32
 	modelTestHost(t, func(u *url.URL, _ http.Header) (hostHTTPResponse, error) {
 		switch u.Path {
 		case "/v1/agent-center/agents/detail":
 			return modelJSON(modelFixture(t, "agent-detail")), nil
 		case "/v1/benefit-gateway-config":
+			benefitCalls.Add(1)
 			time.Sleep(100 * time.Millisecond)
-			close(benefitFinished)
-			return modelJSON([]byte(`{"enabled":false}`)), nil
+			return hostHTTPResponse{}, fmt.Errorf("slow optional catalogue")
 		default:
 			return hostHTTPResponse{}, fmt.Errorf("unexpected path %s", u.Path)
 		}
 	})
 	started := time.Now()
-	catalog := accountModelCatalog(cfg, &credential{AccessKeyID: "slow-benefit-ak", SecretAccessKey: "sk"}, "")
+	catalog := accountAgentModelCatalog(cfg, &credential{AccessKeyID: "slow-benefit-ak", SecretAccessKey: "sk"}, "")
 	elapsed := time.Since(started)
-	if len(catalog.Models) != 4 || elapsed >= 80*time.Millisecond || len(catalog.Warnings) == 0 || !strings.Contains(catalog.Warnings[0], "timed out") {
-		t.Fatalf("slow optional catalogue blocked working agent models: elapsed=%s catalogue=%+v", elapsed, catalog)
+	if len(catalog.Models) != 4 || elapsed >= 80*time.Millisecond || benefitCalls.Load() != 0 {
+		t.Fatalf("critical Agent catalogue touched live benefit discovery: elapsed=%s benefit_calls=%d catalogue=%+v", elapsed, benefitCalls.Load(), catalog)
 	}
-	<-benefitFinished
+}
+
+func TestConcurrentAgentDiscoveryCoalescesCacheMiss(t *testing.T) {
+	resetModelCache(t)
+	cfg := defaultConfig()
+	cfg.ModelAgentIDs = []string{"agent"}
+	var requests atomic.Int32
+	agentFixture := modelFixture(t, "agent-detail")
+	modelTestHost(t, func(u *url.URL, _ http.Header) (hostHTTPResponse, error) {
+		if u.Path != "/v1/agent-center/agents/detail" {
+			return hostHTTPResponse{}, fmt.Errorf("unexpected path %s", u.Path)
+		}
+		requests.Add(1)
+		time.Sleep(20 * time.Millisecond)
+		return modelJSON(agentFixture), nil
+	})
+	const callers = 20
+	results := make(chan modelCatalogResult, callers)
+	var wait sync.WaitGroup
+	wait.Add(callers)
+	for index := 0; index < callers; index++ {
+		go func() {
+			defer wait.Done()
+			results <- accountAgentModelCatalog(cfg, &credential{AccessKeyID: "singleflight-ak", SecretAccessKey: "sk"}, "")
+		}()
+	}
+	wait.Wait()
+	close(results)
+	for catalog := range results {
+		if len(catalog.Models) != 4 {
+			t.Fatalf("coalesced caller lost Agent models: %+v", catalog)
+		}
+	}
+	if requests.Load() != 1 {
+		t.Fatalf("concurrent cache miss issued %d Agent requests, want 1", requests.Load())
+	}
+	modelCatalogFlights.Lock()
+	remainingFlights := len(modelCatalogFlights.entries)
+	modelCatalogFlights.Unlock()
+	if remainingFlights != 0 {
+		t.Fatalf("completed discovery retained %d singleflight locks", remainingFlights)
+	}
+}
+
+func TestConcurrentFailedAgentDiscoveryUsesShortNegativeCache(t *testing.T) {
+	resetModelCache(t)
+	cfg := defaultConfig()
+	cfg.ModelAgentIDs = []string{"agent"}
+	var requests atomic.Int32
+	modelTestHost(t, func(u *url.URL, _ http.Header) (hostHTTPResponse, error) {
+		if u.Path != "/v1/agent-center/agents/detail" {
+			return hostHTTPResponse{}, fmt.Errorf("unexpected path %s", u.Path)
+		}
+		requests.Add(1)
+		time.Sleep(20 * time.Millisecond)
+		return hostHTTPResponse{StatusCode: http.StatusBadGateway}, nil
+	})
+	const callers = 20
+	results := make(chan modelCatalogResult, callers)
+	var wait sync.WaitGroup
+	wait.Add(callers)
+	for index := 0; index < callers; index++ {
+		go func() {
+			defer wait.Done()
+			results <- accountAgentModelCatalog(cfg, &credential{AccessKeyID: "negative-cache-ak", SecretAccessKey: "sk"}, "")
+		}()
+	}
+	wait.Wait()
+	close(results)
+	for catalog := range results {
+		if len(catalog.Models) != 0 || len(catalog.Warnings) == 0 {
+			t.Fatalf("failed discovery lost its negative-cache result: %+v", catalog)
+		}
+	}
+	if requests.Load() != 1 {
+		t.Fatalf("concurrent failed cache miss issued %d requests, want 1", requests.Load())
+	}
+	modelCatalogFlights.Lock()
+	remainingFlights := len(modelCatalogFlights.entries)
+	modelCatalogFlights.Unlock()
+	if remainingFlights != 0 {
+		t.Fatalf("failed discovery retained %d singleflight locks", remainingFlights)
+	}
+}
+
+func TestExplicitFullCatalogWaitsForBenefitWithoutDetachedWork(t *testing.T) {
+	resetModelCache(t)
+	cfg := defaultConfig()
+	cfg.ModelAgentIDs = []string{"agent"}
+	benefitEntered := make(chan struct{})
+	releaseBenefit := make(chan struct{})
+	var releaseOnce sync.Once
+	release := func() { releaseOnce.Do(func() { close(releaseBenefit) }) }
+	t.Cleanup(release)
+	agentFixture := modelFixture(t, "agent-detail")
+	modelTestHost(t, func(u *url.URL, _ http.Header) (hostHTTPResponse, error) {
+		switch u.Path {
+		case "/v1/agent-center/agents/detail":
+			return modelJSON(agentFixture), nil
+		case "/v1/model/builtin":
+			return modelJSON([]byte(`{"builtinModels":[]}`)), nil
+		case "/v1/benefit-gateway-config":
+			close(benefitEntered)
+			<-releaseBenefit
+			return modelJSON([]byte(`{"enabled":false}`)), nil
+		default:
+			return hostHTTPResponse{}, fmt.Errorf("unexpected path %s", u.Path)
+		}
+	})
+	done := make(chan modelCatalogResult, 1)
+	go func() {
+		done <- accountModelCatalog(cfg, &credential{AccessKeyID: "explicit-full-ak", SecretAccessKey: "sk"}, "")
+	}()
+	select {
+	case <-benefitEntered:
+	case <-time.After(time.Second):
+		release()
+		select {
+		case <-done:
+		case <-time.After(time.Second):
+		}
+		t.Fatal("explicit full refresh never reached benefit discovery")
+	}
+	select {
+	case catalog := <-done:
+		release()
+		t.Fatalf("explicit full refresh returned while its synchronous benefit request was active: %+v", catalog)
+	case <-time.After(20 * time.Millisecond):
+	}
+	release()
+	var catalog modelCatalogResult
+	select {
+	case catalog = <-done:
+	case <-time.After(time.Second):
+		t.Fatal("explicit full refresh did not finish after benefit request was released")
+	}
+	if len(catalog.Models) != 4 || len(catalog.Warnings) != 0 {
+		t.Fatalf("explicit full refresh lost Agent models: %+v", catalog)
+	}
 }
 
 func TestGatewayCatalogRejectsUnsuccessfulResponses(t *testing.T) {
