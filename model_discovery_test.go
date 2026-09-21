@@ -109,14 +109,19 @@ func TestCapturedAccountCatalogAndBenefitRouting(t *testing.T) {
 				t.Fatal("gateway config did not use the official narrow signature and account security token")
 			}
 			return modelJSON(modelFixture(t, "gateway-config")), nil
+		case "/v1/model/builtin":
+			if headers.Get("Agent-Type") != "PromptCenter" {
+				t.Fatalf("builtin catalogue Agent-Type = %q", headers.Get("Agent-Type"))
+			}
+			return modelJSON(modelFixture(t, "builtin")), nil
 		default:
 			t.Fatalf("unexpected catalogue path %s", u.Path)
 			return hostHTTPResponse{}, nil
 		}
 	})
 	catalog := accountModelCatalog(cfg, cred, "callback")
-	if len(catalog.Warnings) != 0 || len(catalog.Models) != 7 {
-		t.Fatalf("expected seven discovered models without warnings: %+v", catalog)
+	if len(catalog.Warnings) != 0 || len(catalog.Models) != 9 {
+		t.Fatalf("expected nine discovered models without warnings: %+v", catalog)
 	}
 	want := []ModelConfig{
 		{ID: "GLM-5.2", DisplayName: "GLM-5.2", ContextLength: 202752, MaxOutputTokens: 131072, Source: "agent"},
@@ -126,6 +131,8 @@ func TestCapturedAccountCatalogAndBenefitRouting(t *testing.T) {
 		{ID: "deepseek-v4-flash-0731", DisplayName: "deepseek-v4-flash-0731", ContextLength: 1048576, MaxOutputTokens: 393216, Source: "benefit"},
 		{ID: "deepseek-v4-pro-0813", DisplayName: "deepseek-v4-pro-0813", ContextLength: 1048576, MaxOutputTokens: 393216, Source: "benefit"},
 		{ID: "glm-5.3-flash", DisplayName: "glm-5.3-flash", ContextLength: 1048576, MaxOutputTokens: 131072, Source: "benefit"},
+		{ID: "Qwen3-VL-235B", DisplayName: "Qwen3-VL-235B", ContextLength: 131072, MaxOutputTokens: 8192, SupportsImages: true, Source: "builtin"},
+		{ID: "kimi-k2.6-vl", DisplayName: "Kimi-K2.6-VL", ContextLength: 262144, MaxOutputTokens: 32768, SupportsImages: true, Source: "builtin"},
 	}
 	byID := make(map[string]ModelConfig, len(catalog.Models))
 	for _, model := range catalog.Models {
@@ -229,6 +236,11 @@ func TestBenefitModelRoutingIsScopedToAccount(t *testing.T) {
 				t.Fatal("queried benefit catalogue for an account whose gate is disabled")
 			}
 			return modelJSON(modelFixture(t, "gateway-config")), nil
+		case "/v1/model/builtin":
+			// The built-in catalogue never lists the limited-time benefit models
+			// (verified against the live gateway), so it must not hand one to an
+			// account whose benefit gate is closed.
+			return modelJSON([]byte(`{"builtinModels":[{"model_id":"builtin-only","model_name":"Builtin Only","enable":true}]}`)), nil
 		default:
 			t.Fatalf("unexpected account catalogue route %s", u.Path)
 			return hostHTTPResponse{}, nil
@@ -275,6 +287,8 @@ func TestAgentCatalogPaginatesAndDeduplicates(t *testing.T) {
 			return modelJSON(modelFixture(t, "agent-detail")), nil
 		case "/v1/benefit-gateway-config":
 			return modelJSON([]byte(`{"enabled":false}`)), nil
+		case "/v1/model/builtin":
+			return modelJSON([]byte(`{"builtinModels":[]}`)), nil
 		default:
 			t.Fatalf("gateway should not be called when disabled: %s", u.Path)
 			return hostHTTPResponse{}, nil
@@ -287,7 +301,7 @@ func TestAgentCatalogPaginatesAndDeduplicates(t *testing.T) {
 }
 
 func TestPartialModelCatalogPreservesModelsAndWarnings(t *testing.T) {
-	for _, failedSource := range []string{"agent", "gateway", "gate"} {
+	for _, failedSource := range []string{"agent", "gateway", "gate", "builtin"} {
 		t.Run(failedSource, func(t *testing.T) {
 			resetModelCache(t)
 			cfg := defaultConfig()
@@ -309,16 +323,19 @@ func TestPartialModelCatalogPreservesModelsAndWarnings(t *testing.T) {
 						return hostHTTPResponse{StatusCode: http.StatusServiceUnavailable}, nil
 					}
 					return modelJSON(modelFixture(t, "gateway-config")), nil
+				case "/v1/model/builtin":
+					if failedSource == "builtin" {
+						return hostHTTPResponse{StatusCode: http.StatusBadGateway}, nil
+					}
+					return modelJSON([]byte(`{"builtinModels":[{"model_id":"builtin-only","model_name":"Builtin Only","enable":true}]}`)), nil
 				default:
 					t.Fatalf("explicit agent IDs should bypass catalogue listing: %s", u.Path)
 					return hostHTTPResponse{}, nil
 				}
 			})
 			catalog := accountModelCatalog(cfg, &credential{AccessKeyID: "partial-ak", SecretAccessKey: "sk"}, "")
-			wantCount := 4
-			if failedSource == "agent" {
-				wantCount = 3
-			}
+			// agent-detail contributes 4, gateway-config 3, the built-in stub 1.
+			wantCount := map[string]int{"agent": 4, "gateway": 5, "gate": 5, "builtin": 7}[failedSource]
 			if len(catalog.Models) != wantCount || len(catalog.Warnings) == 0 {
 				t.Fatalf("partial source failure lost models or warning: %+v", catalog)
 			}

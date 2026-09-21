@@ -222,6 +222,16 @@ func discoverModelCatalog(cfg *Config, cred *credential, callbackID string) mode
 			result.Warnings = append(result.Warnings, fmt.Sprintf("Benefit model catalog: timed out after %s", benefitCatalogTimeout))
 		}
 	}
+	// Merged last: appendModels keeps the first entry per id, so ids the agent
+	// and benefit catalogues also report keep the route those sources advertise,
+	// and the built-in list only contributes models nothing else reports.
+	if cfg.APIMode != "native" {
+		builtin, errBuiltin := discoverBuiltinModels(cfg, cred, callbackID)
+		if errBuiltin != nil {
+			result.Warnings = append(result.Warnings, "Builtin model catalog: "+errBuiltin.Error())
+		}
+		appendModels(builtin)
+	}
 	if len(result.Models) == 0 {
 		result.Warnings = append(result.Warnings, "No enabled models were returned for this account")
 		return result
@@ -262,6 +272,57 @@ func requestModelCatalog(cfg *Config, cred *credential, callbackID, endpoint, ag
 		return nil, fmt.Errorf("HTTP %d", response.StatusCode)
 	}
 	return response.Body, nil
+}
+
+// discoverBuiltinModels reads the built-in model catalogue. The official client
+// asks for it with Agent-Type: PromptCenter; with any other agent type the
+// gateway answers with that agent's restricted view and the list comes back
+// empty, which is indistinguishable from "this account has no models".
+func discoverBuiltinModels(cfg *Config, cred *credential, callbackID string) ([]ModelConfig, error) {
+	endpoint := strings.TrimRight(cfg.BaseURL, "/") + "/v1/model/builtin"
+	body, err := requestModelCatalog(cfg, cred, callbackID, endpoint, "PromptCenter")
+	if err != nil {
+		return nil, err
+	}
+	return parseBuiltinModels(body)
+}
+
+func parseBuiltinModels(body []byte) ([]ModelConfig, error) {
+	var catalogue struct {
+		BuiltinModels []struct {
+			ModelID       string `json:"model_id"`
+			ModelName     string `json:"model_name"`
+			Enable        *bool  `json:"enable"`
+			ContextWindow int64  `json:"context_window"`
+			MaxTokens     int64  `json:"max_tokens"`
+			SupportImages bool   `json:"supports_images"`
+			Description   string `json:"model_desc"`
+		} `json:"builtinModels"`
+	}
+	if err := json.Unmarshal(body, &catalogue); err != nil {
+		return nil, fmt.Errorf("invalid builtin model response: %w", err)
+	}
+	var models []ModelConfig
+	for _, entry := range catalogue.BuiltinModels {
+		if entry.Enable != nil && !*entry.Enable {
+			continue
+		}
+		id := firstNonEmptyString(entry.ModelID, entry.ModelName)
+		if id == "" {
+			continue
+		}
+		models = append(models, ModelConfig{
+			ID:              id,
+			Name:            firstNonEmptyString(entry.ModelName, id),
+			DisplayName:     firstNonEmptyString(entry.ModelName, id),
+			Description:     entry.Description,
+			ContextLength:   entry.ContextWindow,
+			MaxOutputTokens: entry.MaxTokens,
+			SupportsImages:  entry.SupportImages,
+			Source:          "builtin",
+		})
+	}
+	return models, nil
 }
 
 func discoverAgentCatalogIDs(cfg *Config, cred *credential, callbackID string) ([]string, []string) {

@@ -191,6 +191,12 @@ plugins:
             # Text meaning "already claimed today". Matching it counts as
             # success, so a twice-a-day schedule does not look like a failure.
             checkin_already_marker: ""
+            # The allowance is granted per Huawei Cloud account. Run the claim
+            # once per stored credential instead of the first one found.
+            checkin_all_accounts: false
+            # Claim for one account only, matched against the auth index, file
+            # name or label. Empty means "not restricted".
+            checkin_auth_index: ""
             enabled: false
 
           # Escape hatch: schedule any CodeArts gateway endpoint. `path` is
