@@ -10,6 +10,7 @@ import (
 	"reflect"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/router-for-me/CLIProxyAPI/v7/sdk/pluginapi"
 )
@@ -322,6 +323,35 @@ func TestPartialModelCatalogPreservesModelsAndWarnings(t *testing.T) {
 			}
 		})
 	}
+}
+
+func TestSlowBenefitCatalogDoesNotBlockAgentModels(t *testing.T) {
+	resetModelCache(t)
+	cfg := defaultConfig()
+	cfg.ModelAgentIDs = []string{"agent"}
+	previousTimeout := benefitCatalogTimeout
+	benefitCatalogTimeout = 20 * time.Millisecond
+	t.Cleanup(func() { benefitCatalogTimeout = previousTimeout })
+	benefitFinished := make(chan struct{})
+	modelTestHost(t, func(u *url.URL, _ http.Header) (hostHTTPResponse, error) {
+		switch u.Path {
+		case "/v1/agent-center/agents/detail":
+			return modelJSON(modelFixture(t, "agent-detail")), nil
+		case "/v1/benefit-gateway-config":
+			time.Sleep(100 * time.Millisecond)
+			close(benefitFinished)
+			return modelJSON([]byte(`{"enabled":false}`)), nil
+		default:
+			return hostHTTPResponse{}, fmt.Errorf("unexpected path %s", u.Path)
+		}
+	})
+	started := time.Now()
+	catalog := accountModelCatalog(cfg, &credential{AccessKeyID: "slow-benefit-ak", SecretAccessKey: "sk"}, "")
+	elapsed := time.Since(started)
+	if len(catalog.Models) != 4 || elapsed >= 80*time.Millisecond || len(catalog.Warnings) == 0 || !strings.Contains(catalog.Warnings[0], "timed out") {
+		t.Fatalf("slow optional catalogue blocked working agent models: elapsed=%s catalogue=%+v", elapsed, catalog)
+	}
+	<-benefitFinished
 }
 
 func TestGatewayCatalogRejectsUnsuccessfulResponses(t *testing.T) {

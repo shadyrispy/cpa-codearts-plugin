@@ -37,6 +37,17 @@ var discoveredModels = struct {
 	entries map[string]modelCacheEntry
 }{entries: make(map[string]modelCacheEntry)}
 
+// benefitCatalogTimeout keeps an optional/slow benefit gateway from blocking
+// the account's already available Agent Center models until CPA abandons the
+// whole model.for_auth call. The request continues in its buffered goroutine and
+// a short cache TTL retries the missing source later.
+var benefitCatalogTimeout = 8 * time.Second
+
+type benefitCatalogResult struct {
+	models []ModelConfig
+	err    error
+}
+
 func modelsForAuth(raw []byte) ([]byte, error) {
 	var req struct {
 		pluginapi.AuthModelRequest
@@ -144,6 +155,17 @@ func discoverModelCatalog(cfg *Config, cred *credential, callbackID string) mode
 		return cloneModelCatalog(entry.catalog)
 	}
 	result := modelCatalogResult{Models: []ModelConfig{}, Source: "unavailable", FetchedAt: time.Now().UTC()}
+	var benefitResults <-chan benefitCatalogResult
+	var benefitTimer *time.Timer
+	if cfg.APIMode != "native" && cfg.BenefitGatewayURL != "" {
+		results := make(chan benefitCatalogResult, 1)
+		benefitResults = results
+		benefitTimer = time.NewTimer(benefitCatalogTimeout)
+		go func() {
+			models, err := discoverBenefitModels(cfg, cred, callbackID)
+			results <- benefitCatalogResult{models: models, err: err}
+		}()
+	}
 	ids := append([]string(nil), cfg.ModelAgentIDs...)
 	if len(ids) == 0 {
 		if cfg.APIMode == "native" {
@@ -186,12 +208,19 @@ func discoverModelCatalog(cfg *Config, cred *credential, callbackID string) mode
 		}
 		appendModels(models)
 	}
-	if cfg.APIMode != "native" && cfg.BenefitGatewayURL != "" {
-		models, err := discoverBenefitModels(cfg, cred, callbackID)
-		if err != nil {
-			result.Warnings = append(result.Warnings, "Benefit model catalog: "+err.Error())
+	if benefitResults != nil {
+		select {
+		case benefit := <-benefitResults:
+			if benefitTimer != nil {
+				benefitTimer.Stop()
+			}
+			if benefit.err != nil {
+				result.Warnings = append(result.Warnings, "Benefit model catalog: "+benefit.err.Error())
+			}
+			appendModels(benefit.models)
+		case <-benefitTimer.C:
+			result.Warnings = append(result.Warnings, fmt.Sprintf("Benefit model catalog: timed out after %s", benefitCatalogTimeout))
 		}
-		appendModels(models)
 	}
 	if len(result.Models) == 0 {
 		result.Warnings = append(result.Warnings, "No enabled models were returned for this account")
