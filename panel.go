@@ -252,6 +252,23 @@ const panelTemplate = `<!doctype html>
     return out;
   }
 
+  // Upstream decides which usage rows exist, so render what it reports instead of
+  // two hard-coded names: a renamed metric then still shows up rather than
+  // silently disappearing from the card.
+  function meterRows(a) {
+    return (a.meters || []).map(function (m) {
+      var label = m.label || m.name;
+      var has = m.used_percent !== undefined && m.used_percent !== null;
+      var out = has ? meter(label, Number(m.used_percent)) : "";
+      var bits = [];
+      if (!out) bits.push(label + "：上游未给出百分比");
+      var used = Number(m.used_tokens) || 0, allow = Number(m.allowance_tokens) || 0;
+      if (allow > 0) bits.push("token " + tokenCount(used) + " / " + tokenCount(allow));
+      else if (used > 0) bits.push("已用 " + tokenCount(used) + " token");
+      return out + (bits.length ? '<div class="meta">' + bits.map(esc).join(" · ") + '</div>' : "");
+    }).join("");
+  }
+
   function meter(label, pct) {
     if (pct === null || pct === undefined || pct < 0) return "";
     var v = Number(pct);
@@ -279,8 +296,7 @@ const panelTemplate = `<!doctype html>
       if (a.reset_date) bits.push("额度重置：" + esc(a.reset_date));
       return '<div class="acct"><div class="top"><span class="who">' + head + '</span>' + pill + '</div>' +
         (bits.length ? '<div class="meta">' + bits.join(" · ") + '</div>' : '') +
-        meter("代码补全额度", a.code_completions_percent) +
-        meter("对话消息额度", a.chat_messages_percent) +
+        meterRows(a) +
         benefitBlock(a) +
         (a.quota_error ? '<div class="meta err">额度查询失败：' + esc(a.quota_error) + '</div>' : '') +
         '<div style="margin-top:9px"><button data-models="' + esc(a.auth_index) + '">查看账号模型</button></div>' +

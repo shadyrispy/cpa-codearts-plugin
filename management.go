@@ -350,13 +350,12 @@ type accountView struct {
 	LoginType string `json:"login_type"`
 	ExpiresAt string `json:"expires_at"`
 
-	Plan                   string  `json:"plan,omitempty"`
-	PlanName               string  `json:"plan_name,omitempty"`
-	PlanURL                string  `json:"plan_url,omitempty"`
-	ResetDate              string  `json:"reset_date,omitempty"`
-	CodeCompletionsPercent float64 `json:"code_completions_percent"`
-	ChatMessagesPercent    float64 `json:"chat_messages_percent"`
-	Features               any     `json:"features,omitempty"`
+	Plan      string       `json:"plan,omitempty"`
+	PlanName  string       `json:"plan_name,omitempty"`
+	PlanURL   string       `json:"plan_url,omitempty"`
+	ResetDate string       `json:"reset_date,omitempty"`
+	Meters    []quotaMeter `json:"meters,omitempty"`
+	Features  any          `json:"features,omitempty"`
 	// Benefit is the limited-time daily token pool, reported next to the
 	// subscription meters because it is accounted separately upstream.
 	Benefit        *benefitBalance `json:"benefit,omitempty"`
@@ -413,8 +412,7 @@ func codeartsAccounts() ([]accountView, error) {
 			view.PlanName = snapshot.PlanName
 			view.PlanURL = snapshot.PlanURL
 			view.ResetDate = snapshot.ResetDate
-			view.CodeCompletionsPercent = snapshot.CodeCompletionsPercent
-			view.ChatMessagesPercent = snapshot.ChatMessagesPercent
+			view.Meters = snapshot.Meters
 			view.Features = snapshot.Features
 			view.Benefit = snapshot.Benefit
 			view.BenefitError = snapshot.BenefitError

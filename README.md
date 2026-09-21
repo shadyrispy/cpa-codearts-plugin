@@ -487,9 +487,27 @@ GET {base_url}/snap-manager/v1/statistics/plugin
 
 Its `metrics[].value` fields are **consumed percentages**, while CLIProxyAPI's
 quota model expects a `remainingFraction`, so the value is inverted
-(`(100 - used) / 100`). A negative upstream value means "not reported" and maps
-to a full bucket. The plugin reports `supports_reset: false` because the upstream
-quota is bound to the subscription cycle and cannot be reset on demand — the
+(`(100 - used) / 100`). The plugin keeps the upstream's own selection: a metric is
+shown when upstream reports it **and** sets `show:true`. Absent metrics and
+negative values are not displayed, because inventing `0%` claims an untouched
+quota where the truth is "nothing was reported".
+
+Upstream migrates metric names instead of deprecating them. Captured live on
+2026-09-21, the message-count row had been retired in favour of a token row:
+
+```json
+{"name":"usageDataChatMessages","value":-1,"show":false}
+{"name":"usageTokenChatMessages","value":0,"usage_token_num":2167,"package_token_amount":5000000,"show":true}
+```
+
+so `meters[]` is parsed generically (`name`, `label`, optional `used_percent`,
+`used_tokens`, `allowance_tokens`) and an unrecognised metric appears under its
+raw name rather than disappearing. `/accounts` therefore now returns `meters`
+instead of the two fixed `code_completions_percent` / `chat_messages_percent`
+keys, and the panel renders one row per reported metric.
+
+The plugin reports `supports_reset: false` because the upstream
+quota is bound to the subscription cycle and cannot be reset on demand - the
 reset route answers honestly instead of pretending success.
 
 ### Benefit allowance

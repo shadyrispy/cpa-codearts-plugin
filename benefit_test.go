@@ -77,9 +77,8 @@ func TestBenefitDailyRemainingAndPercent(t *testing.T) {
 func TestToQuotaFetchResponseReportsBenefitPool(t *testing.T) {
 	snapshot := quotaSnapshot{
 		Plan: "codearts.agent.trial", PlanName: "Free",
-		ResetDate:              "2026-10-03",
-		CodeCompletionsPercent: 0,
-		Benefit:                &benefitBalance{Channel: "codearts", DailyTokenLimit: 10000000, DailyTokensUsed: 10231428},
+		ResetDate: "2026-10-03",
+		Benefit:   &benefitBalance{Channel: "codearts", DailyTokenLimit: 10000000, DailyTokensUsed: 10231428},
 	}
 	response := toQuotaFetchResponse(snapshot)
 	var found bool
