@@ -341,6 +341,14 @@ contract is unpublished, the outcome is judged by the markers above rather than
 by HTTP status alone: a bare `200` without the success marker is reported as a
 failure, so a silently rejected claim never looks like a success.
 
+The allowance is granted per Huawei Cloud account, so `checkin_all_accounts: true`
+runs the claim once for every stored credential; `checkin_auth_index` instead
+targets one account by auth index, file name or label. Both are optional and the
+default keeps the single-credential behaviour, because repeating an unpublished
+request across every credential is exactly the traffic pattern upstream
+throttles. Per-account outcomes are reported together, and a partial failure
+names the accounts that did not claim.
+
 ### How to capture the claim request
 
 1. Open the daily benefit page (Wish Wall) in a browser and sign in.
@@ -385,7 +393,7 @@ Three task types ship:
 | `token_renew` | Renews temporary credentials using the saved OAuth proof context when available. The host uses the returned expiration to schedule renewal; the optional cron task defaults to hourly. OAuth credentials can expire sooner than older 24-hour credentials. |
 | `quota_refresh` | Refreshes the cached subscription/quota snapshot per account, keeping the panel and quota API cheap. |
 | `http` | Any request against the CodeArts gateway, optionally signed with the first available credential. The escape hatch for endpoints this plugin does not model yet. |
-| `checkin` | Claims the daily benefit by driving a request you capture from the activity page, with success/already markers so the outcome is judged accurately. |
+| `checkin` | Claims the daily benefit by driving a request you capture from the activity page, with success/already markers so the outcome is judged accurately. `checkin_all_accounts` claims once per stored account; `checkin_auth_index` targets one. |
 
 Defaults (used when `schedule.tasks` is omitted): `token_renew` hourly at :17 and
 `quota_refresh` every 30 minutes. Set `schedule.disable_defaults: true` to run
@@ -523,7 +531,7 @@ leaves the other two undeclared as explained above.
 
 ### Model discovery
 
-The plugin discovers two account-specific sources, matching the captured
+The plugin discovers three sources, matching the captured
 26.9.101 extension flow:
 
 1. `GET /v1/agent-center/agents/useragents` is paginated to find real agent IDs.
@@ -539,10 +547,22 @@ The plugin discovers two account-specific sources, matching the captured
    are benefit models; their chat requests still use snap
    `/api/v2/chat/completions`, with `maas_type: benefit`. The returned gateway
    `base_url` does not redirect subscription chat traffic.
+3. `GET /v1/model/builtin` supplies `builtinModels` — the models the account may
+   call directly. `Agent-Type: PromptCenter` is required: with any other agent
+   type the gateway answers with that agent's restricted view, and an empty list
+   is indistinguishable from "this account has no models". This source is what
+   advertises, for example, `Qwen3-VL-235B` and `kimi-k2.6-vl`, which no agent
+   detail lists.
+
+It is merged last on purpose: discovery keeps the first entry per model id, so
+ids an earlier source also reports keep the route that source advertises. The
+live built-in list was verified not to contain the benefit models, so it cannot
+offer one to an account whose benefit gate is closed.
 
 The captured catalog contained four Agent Center models (GLM-5.2, its ArkTS
-variant, OpenPangu Pro and Flash) and three benefit models (two DeepSeek variants
-and GLM-5.3-Flash). This is a regression fixture, not a hardcoded universal list:
+variant, OpenPangu Pro and Flash), three benefit models (two DeepSeek variants
+and GLM-5.3-Flash) and, from the built-in catalogue, two vision models that
+nothing else reports. This is a regression fixture, not a hardcoded universal list:
 accounts and upstream catalogs can differ. Benefit discovery does not claim
 benefits; new accounts may need to claim the entitlement in the official client.
 
@@ -599,7 +619,7 @@ example.
 | `default_model_id` | empty | Explicit fallback when a request omits its model. |
 | `model_map` | `{}` | Client-facing ID → upstream model_id. |
 | `models` | `[]` | Optional explicit static models or aliases; no invented fallback. |
-| `discover_models` | `true` | Discover Agent Center and enabled benefit models per account. |
+| `discover_models` | `true` | Discover Agent Center, enabled benefit and built-in models per account. |
 | `model_agent_ids` | `[]` | Explicit catalog IDs; empty discovers IDs from the account's agent list. |
 | `benefit_gateway_url` | `https://opengw.developer.huaweicloud.com` | Optional benefit catalog base; empty disables this source. |
 | `heartbeat` | `true` | Request upstream SSE heartbeat frames. |

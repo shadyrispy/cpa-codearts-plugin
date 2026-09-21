@@ -362,7 +362,10 @@ func TestAccountModelDiscoveryIsolation(t *testing.T) {
 			return json.Marshal(modelJSON([]byte(`{"enabled":false}`)))
 		}
 		requests++
-		if u.Path != "/v1/agent-center/agents/detail" || u.Query().Get("agent_id") != "agent" {
+		if u.Path != "/v1/agent-center/agents/detail" && u.Path != "/v1/model/builtin" {
+			t.Fatal("wrong discovery contract")
+		}
+		if u.Path == "/v1/agent-center/agents/detail" && u.Query().Get("agent_id") != "agent" {
 			t.Fatal("wrong discovery contract")
 		}
 		if req["host_callback_id"] != "callback" {
@@ -372,6 +375,12 @@ func TestAccountModelDiscoveryIsolation(t *testing.T) {
 		model := "tenant-a"
 		if strings.Contains(headers["Authorization"][0], "Access=account-b") {
 			model = "tenant-b"
+		}
+		if u.Path == "/v1/model/builtin" {
+			if headers["Agent-Type"][0] != "PromptCenter" {
+				t.Fatal("the built-in catalogue must be asked with Agent-Type: PromptCenter")
+			}
+			return json.Marshal(hostHTTPResponse{StatusCode: http.StatusOK, Body: []byte(`{"builtinModels":[{"model_id":"` + model + `-builtin","model_name":"Builtin","enable":true}]}`)})
 		}
 		return json.Marshal(hostHTTPResponse{StatusCode: http.StatusOK, Body: []byte(`{"gpts":{"models":[{"model_alias":"` + model + `","model_id":"internal-id","model_name":"Test","model_parameters":{"enabled":true,"display_enabled":true,"supports_images":true,"context_window":200000,"max_tokens":16000}},{"model_alias":"disabled","model_parameters":{"enabled":false}}]}}`)})
 	})
@@ -389,7 +398,8 @@ func TestAccountModelDiscoveryIsolation(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if requests != 2 || len(first) != 1 || first[0].ID != "tenant-a" || second[0].ID != "tenant-b" || !first[0].SupportsImages {
+	if requests != 4 || len(first) != 2 || first[0].ID != "tenant-a" || second[0].ID != "tenant-b" ||
+		!first[0].SupportsImages || first[1].ID != "tenant-a-builtin" || second[1].ID != "tenant-b-builtin" {
 		t.Fatal("discovery did not isolate accounts, cache, or preserve model aliases")
 	}
 }
