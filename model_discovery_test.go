@@ -9,6 +9,7 @@ import (
 	"path/filepath"
 	"reflect"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -80,9 +81,9 @@ func TestCapturedAccountCatalogAndBenefitRouting(t *testing.T) {
 	cfg.BenefitGatewayURL = "https://gateway.test"
 	useModelTestConfig(t, cfg)
 	cred := &credential{AccessKeyID: "test-ak", SecretAccessKey: "test-sk", SecurityToken: "test-sts", DomainID: "test-domain"}
-	requests := 0
+	var requests atomic.Int32
 	modelTestHost(t, func(u *url.URL, headers http.Header) (hostHTTPResponse, error) {
-		requests++
+		requests.Add(1)
 		switch u.Path {
 		case "/v1/agent-center/agents/useragents":
 			q := u.Query()
@@ -158,9 +159,9 @@ func TestCapturedAccountCatalogAndBenefitRouting(t *testing.T) {
 			t.Fatalf("agent model %s incorrectly routed as benefit", expected.ID)
 		}
 	}
-	before := requests
+	before := requests.Load()
 	catalog.Models[0].ID = "caller-mutated-id"
-	if again := accountModelCatalog(cfg, cred, "callback"); requests != before || again.Models[0].ID == "caller-mutated-id" {
+	if again := accountModelCatalog(cfg, cred, "callback"); requests.Load() != before || again.Models[0].ID == "caller-mutated-id" {
 		t.Fatal("catalogue cache is not reused or exposes mutable storage")
 	}
 
