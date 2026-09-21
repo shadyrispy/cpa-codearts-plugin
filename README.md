@@ -310,8 +310,12 @@ Responses clients (`/v1/responses`), with tool calls and usage preserved.
 
 The 26.9.101 capture includes a benefit claim at the developer gateway before
 using a benefit model. Model discovery only reads the catalog; it does not
-perform that claim or guarantee an account has remaining benefit quota. Claim
-the entitlement in the official client when needed.
+perform that claim or guarantee an account has remaining benefit quota. An exhausted
+pool is still reported honestly at request time: the gateway signals it inside an
+HTTP 200 stream, and that envelope is classified as `insufficient_quota` (HTTP 403)
+rather than served to the client as a successful empty completion. Claim the
+entitlement in the official client, or schedule the `checkin` task, when it is used
+up.
 
 The plugin's existing `checkin` task remains a configurable automation for a
 verified claim request. It is separate from model discovery and must be

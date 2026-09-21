@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net/http"
 	"net/url"
@@ -93,7 +94,7 @@ func executorExecute(request []byte) ([]byte, error) {
 
 	payload, errAggregate := aggregateUpstream(cfg, req.Model, response.Body)
 	if errAggregate != nil {
-		return failEnvelope("upstream_error", errAggregate.Error(), http.StatusBadGateway)
+		return upstreamFailureEnvelope(errAggregate, cred)
 	}
 	// The host forwards the payload unchanged for Anthropic clients because the
 	// plugin declares "claude" as an output format, so the plugin owns the
@@ -262,6 +263,14 @@ func runUpstreamStream(cfg *Config, req executorRequest, open *hostHTTPStreamOpe
 		}
 	}
 
+	// An in-stream envelope means the answer never arrived, so the stream must not
+	// be terminated as a success the client cannot distinguish from an empty
+	// reply; failing it lets the host report and route around the condition.
+	if fault := translator.streamFault(); fault != nil {
+		session.fail(redactUpstreamError(fault.Message, nil, false))
+		return
+	}
+
 	for _, frame := range translator.finish() {
 		if errEmit := hostStreamEmit(session.streamID, translator.hostPayload(frame)); errEmit != nil {
 			session.success()
@@ -277,6 +286,9 @@ func bufferedStreamResponse(cfg *Config, model, protocol string, body []byte) ([
 	renderer := newStreamRenderer(cfg, model, protocol)
 	frames := renderer.feed(body)
 	frames = append(frames, renderer.finish()...)
+	if fault := renderer.streamFault(); fault != nil {
+		return failEnvelope(fault.Code, fault.Message, fault.Status)
+	}
 
 	chunks := make([]pluginapi.ExecutorStreamChunk, 0, len(frames))
 	for _, frame := range frames {
@@ -647,6 +659,30 @@ type streamRenderer struct {
 	anthropic  *anthropicStreamRenderer
 	decoder    sseDecoder
 	done       bool
+	// fault records the first in-stream error envelope so the caller can fail the
+	// stream instead of closing it as a success with no content.
+	fault *upstreamStreamFault
+}
+
+// streamFault returns the in-stream error envelope seen so far, if any.
+func (r *streamRenderer) streamFault() *upstreamStreamFault {
+	if r == nil {
+		return nil
+	}
+	return r.fault
+}
+
+// observeFault records the first fault carried by a decoded frame and reports
+// whether the frame must be withheld from the client.
+func (r *streamRenderer) observeFault(payload []byte) bool {
+	fault := streamFrameFault(payload)
+	if fault == nil {
+		return false
+	}
+	if r.fault == nil {
+		r.fault = fault
+	}
+	return true
 }
 
 func newStreamRenderer(cfg *Config, model, protocol string) *streamRenderer {
@@ -672,17 +708,25 @@ func (r *streamRenderer) feed(data []byte) [][]byte {
 			if len(payload) == 0 {
 				continue
 			}
+			if r.observeFault(payload) {
+				continue
+			}
 			out = append(out, r.anthropic.feed(payload)...)
 		}
 		return out
 	}
 	if r.translator != nil {
+		// The native translator owns its own framing, so an in-stream envelope is
+		// reported by the aggregated path rather than withheld here.
 		return r.translator.translate(data)
 	}
 	// Agent mode already streams OpenAI SSE, so frames are forwarded unchanged
 	// once complete frames have been assembled.
 	var out [][]byte
 	for _, frame := range r.decoder.push(data) {
+		if r.observeFault(executorStreamPayload([]byte(frame))) {
+			continue
+		}
 		if isDoneFrame([]byte(frame)) {
 			if r.done {
 				continue
@@ -739,10 +783,99 @@ func (r *streamRenderer) hostPayload(frame []byte) []byte {
 // aggregateUpstream folds a complete upstream SSE body into a single
 // non-streaming OpenAI completion. The result is deliberately protocol-neutral:
 // callers convert it to the client protocol afterwards.
+// upstreamStreamFault is an error the gateway reports inside an HTTP 200 SSE
+// body. CodeArts speaks a top-level {"error_code","error_msg"} envelope here
+// rather than the OpenAI {"error"} object, so a stream can end with neither
+// content nor failure: an exhausted daily benefit allowance arrives this way and
+// would otherwise be served to the client as a successful empty completion.
+type upstreamStreamFault struct {
+	Code    string
+	Message string
+	Status  int
+}
+
+func (f *upstreamStreamFault) Error() string { return f.Message }
+
+// streamSuccessCodes are the envelope values this gateway family uses to mean
+// "no fault" on a frame.
+var streamSuccessCodes = map[string]bool{"0": true, "0000": true, "success": true}
+
+// streamFrameFault reports the fault carried by one decoded SSE data payload, or
+// nil when the frame is ordinary traffic. A frame that also carries a completion
+// is never treated as a fault, so a partial answer is never discarded.
+func streamFrameFault(payload []byte) *upstreamStreamFault {
+	if len(bytes.TrimSpace(payload)) == 0 {
+		return nil
+	}
+	var frame struct {
+		ErrorCode string          `json:"error_code"`
+		ErrorMsg  string          `json:"error_msg"`
+		Delta     json.RawMessage `json:"delta"`
+		Choices   json.RawMessage `json:"choices"`
+		Text      string          `json:"text"`
+		Details   []struct {
+			ErrorCode string `json:"error_code"`
+			ErrorMsg  string `json:"error_msg"`
+		} `json:"details"`
+	}
+	if errUnmarshal := json.Unmarshal(payload, &frame); errUnmarshal != nil {
+		return nil
+	}
+	code := strings.TrimSpace(frame.ErrorCode)
+	if code == "" || streamSuccessCodes[strings.ToLower(code)] {
+		return nil
+	}
+	if len(frame.Delta) > 0 || len(frame.Choices) > 0 || strings.TrimSpace(frame.Text) != "" {
+		return nil
+	}
+
+	message := "upstream reported " + code
+	if text := strings.TrimSpace(frame.ErrorMsg); text != "" {
+		message += ": " + text
+	}
+	// The envelope's details are trace decorations (requestId, modelId, …) that
+	// repeat the same code, so only a genuinely additional message is appended.
+	for _, detail := range frame.Details {
+		text := strings.TrimSpace(detail.ErrorMsg)
+		if text == "" || strings.Contains(message, text) || strings.Contains(text, ":") {
+			continue
+		}
+		message += " (" + text + ")"
+		break
+	}
+
+	fault := &upstreamStreamFault{Code: "upstream_error", Message: message, Status: http.StatusBadGateway}
+	lowered := strings.ToLower(message)
+	switch {
+	case strings.Contains(lowered, "insufficient quota"):
+		// Mirrors the HTTP mapping, where 403 means insufficient_quota.
+		fault.Code, fault.Status = "insufficient_quota", http.StatusForbidden
+	case strings.Contains(code, "429") || strings.Contains(lowered, "rate limit") || strings.Contains(lowered, "too many"):
+		fault.Code, fault.Status = "rate_limit_exceeded", http.StatusTooManyRequests
+	}
+	return fault
+}
+
+// upstreamFailureEnvelope maps an aggregation failure to a host-visible error,
+// preserving the classification the gateway carried inside the stream so the
+// host can cool the credential over rather than serving an empty success.
+func upstreamFailureEnvelope(err error, cred *credential) ([]byte, error) {
+	var fault *upstreamStreamFault
+	if errors.As(err, &fault) {
+		return failEnvelope(fault.Code, redactUpstreamError(fault.Message, cred, false), fault.Status)
+	}
+	return failEnvelope("upstream_error", err.Error(), http.StatusBadGateway)
+}
+
 func aggregateUpstream(cfg *Config, model string, body []byte) ([]byte, error) {
 	renderer := newStreamRenderer(cfg, model, protocolOpenAI)
 	frames := renderer.feed(body)
 	frames = append(frames, renderer.finish()...)
+	// The renderer withholds fault envelopes from the frame list, so the recorded
+	// fault is the only place an aggregated reply can learn about it.
+	if fault := renderer.streamFault(); fault != nil {
+		return nil, fault
+	}
 	if len(bytes.TrimSpace(body)) == 0 {
 		return nil, fmt.Errorf("upstream returned an empty response")
 	}
