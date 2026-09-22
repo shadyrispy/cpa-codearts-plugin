@@ -132,6 +132,7 @@ func registrationResponse() map[string]any {
 					Type:        pluginapi.ConfigFieldTypeInteger,
 					Description: "Timeout in seconds for a single upstream request.",
 				},
+				{Name: "chat_session_concurrency", Type: pluginapi.ConfigFieldTypeInteger, Description: "Default local concurrent chat limit per CodeArts account (1–64, default 3). Account panel overrides take precedence. Does not raise the upstream subscription limit."},
 				{
 					Name:        "insist_missing_credentials",
 					Type:        pluginapi.ConfigFieldTypeBoolean,

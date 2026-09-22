@@ -165,3 +165,58 @@ test('credit balances preserve decimal credits and do not label them as tokens',
   assert.equal(context.creditCount(4999.21),'4,999.21');
   assert(source.includes("'剩余积分 ' + creditCount(m.credit_remaining)"));
 });
+
+function concurrencyPanel(callImpl) {
+  const input = { value: '5', disabled: false };
+  const status = { textContent: '' };
+  const button = { disabled: false, parentNode: { querySelector: selector => selector === 'input' ? input : status } };
+  const context = vm.createContext({ BASE: '/management', call: callImpl });
+  vm.runInContext(source.slice(source.indexOf('  function esc('), source.indexOf('  function tokenCount(')), context);
+  return { input, status, button, context };
+}
+
+test('concurrency controls render inherited/default limits, occupancy and escaped account ID', () => {
+  const p = concurrencyPanel();
+  const html = p.context.sessionConcurrencyBlock({ auth_index: '<account"', concurrency: { limit: 5, default: 3, override: 5, active: 2 } });
+  assert.match(html, /value="5"/);
+  assert.match(html, /0 继承默认 3/);
+  assert.match(html, /本插件占用 2 \/ 5/);
+  assert.match(html, /data-concurrency-save="&lt;account&quot;"/);
+  assert(source.includes('if (concurrencyAccount) { saveSessionConcurrency(t, concurrencyAccount); return; }'));
+});
+
+test('concurrency save validates integers and restores controls after persistent save', async () => {
+  let resolve, calls = 0;
+  const p = concurrencyPanel((url, opts) => {
+    calls++;
+    assert.equal(url, '/management/concurrency');
+    assert.equal(opts.method, 'POST');
+    assert.equal(opts.body.auth_index, 'account');
+    assert.equal(opts.body.limit, 5);
+    return new Promise(r => { resolve = r; });
+  });
+  for (const value of ['', '-1', '65', '3.5', 'abc']) {
+    p.input.value = value;
+    await p.context.saveSessionConcurrency(p.button, 'account');
+    assert.equal(calls, 0);
+    assert.match(p.status.textContent, /请输入/);
+  }
+  p.input.value = '5';
+  const saving = p.context.saveSessionConcurrency(p.button, 'account');
+  assert(p.button.disabled && p.input.disabled);
+  resolve({ persistent: true, concurrency: { limit: 5, override: 5, active: 2 } });
+  await saving;
+  assert(!p.button.disabled && !p.input.disabled);
+  assert.match(p.status.textContent, /已保存，当前占用 2 \/ 5/);
+});
+
+test('concurrency zero restores inheritance and failed save does not claim success', async () => {
+  const p = concurrencyPanel((_url, opts) => {
+    assert.equal(opts.body.limit, 0);
+    return Promise.reject(Error('read only'));
+  });
+  p.input.value = '0';
+  await p.context.saveSessionConcurrency(p.button, 'account');
+  assert.match(p.status.textContent, /保存失败：read only/);
+  assert(!p.button.disabled && !p.input.disabled);
+});

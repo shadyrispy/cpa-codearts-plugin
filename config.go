@@ -86,6 +86,9 @@ type Config struct {
 	// ChatSessionHeartbeat reports busy/idle for each plugin-owned chat session,
 	// releasing its upstream concurrency slot when the request finishes.
 	ChatSessionHeartbeat bool `yaml:"chat_session_heartbeat" json:"chat_session_heartbeat"`
+	// Local per-account admission limit. Account-specific panel overrides take
+	// precedence; this cannot increase the upstream subscription's entitlement.
+	ChatSessionConcurrency int `yaml:"chat_session_concurrency" json:"chat_session_concurrency"`
 	// SignHost adds `host` to regional API signatures (default false for
 	// compatibility). Benefit gateway requests always sign host, independently
 	// of this setting, matching the gateway's official client protocol.
@@ -249,20 +252,21 @@ type ModelConfig struct {
 // defaults are a starting point that users are expected to adjust.
 func defaultConfig() *Config {
 	return &Config{
-		BaseURL:               "https://snap-access.cn-north-4.myhuaweicloud.com",
-		BenefitGatewayURL:     "https://opengw.developer.huaweicloud.com",
-		WebLoginBase:          "https://codearts.huaweicloud.com",
-		OAuthTokenURL:         codeArtsOAuthTokenURL,
-		OAuthIdentityURL:      codeArtsOAuthIdentityURL,
-		APIMode:               "agent",
-		PluginName:            "snap_vscode",
-		PluginVersion:         "26.9.101",
-		Language:              "en-us",
-		AgentID:               "Pangu_Doer_in_CodeArts",
-		RequestTimeoutSeconds: 600,
-		LoginTimeoutSeconds:   300,
-		Heartbeat:             true,
-		ChatSessionHeartbeat:  true,
+		BaseURL:                "https://snap-access.cn-north-4.myhuaweicloud.com",
+		BenefitGatewayURL:      "https://opengw.developer.huaweicloud.com",
+		WebLoginBase:           "https://codearts.huaweicloud.com",
+		OAuthTokenURL:          codeArtsOAuthTokenURL,
+		OAuthIdentityURL:       codeArtsOAuthIdentityURL,
+		APIMode:                "agent",
+		PluginName:             "snap_vscode",
+		PluginVersion:          "26.9.101",
+		Language:               "en-us",
+		AgentID:                "Pangu_Doer_in_CodeArts",
+		RequestTimeoutSeconds:  600,
+		LoginTimeoutSeconds:    300,
+		Heartbeat:              true,
+		ChatSessionHeartbeat:   true,
+		ChatSessionConcurrency: 3,
 		Schedule: ScheduleConfig{
 			Enabled: true,
 		},
@@ -295,6 +299,9 @@ func parseConfig(request []byte) (*Config, error) {
 		return nil, errUnmarshal
 	}
 	cfg.normalize()
+	if cfg.ChatSessionConcurrency < 1 || cfg.ChatSessionConcurrency > 64 {
+		return nil, fmt.Errorf("chat_session_concurrency must be between 1 and 64")
+	}
 	if cfg.StateDir != "" && !filepath.IsAbs(cfg.StateDir) {
 		return nil, fmt.Errorf("state_dir must be an absolute persistent directory")
 	}

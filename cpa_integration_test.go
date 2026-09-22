@@ -42,6 +42,9 @@ func TestCPAIntegration(t *testing.T) {
 	var welfareMu sync.Mutex
 	welfareStatus := map[string]string{}
 	var sessionMu sync.Mutex
+	var heldChat atomic.Pointer[integrationChatGate]
+	var upstreamSessionLimit atomic.Int32
+	upstreamSessionLimit.Store(3)
 	activeSessions := map[string]bool{}
 	sessionStarts := map[string]int{}
 	sessionFinishes := map[string]int{}
@@ -153,8 +156,8 @@ func TestCPAIntegration(t *testing.T) {
 			switch r.URL.Query().Get("status") {
 			case "busy":
 				if !activeSessions[sessionID] {
-					if len(activeSessions) >= 3 {
-						http.Error(w, "TM.00001041: session limit is 3", http.StatusBadRequest)
+					if len(activeSessions) >= int(upstreamSessionLimit.Load()) {
+						http.Error(w, "TM.00001041: fixture session limit reached", http.StatusBadRequest)
 						return
 					}
 					activeSessions[sessionID] = true
@@ -197,6 +200,14 @@ func TestCPAIntegration(t *testing.T) {
 			if !busy {
 				http.Error(w, "chat did not use an active busy session", http.StatusBadRequest)
 				return
+			}
+			if gate := heldChat.Load(); gate != nil {
+				gate.entered <- struct{}{}
+				select {
+				case <-gate.release:
+				case <-r.Context().Done():
+					return
+				}
 			}
 			if status := nextStatus.Load(); status != 0 {
 				http.Error(w, "fixture rate limit", int(status))
@@ -447,6 +458,27 @@ func TestCPAIntegration(t *testing.T) {
 	if json.Unmarshal(body, &accountList) != nil || status != 200 || len(accountList.Accounts) != 1 {
 		t.Fatalf("account inventory failed: %d %s", status, body)
 	}
+	testCPAConcurrency(t, base, 3, &heldChat, &chatCalls)
+	status, body = request("POST", "/v0/management/codearts-provider/concurrency", fmt.Sprintf(`{"auth_index":%q,"limit":5}`, accountList.Accounts[0].AuthIndex))
+	if status != 200 || !bytes.Contains(body, []byte(`"persistent":true`)) {
+		t.Fatalf("concurrency save failed: %d %s", status, body)
+	}
+	stop()
+	start()
+	assertModels("audit-model", "glm-5.3-flash", "GLM-5.2")
+	status, body = request("GET", "/v0/management/codearts-provider/accounts", "")
+	if status != 200 || !bytes.Contains(body, []byte(`"override":5`)) {
+		t.Fatalf("restart lost concurrency override: %d %s", status, body)
+	}
+	upstreamSessionLimit.Store(5)
+	testCPAConcurrency(t, base, 5, &heldChat, &chatCalls)
+	status, body = request("POST", "/v0/management/codearts-provider/concurrency", fmt.Sprintf(`{"auth_index":%q,"limit":0}`, accountList.Accounts[0].AuthIndex))
+	if status != 200 {
+		t.Fatalf("concurrency reset failed: %d %s", status, body)
+	}
+	upstreamSessionLimit.Store(3)
+	assertSessionsIdle()
+	t.Log("per-account concurrency: 3 and 5 enforced, persisted across restart, no busy cooldown or leaked sessions")
 	benefitPath := "/v0/management/codearts-provider/benefit-balance?auth_index=" + url.QueryEscape(accountList.Accounts[0].AuthIndex)
 	status, body = request("GET", benefitPath, "")
 	if status != http.StatusOK || !bytes.Contains(body, []byte(`"daily_tokens_used":30`)) {

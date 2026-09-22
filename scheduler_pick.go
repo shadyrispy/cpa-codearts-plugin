@@ -96,6 +96,17 @@ func schedulerPick(request []byte) ([]byte, error) {
 	}
 
 	candidates := usableCandidates(req.Candidates)
+	available := make([]pluginapi.SchedulerAuthCandidate, 0, len(candidates))
+	for _, candidate := range candidates {
+		if candidateSessionAvailable(cfg, candidate) {
+			available = append(available, candidate)
+		}
+	}
+	// Picking is advisory: concurrent requests can race. The executor reserves
+	// atomically. If all are full it returns a request-scoped 409, not an unknown auth.
+	if len(available) > 0 {
+		candidates = available
+	}
 	if len(candidates) == 0 {
 		// No usable credential of ours: stay unhandled so the host applies its own
 		// error handling rather than us inventing one.

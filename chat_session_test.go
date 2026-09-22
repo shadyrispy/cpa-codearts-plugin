@@ -263,6 +263,9 @@ func TestExecutorReleasesChatSessionOnRejectedChat(t *testing.T) {
 			if result.Error.HTTPStatus != http.StatusBadRequest || busy.Load() != 1 || idle.Load() != 1 || closed.Load() != 1 {
 				t.Fatalf("rejected chat did not release both resources: status=%d busy=%d idle=%d closed=%d", result.Error.HTTPStatus, busy.Load(), idle.Load(), closed.Load())
 			}
+			if v := accountSessionConcurrency(cfg, &credential{AccessKeyID: "fixture-ak", SecretAccessKey: "fixture-sk"}, ""); v.Active != 0 {
+				t.Fatal("rejected chat leaked its local concurrency permit")
+			}
 		})
 	}
 }
@@ -325,5 +328,8 @@ func TestExecutorTimeoutReleasesChatSession(t *testing.T) {
 	}
 	if busy.Load() != 1 || idle.Load() != 1 || upstreamCloses.Load() != 1 {
 		t.Fatalf("timeout leaked a session: busy=%d idle=%d upstream closes=%d", busy.Load(), idle.Load(), upstreamCloses.Load())
+	}
+	if v := accountSessionConcurrency(cfg, &credential{AccessKeyID: "fixture-ak", SecretAccessKey: "fixture-sk"}, ""); v.Active != 0 {
+		t.Fatal("timeout leaked its local concurrency permit")
 	}
 }

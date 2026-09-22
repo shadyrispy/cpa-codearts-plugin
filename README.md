@@ -528,6 +528,7 @@ All routes live under `/v0/management/codearts-provider/` and require the admin 
 | `POST` | `/schedule/run` | Run one task now (body: `{task}`). |
 | `POST` | `/schedule/config` | Persist the total switch and/or `tasks:[{id,enabled}]`; unknown IDs reject the entire change. |
 | `POST` | `/import` | Import a credential (`{access_key_id, secret_access_key, security_token, domain_id, user_name, name}`). |
+| `POST` | `/concurrency` | Persist an account's chat concurrency limit (`{auth_index, limit}`); 1–64, or 0 to inherit the configured default. |
 | `GET` | `/export` | Export all credentials in re-importable form. Returns live secrets — handle accordingly. |
 | `POST` | `/delete` | Delete one account's auth file (body: `{auth_index}`). |
 
@@ -555,6 +556,27 @@ unauthenticated resource namespace, so it holds no secrets of its own — it rea
 the admin key from the management UI's same-origin `localStorage` and calls the
 authenticated routes above. Scripts are inlined rather than loaded from a CDN, so
 no third-party code runs in an admin context.
+
+Each account card has **会话并发上限** and **保存并发上限** controls, plus the
+current local occupancy. The default is 3; set an entitled paid account to 5,
+or enter 0 to inherit `chat_session_concurrency`. The plugin does not guess the
+subscription tier or increase the upstream entitlement. Values 1–64 are supported.
+Overrides persist in `session-limit-*.state` under `state_dir` (or the resolved
+plugin state directory beside auth files). Persist that directory in Docker.
+
+The limit covers active chats across models and client protocols, including
+streaming until completion/cancellation and upstream session cleanup. Lowering
+the limit does not terminate existing requests. Plugin scheduling prefers an
+account with capacity; if the selected account is full, the request receives
+HTTP **409** with a concurrent-session-limit message before any upstream chat
+starts (the plugin's internal code is `session_concurrency_limit`). Retry
+after an active request finishes. This deliberately avoids CPA's quota cooldown
+for upstream 429s. There is no unbounded local waiting queue.
+
+Counters are local to one CPA process. Another CPA replica or the official VS
+Code extension can consume the same subscription's upstream capacity without
+appearing here; reserve capacity for them when choosing a limit. Duplicate
+logins and token rotation share a cap when the upstream identity is available.
 
 The page deliberately offers a single sign-in path. Importing a pre-existing
 AK/SK pair stays available as `POST /codearts-provider/import` for operators who
@@ -775,6 +797,7 @@ example.
 | `benefit_gateway_url` | `https://opengw.developer.huaweicloud.com` | Optional benefit catalog base; empty disables this source. |
 | `heartbeat` | `true` | Request upstream SSE heartbeat frames. |
 | `chat_session_heartbeat` | `true` | In agent mode, report each request's independent session as busy, renew every 30 seconds, and report idle after completion, failure or cancellation. |
+| `chat_session_concurrency` | `3` | Default concurrent chat limit per account (1–64), shared across models and protocols. Each account card can override it, e.g. 3 for Free or 5 for a paid subscription that permits five sessions. |
 | `sign_host` | `false` | Include `host` in regional API `SignedHeaders`; the benefit catalog always signs it. |
 | `is_confidential` | `false` | Send the `is_confidential` header. |
 | `request_timeout_seconds` | `600` | Per-request upstream timeout. |

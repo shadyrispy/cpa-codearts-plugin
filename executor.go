@@ -55,6 +55,11 @@ func executorExecute(request []byte) ([]byte, error) {
 			http.StatusUnauthorized,
 		)
 	}
+	permit, errPermit := acquireSessionPermit(cfg, req, cred)
+	if errPermit != nil {
+		return sessionAdmissionFailure(errPermit)
+	}
+	defer permit.release()
 	if cred.valid() {
 		refreshed, errRefresh := prepareCredentialForUse(req.AuthID, cred)
 		if errRefresh != nil {
@@ -128,6 +133,16 @@ func executorExecuteStream(request []byte) ([]byte, error) {
 	if !cred.valid() && !cfg.InsistMissingCredentials {
 		return failEnvelope("missing_credential", "no CodeArts Doer credential is available for this model", http.StatusUnauthorized)
 	}
+	permit, errPermit := acquireSessionPermit(cfg, req, cred)
+	if errPermit != nil {
+		return sessionAdmissionFailure(errPermit)
+	}
+	handedOff := false
+	defer func() {
+		if !handedOff {
+			permit.release()
+		}
+	}()
 	if cred.valid() {
 		refreshed, errRefresh := prepareCredentialForUse(req.AuthID, cred)
 		if errRefresh != nil {
@@ -148,7 +163,6 @@ func executorExecuteStream(request []byte) ([]byte, error) {
 	if rejected != nil {
 		return upstreamHTTPErrorEnvelope(rejected, cred)
 	}
-	handedOff := false
 	if chatSession != nil {
 		req.ChatSessionID = chatSession.ID()
 		defer func() {
@@ -185,6 +199,7 @@ func executorExecuteStream(request []byte) ([]byte, error) {
 		return upstreamHTTPErrorEnvelope(readUpstreamErrorResponse(cfg, open), cred)
 	}
 	stop, errRegister := registerActiveStream(req.StreamID, func() {
+		defer permit.release()
 		_ = hostHTTPStreamClose(open.StreamID)
 		if chatSession != nil {
 			chatSession.Stop()

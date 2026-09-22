@@ -944,6 +944,7 @@ func credentialAuthMetadata(cred *credential) map[string]any {
 	metadata["user_name"] = cred.UserName
 	metadata["user_id"] = cred.UserID
 	metadata["domain_id"] = cred.DomainID
+	metadata["session_identity"] = credentialRefreshKey(cred)
 	loginType := cred.LoginType
 	if strings.TrimSpace(cred.SecurityToken) == "" {
 		loginType = firstNonEmptyString(loginType, "AKSK")

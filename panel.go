@@ -98,6 +98,8 @@ const panelTemplate = `<!doctype html>
   input:focus-visible,button:focus-visible { outline:2px solid var(--accent); outline-offset:3px; }
   .task-table { overflow-x:auto; }
   .schedule-head { display:flex; gap:16px; flex-wrap:wrap; align-items:center; margin-bottom:10px; }
+  .session-controls { margin-top:12px; padding-top:10px; border-top:1px solid var(--line); }
+  .session-controls input { width:76px; margin-right:6px; }
 </style>
 </head>
 <body>
@@ -289,6 +291,35 @@ const panelTemplate = `<!doctype html>
     });
   }
 
+  function sessionConcurrencyBlock(a) {
+    var c = a.concurrency || { limit: 3, default: 3, override: 0, active: 0 };
+    return '<div class="session-controls"><label>会话并发上限（0 继承默认 ' + esc(c.default) + '）' +
+      '<input type="number" min="0" max="64" step="1" value="' + esc(c.override) + '" aria-label="会话并发上限"></label>' +
+      '<button data-concurrency-save="' + esc(a.auth_index) + '">保存并发上限</button>' +
+      '<div class="meta" data-concurrency-status role="status">' +
+      (c.error ? esc(c.error) : '本插件占用 ' + esc(c.active) + ' / ' + esc(c.limit) + '；按订阅设置，例如 3 或 5。') +
+      '</div></div>';
+  }
+
+  function saveSessionConcurrency(button, authIndex) {
+    var input = button.parentNode.querySelector('input');
+    var status = button.parentNode.querySelector('[data-concurrency-status]');
+    var value = Number(input.value);
+    if (input.value.trim() === '' || !Number.isInteger(value) || value < 0 || value > 64) {
+      status.textContent = '请输入 0–64 的整数；0 表示继承默认值。';
+      return Promise.resolve();
+    }
+    button.disabled = true; input.disabled = true;
+    status.textContent = '正在保存…';
+    return call(BASE + '/concurrency', { method: 'POST', body: { auth_index: authIndex, limit: value } })
+      .then(function (r) {
+        var c = r.concurrency;
+        input.value = String(c.override);
+        status.textContent = '已保存，当前占用 ' + c.active + ' / ' + c.limit + '。重启保留，不中断已有会话。';
+      }).catch(function (e) { status.textContent = '保存失败：' + e.message; })
+      .finally(function () { button.disabled = false; input.disabled = false; });
+  }
+
   function tokenCount(n) {
     var v = Number(n);
     if (!isFinite(v)) return "?";
@@ -387,6 +418,7 @@ const panelTemplate = `<!doctype html>
         '<div style="margin-top:9px"><button data-models="' + esc(a.auth_index) + '">刷新并同步模型</button></div>' +
         '<div data-model-list="' + esc(a.auth_index) + '" class="meta">模型列表从此账号的华为服务获取。</div>' +
         '<div class="meta mono">' + esc(a.auth_index) + '</div>' +
+        sessionConcurrencyBlock(a) +
         '<div style="margin-top:9px"><button class="danger" data-del="' + esc(a.auth_index) + '">删除账号</button></div>' +
         '</div>';
     }).join("");
@@ -577,6 +609,8 @@ const panelTemplate = `<!doctype html>
   document.addEventListener("click", function (ev) {
     var t = ev.target;
     if (!t || t.tagName !== "BUTTON") return;
+    var concurrencyAccount = t.getAttribute('data-concurrency-save');
+    if (concurrencyAccount) { saveSessionConcurrency(t, concurrencyAccount); return; }
     var benefitAccount = t.getAttribute("data-benefit");
     if (benefitAccount) {
       var benefitBox = t.parentNode.previousElementSibling;

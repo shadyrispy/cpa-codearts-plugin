@@ -28,6 +28,7 @@ func managementRoutes() []map[string]any {
 	return []map[string]any{
 		{"Method": http.MethodPost, "Path": "/codearts-provider/login/callback", "Description": "Submit the localhost OAuth callback URL when CPA runs on a different machine."},
 		{"Method": http.MethodGet, "Path": "/codearts-provider/login/status", "Description": "Report the stage of one OAuth sign-in flow (waiting for the callback, or exchanging the code)."},
+		{"Method": http.MethodPost, "Path": "/codearts-provider/concurrency", "Description": "Persist an account's local concurrent chat limit (body: {auth_index,limit}; 0 inherits the configured default)."},
 		{
 			"Method":      http.MethodGet,
 			"Path":        "/codearts-provider/accounts",
@@ -152,6 +153,8 @@ func managementHandle(request []byte) ([]byte, error) {
 		return okEnvelope(htmlResponse(panelHTML()))
 	case route == "/accounts" && method == http.MethodGet:
 		return okEnvelope(handleAccounts())
+	case route == "/concurrency" && method == http.MethodPost:
+		return okEnvelope(handleSessionConcurrency(req.ManagementRequest))
 	case route == "/models" && method == http.MethodGet:
 		return okEnvelope(handleAccountModels(req.Query, req.HostCallbackID))
 	case route == "/login/callback" && method == http.MethodPost:
@@ -345,17 +348,18 @@ func managementRouteSuffix(path string) string {
 
 // accountView is one account row for the panel and the accounts route.
 type accountView struct {
-	AuthIndex string `json:"auth_index"`
-	AuthID    string `json:"auth_id"`
-	Name      string `json:"name"`
-	Label     string `json:"label"`
-	Status    string `json:"status"`
-	Disabled  bool   `json:"disabled"`
-	UserName  string `json:"user_name"`
-	UserID    string `json:"user_id"`
-	DomainID  string `json:"domain_id"`
-	LoginType string `json:"login_type"`
-	ExpiresAt string `json:"expires_at"`
+	AuthIndex   string                  `json:"auth_index"`
+	AuthID      string                  `json:"auth_id"`
+	Name        string                  `json:"name"`
+	Label       string                  `json:"label"`
+	Status      string                  `json:"status"`
+	Disabled    bool                    `json:"disabled"`
+	UserName    string                  `json:"user_name"`
+	UserID      string                  `json:"user_id"`
+	DomainID    string                  `json:"domain_id"`
+	LoginType   string                  `json:"login_type"`
+	ExpiresAt   string                  `json:"expires_at"`
+	Concurrency *sessionConcurrencyView `json:"concurrency,omitempty"`
 
 	Plan      string       `json:"plan,omitempty"`
 	PlanName  string       `json:"plan_name,omitempty"`
@@ -412,6 +416,8 @@ func codeartsAccounts() ([]accountView, error) {
 				view.DomainID = cred.DomainID
 				view.LoginType = cred.LoginType
 				view.ExpiresAt = cred.ExpiresAt
+				v := accountSessionConcurrency(config(), cred, file.Path)
+				view.Concurrency = &v
 			}
 		}
 

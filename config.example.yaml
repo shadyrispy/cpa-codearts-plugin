@@ -126,6 +126,10 @@ plugins:
       # generating, idle after completion/failure/cancellation. Keep enabled
       # to release the account's concurrent-chat slots promptly.
       chat_session_heartbeat: true
+      # Per-account concurrent chats across models/protocols. Free: 3; set 5
+      # for an entitled paid account in the dashboard. Per-account 0 inherits
+      # this default (1-64). Local limit only; does not increase entitlement.
+      chat_session_concurrency: 3
 
       # Include `host` in regional API signatures. Defaults to false for
       # compatibility with existing configurations; captured 26.9.101 requests
