@@ -61,7 +61,7 @@ func registrationResponse() map[string]any {
 				{
 					Name:        "discover_models",
 					Type:        pluginapi.ConfigFieldTypeBoolean,
-					Description: "Discover each account's Agent Center models. Enabled by default; optional benefit discovery is explicit so it cannot block CPA startup.",
+					Description: "Discover account models, including bounded initial benefit discovery and a persistent account-scoped benefit catalogue.",
 				},
 				{
 					Name:        "discover_builtin_models",
@@ -72,6 +72,10 @@ func registrationResponse() map[string]any {
 					Name:        "benefit_gateway_url",
 					Type:        pluginapi.ConfigFieldTypeString,
 					Description: "Benefit model catalog base, default https://opengw.developer.huaweicloud.com. Empty disables this catalog; chats use the CodeArts base_url.",
+				},
+				{
+					Name: "discovery_proxy_url", Type: pluginapi.ConfigFieldTypeString,
+					Description: "Optional proxy override for five-second initial benefit discovery; otherwise inherits the host proxy. direct:// disables proxies. Chat and management retain host transport policy.",
 				},
 				{
 					Name:        "model_agent_ids",

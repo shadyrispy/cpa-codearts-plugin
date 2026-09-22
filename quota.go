@@ -90,6 +90,9 @@ type quotaMeter struct {
 	UsedPercent     *float64 `json:"used_percent,omitempty"`
 	UsedTokens      int64    `json:"used_tokens,omitempty"`
 	AllowanceTokens int64    `json:"allowance_tokens,omitempty"`
+	CreditTotal     *float64 `json:"credit_total,omitempty"`
+	CreditUsed      *float64 `json:"credit_used,omitempty"`
+	CreditRemaining *float64 `json:"credit_remaining,omitempty"`
 }
 
 // quotaMeterLabels localises known metric names; anything else keeps the raw
@@ -297,6 +300,9 @@ type statisticsResponse struct {
 		Value            *float64 `json:"value"`
 		UsageTokenNum    int64    `json:"usage_token_num"`
 		PackageTokenAmnt int64    `json:"package_token_amount"`
+		CreditTotal      *float64 `json:"package_credit_amount"`
+		CreditUsed       *float64 `json:"package_credit_used"`
+		CreditRemaining  *float64 `json:"package_credit_remain"`
 		Show             bool     `json:"show"`
 	} `json:"metrics"`
 	Package *struct {
@@ -337,6 +343,7 @@ func parseQuotaSnapshot(body []byte) (quotaSnapshot, error) {
 			Label:           quotaMeterLabels[metric.Name],
 			UsedTokens:      metric.UsageTokenNum,
 			AllowanceTokens: metric.PackageTokenAmnt,
+			CreditTotal:     metric.CreditTotal, CreditUsed: metric.CreditUsed, CreditRemaining: metric.CreditRemaining,
 		}
 		if meter.Label == "" {
 			meter.Label = metric.Name
@@ -345,7 +352,7 @@ func parseQuotaSnapshot(body []byte) (quotaSnapshot, error) {
 			value := *metric.Value
 			meter.UsedPercent = &value
 		}
-		if meter.UsedPercent == nil && meter.UsedTokens == 0 && meter.AllowanceTokens == 0 {
+		if meter.UsedPercent == nil && meter.UsedTokens == 0 && meter.AllowanceTokens == 0 && meter.CreditTotal == nil && meter.CreditRemaining == nil {
 			continue // nothing to show
 		}
 		snapshot.Meters = append(snapshot.Meters, meter)

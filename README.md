@@ -308,9 +308,9 @@ Responses clients (`/v1/responses`), with tool calls and usage preserved.
 
 ## Daily check-in (签到 / 积分领取)
 
-### Built-in daily benefit (v0.1.14)
+### Daily activity credits (corrected in v0.1.16)
 
-The plugin page includes **领取今日额度**, a **定时任务总开关**, and an
+The plugin page includes **领取每日活动积分**, a **定时任务总开关**, and an
 individual automatic switch for every task, including **daily-benefit-claim**.
 Manual execution is independent of both automatic switches. The bulk button
 executes only enabled tasks; it never implicitly opts into a disabled claim.
@@ -326,40 +326,57 @@ schedule:
 
 This adds the built-in task without replacing your existing tasks. Do not add a
 task with its reserved ID `daily-benefit-claim` or type `daily_claim` yourself.
-The claim matches the official 26.9.101 capture: `POST
-https://opengw.developer.huaweicloud.com/api/v1/benefit/claim`, empty body,
-`Content-Type: application/json`, and signed headers
-`content-type;host;x-sdk-date;x-security-token` (no regional `X-Domain-Id`).
-Only `error_code: "0000"` with a CodeArts result counts as accepted.
+The implementation follows the official 26.9.102 extension's **activity** flow:
+
+1. `GET {base_url}/v1/ops/delivery?channel=IDE` reads eligibility.
+2. Only `USER_LOGIN` activities with `benefitUnit: CREDIT` are considered. Student,
+   registration and invitation rewards are never automatically claimed.
+3. `POST /v1/ops/claim` sends the returned `campaignId`, a persisted
+   `idempotentKey`, and `channel: IDE`.
+4. `POST /v1/ops/confirm` sends `campaignId`. A later delivery read must show
+   `CONFIRMED`/`CONSUMED` and no longer claimable before success is recorded.
+5. Subscription statistics refresh the **package/bonus credits** displayed in
+   the account card, with decimal balances. This does **not** increase the separate
+   developer-gateway benefit model token pool.
+
+v0.1.14/v0.1.15 incorrectly treated `/api/v1/benefit/claim` as daily activity
+claiming. That endpoint is not used for daily activity credits anymore. Old
+`daily-claim-*.state` files are preserved but ignored; they cannot block a real claim.
 
 Automatic checks run at minute 05/15/25/35/45/55 and once on scheduler startup,
-using Beijing (UTC+8) dates and skipping 00:00–00:04. Each account is skipped
-after today's success; failed requests are at least ten minutes apart, at most
+using Beijing (UTC+8) dates and skipping 00:00–00:04. Eligibility is re-read on
+each check; confirmed/unclaimable activities do not issue claim requests.
+Failed mutating requests are at least ten minutes apart, at most
 six attempts per account per Beijing day. A newly added account is picked up at
 the next check. Disabled/foreign accounts are excluded; quota-exhausted accounts
 remain eligible. Credentials are refreshed before use when needed.
 
 Attempt/success records default to `auth-dir/.codearts-provider-state/` as hashed
-`daily-claim-*.state` files, independent of credential JSON, with no keys, tokens,
+`daily-welfare-*.state` files, independent of credential JSON, with no keys, tokens,
 or raw responses. Unreadable, corrupt or unwritable state prevents a claim.
 Keep this directory on persistent storage. **Database/object-store deployments:**
 CPA may clear and rebuild its auth spool during startup, even on a persistent
 volume. In v0.1.15+, set an absolute `state_dir` **outside** that spool, e.g.
 `state_dir: /data/codearts-provider-state` with `/data` mounted persistently.
-This directory then holds both `schedule.state` and `daily-claim-*.state`.
+This directory holds `schedule.state`, `daily-welfare-*.state`, and account-scoped
+`benefit-models-*.state` catalogues.
 Changing directories does not migrate existing records; stop CPA and copy them
 to the new directory before restarting if you already have saved state.
 Deduplication is per plugin process
 plus its durable ledger: do not run multiple CPA instances against the same
 directory. A process crash after upstream acceptance but before local success
-is saved can produce a later retry; this is not an exactly-once guarantee.
+is saved can produce a later retry with the same persisted idempotency key.
+Failed confirmation resumes the confirmation stage without repeating a successful
+claim. This is not an exactly-once guarantee across replicas.
 
 The task runs in the background, not on chat/model/quota paths. CPA's HTTP ABI
 does not provide a separate cron-request deadline, so the host transport
 controls network timeout; a slow task cannot overlap itself. Closing a switch
 stops future automatic triggers but does not cancel a request already started.
-Acceptance does not guarantee extra tokens or an entitlement extension; Huawei
-determines eligibility. Use **刷新福利额度** to check the actual allowance.
+Huawei determines eligibility. Manual clicks and automatic checks re-read
+upstream status even when the local record says completed; a local record is
+never substituted for the server's current eligibility decision.
+Use **刷新额度** to check package credits; **刷新福利额度** queries a separate token pool.
 
 For a one-time API trigger:
 `POST /v0/management/codearts-provider/checkin` with
@@ -373,7 +390,8 @@ perform that claim or guarantee an account has remaining benefit quota. An exhau
 pool is still reported honestly at request time: the gateway signals it inside an
 HTTP 200 stream, and that envelope is classified as `insufficient_quota` (HTTP 403)
 rather than served to the client as a successful empty completion. Claim the
-eligible entitlement in the official client or use the built-in claim above.
+eligible benefit-model entitlement in the official client; it is separate from
+the activity-credit claim above.
 
 The plugin's existing `checkin` task remains a configurable automation for a
 verified claim request. It is separate from model discovery and must be
@@ -518,7 +536,7 @@ and responds with `persistent: true` only after a successful write. Saved flags
 override their YAML counterparts across restarts/reconfiguration. Cron expressions
 and task definitions still come from YAML; the plugin never rewrites `config.yaml`.
 To return entirely to YAML defaults, stop CPA and back up/move only `schedule.state`,
-leaving `daily-claim-*.state` intact. Missing accounts mean the directory is unknown:
+leaving `daily-welfare-*.state` intact. Missing accounts may mean the directory is unknown:
 add an account before saving; cron waits until it can restore the saved state.
 A corrupt state file pauses automatic tasks and displays an error, rather than
 silently re-enabling them. Docker must persist the selected state directory.
@@ -658,15 +676,24 @@ The plugin discovers three sources, matching the captured
    `model_name` is retained as the display name. `model_agent_ids` can override
    the automatic agent list. The legacy Act/Plan IDs are only a list-failure or
    empty-list fallback.
-2. The CPA cold-start and chat paths never query the optional benefit gateway.
-   Put account-confirmed entries in `benefit_models`; they are registered and
-   routed with `maas_type: benefit` without network I/O. An operator can request
-   a synchronous live diagnostic with
+2. CPA account registration discovers the optional benefit catalogue automatically,
+   with a **five-second total deadline** for its availability and gateway requests.
+   Chat routing does not perform this I/O. Results are persisted per account in
+   `benefit-models-*.state`, keyed by account identity and gateway endpoints, not
+   temporary access tokens or scheduler switches. Fresh entries are reused for six
+   hours; a failed refresh can retain a last-known-good catalogue for up to seven days.
+   No model IDs are fabricated or shared across accounts. The first bounded lookup
+   uses its own cancellable HTTP client, inheriting `Host.ProxyURL` (override with
+   `discovery_proxy_url`, or `direct://`). Chat and management retain host transport.
+   The **刷新并同步模型** button discovers all sources and requests CPA re-registration
+   with an empty plugin-config PATCH: no configuration values or credential files
+   are rewritten by the plugin. The management read route is
    `GET /v0/management/codearts-provider/models?auth_index=...&include_benefit=true`.
    That call checks snap `/v1/benefit-gateway-config`, then reads
    `/api/v1/gateway/config` under `benefit_gateway_url` using the account's
-   temporary credentials and host-signed request format. A successful result is
-   reused from memory, but `benefit_models` is the restart-persistent LKG list.
+   temporary credentials and host-signed request format. Live discovery is now the
+   default for this management route; `include_benefit=false` is the fast cached view.
+   `benefit_models` remains an optional manual override, not a required workaround.
 
 `benefit_models` is plugin-wide and is therefore offered to every configured
 CodeArts account. On a multi-account CPA, include only benefits shared by every
@@ -969,7 +996,7 @@ Rebuild the library before running it: the test loads the file named by
   guarantee that a request fits the model's context window.
 - **Benefit model listing is separate from entitlement claiming.** The plugin
   routes configured or explicitly refreshed benefit models but does not
-  claim as a side effect of listing models. Daily developer-gateway claiming is
+  claim as a side effect of listing models. Daily activity-credit claiming is
   opt-in through `daily_claim.enabled` or the panel; custom activities can still
   use a verified `checkin` task.
 - **Credential renewal has three independent triggers.** Temporary credentials

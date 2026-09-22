@@ -154,4 +154,14 @@ test('manual claim names the built-in task and bulk run excludes disabled tasks'
   assert.equal(calls[0].opts.body.task, 'daily-benefit-claim');
   assert.equal(calls[0].url, '/management/checkin');
   assert(source.includes('[data-run][data-enabled="true"]:not(:disabled)'));
+  assert(source.includes('领取每日活动积分'));
+  assert(source.includes('/models?include_benefit=true&auth_index='));
+  assert(source.includes("call('/v0/management/plugins/' + P + '/config', { method: 'PATCH', body: {} })"));
+});
+
+test('credit balances preserve decimal credits and do not label them as tokens', () => {
+  const context = vm.createContext({});
+  vm.runInContext(source.slice(source.indexOf('  function creditCount('),source.indexOf('  // The benefit pool')),context);
+  assert.equal(context.creditCount(4999.21),'4,999.21');
+  assert(source.includes("'剩余积分 ' + creditCount(m.credit_remaining)"));
 });

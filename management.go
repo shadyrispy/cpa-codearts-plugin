@@ -518,15 +518,17 @@ func handleAccountModels(query url.Values, callbackID string) pluginapi.Manageme
 			return errorJSON(http.StatusServiceUnavailable, "the account credential expired and silent refresh failed")
 		}
 		cred = refreshed
-		includeLiveBenefit, _ := strconv.ParseBool(strings.TrimSpace(query.Get("include_benefit")))
+		includeLiveBenefit := true
+		if query.Has("include_benefit") {
+			includeLiveBenefit, _ = strconv.ParseBool(strings.TrimSpace(query.Get("include_benefit")))
+		}
 		catalog := accountAgentModelCatalog(config(), cred, callbackID)
 		if includeLiveBenefit {
 			// This is an explicit diagnostic refresh. It is synchronous so the
 			// management request context cancels host HTTP rather than leaving a
 			// detached benefit request behind. It never rewrites the credential:
 			// doing so could roll back an OAuth token rotated while this slow
-			// diagnostic was running. Persist confirmed entries explicitly through
-			// benefit_models instead.
+			// diagnostic was running. Account-scoped catalogues are saved separately.
 			_ = discoverModelCatalog(config(), cred, callbackID)
 			catalog = accountModelCatalog(config(), cred, callbackID)
 		}
@@ -959,8 +961,8 @@ func handleBenefits() pluginapi.ManagementResponse {
 		"configured":       len(tasks) > 0,
 		"schedule_enabled": scheduleEnabled,
 		"tasks":            tasks,
-		"explanation": "daily-benefit-claim uses the official developer gateway claim, independent of automatic switches. " +
-			"Enable daily_claim and the scheduler for automatic claims; success means accepted, not additional quota guaranteed.",
+		"explanation": "daily-benefit-claim now uses ops delivery/claim/confirm for USER_LOGIN CREDIT activities only. " +
+			"Success requires an upstream CONFIRMED/CONSUMED state. Activity credits are not the developer gateway's benefit token pool.",
 		"how_to_capture": []string{
 			"Open the daily benefit page in a browser and sign in.",
 			"Open devtools -> Network, clear it, then click the daily claim button.",

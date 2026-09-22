@@ -148,7 +148,7 @@ const panelTemplate = `<!doctype html>
   <div class="card">
     <h2>定时任务</h2>
     <div class="bar">
-      <button id="claimDaily" class="primary">领取今日额度</button>
+      <button id="claimDaily" class="primary">领取每日活动积分</button>
       <button id="runAll">执行已启用任务</button>
       <button id="refreshQuota">刷新额度</button>
     </div>
@@ -297,6 +297,11 @@ const panelTemplate = `<!doctype html>
     return String(Math.round(v));
   }
 
+  function creditCount(n) {
+    var v = Number(n);
+    return isFinite(v) ? v.toLocaleString('zh-CN', { maximumFractionDigits: 2 }) : '?';
+  }
+
   // The benefit pool is a separate upstream account from the meters above, and
   // an uncapped dimension must not be drawn as an empty bar.
   function benefitBlock(a) {
@@ -341,6 +346,9 @@ const panelTemplate = `<!doctype html>
       // as a fraction the account has somehow exceeded.
       if (allow > 0 && used <= allow) bits.push("token " + tokenCount(used) + " / " + tokenCount(allow));
       else if (used > 0) bits.push("已用 " + tokenCount(used) + " token");
+      if (m.credit_total != null) bits.push('积分总额 ' + creditCount(m.credit_total));
+      if (m.credit_used != null) bits.push('已用积分 ' + creditCount(m.credit_used));
+      if (m.credit_remaining != null) bits.push('剩余积分 ' + creditCount(m.credit_remaining));
       return out + (bits.length ? '<div class="meta">' + bits.map(esc).join(" · ") + '</div>' : "");
     }).join("");
   }
@@ -376,7 +384,7 @@ const panelTemplate = `<!doctype html>
         '<div data-benefit-result="' + esc(a.auth_index) + '">' + benefitBlock(a) + '</div>' +
         '<div style="margin-top:9px"><button data-benefit="' + esc(a.auth_index) + '">刷新福利额度</button></div>' +
         (a.quota_error ? '<div class="meta err">额度查询失败：' + esc(a.quota_error) + '</div>' : '') +
-        '<div style="margin-top:9px"><button data-models="' + esc(a.auth_index) + '">查看账号模型</button></div>' +
+        '<div style="margin-top:9px"><button data-models="' + esc(a.auth_index) + '">刷新并同步模型</button></div>' +
         '<div data-model-list="' + esc(a.auth_index) + '" class="meta">模型列表从此账号的华为服务获取。</div>' +
         '<div class="meta mono">' + esc(a.auth_index) + '</div>' +
         '<div style="margin-top:9px"><button class="danger" data-del="' + esc(a.auth_index) + '">删除账号</button></div>' +
@@ -405,7 +413,7 @@ const panelTemplate = `<!doctype html>
       (s.enabled ? ' checked' : '') + '>定时任务总开关</label><span class="sub" style="margin:0">' +
       (s.enabled ? '自动调度已开启' : '自动调度已暂停') + ' · 时区 ' + esc(s.timezone || "本机时区") + '</span></div>' +
       '<div class="sub">开关保存后重启仍保留。总开关只控制自动执行，手动按钮始终可用；已开始的任务会执行完毕。<br>' +
-      '每日领取按北京时间计日，00:05 后每 10 分钟补检查；当天成功后不再领取，失败最多尝试 6 次。</div>' +
+      '每日活动按北京时间检查：只领取官方标记可领的登录积分活动，完成领取、确认并复查官方状态后才记成功。积分显示在账号的套餐/赠送积分，不是福利模型 token 池。</div>' +
       (s.pending ? '<div class="sub">正在等待账号目录，自动调度暂未启动；请先添加账号。</div>' : '') +
       (s.persistence_error ? '<div class="err">开关恢复失败：' + esc(s.persistence_error) + '，已暂停自动调度。</div>' : '') +
       '<div class="task-table"><table><thead><tr><th>任务</th><th>类型</th><th>Cron</th><th>自动执行</th>' +
@@ -560,7 +568,7 @@ const panelTemplate = `<!doctype html>
     say('正在启动每日领取…');
     call(BASE + '/checkin', { method: 'POST', body: { task: 'daily-benefit-claim' } })
       .then(function () {
-        say('领取任务已启动，请在下方任务结果查看；上游受理不保证重复增加额度。');
+        say('每日活动领取已启动；将完成领取、确认和状态复查，结果见下方任务记录。');
         setTimeout(load, 1500);
       }).catch(function (e) { say('启动领取失败：' + e.message, 'err'); })
       .finally(function () { button.disabled = false; });
@@ -587,11 +595,15 @@ const panelTemplate = `<!doctype html>
       var modelBox = t.parentNode.nextElementSibling;
       t.disabled = true;
       modelBox.textContent = "正在获取模型…";
-      call(BASE + "/models?auth_index=" + encodeURIComponent(modelAccount)).then(function (catalog) {
+      call(BASE + "/models?include_benefit=true&auth_index=" + encodeURIComponent(modelAccount), { timeout: 10000 }).then(function (catalog) {
+        // Reconfigure without changing any fields: CPA re-registers saved account
+        // catalogues. Never rewrite credentials to force discovery notifications.
+        return call('/v0/management/plugins/' + P + '/config', { method: 'PATCH', body: {} }).then(function () { return catalog; });
+      }).then(function (catalog) {
         var items = (catalog && catalog.models) || [];
         var warnings = (catalog && catalog.warnings) || [];
         var source = catalog && catalog.source;
-        var note = source === "configured" ? "配置中的模型（本次未从账号发现）" : "账号返回的模型";
+        var note = source === "configured" ? "配置中的模型（本次未从账号发现）" : "已刷新并请求 CPA 同步的账号模型";
         modelBox.innerHTML = '<div>' + esc(note) + '：' + items.length + ' 个</div>' +
           items.map(function (m) {
             var origin = m.source === "benefit" ? "福利网关" : (m.source === "agent" ? "CodeArts" : "手动配置");

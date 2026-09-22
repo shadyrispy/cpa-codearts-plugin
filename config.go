@@ -20,6 +20,7 @@ type Config struct {
 	// BenefitGatewayURL supplies the optional second catalog used by CodeArts.
 	// Chat requests still go through BaseURL with the benefit routing header.
 	BenefitGatewayURL string `yaml:"benefit_gateway_url" json:"benefit_gateway_url"`
+	DiscoveryProxyURL string `yaml:"discovery_proxy_url" json:"discovery_proxy_url"`
 	// WebLoginBase is the web console used to start the browser login flow.
 	WebLoginBase string `yaml:"web_login_base" json:"web_login_base"`
 	// OAuthTokenURL and OAuthIdentityURL are the Huawei STS endpoints used by
@@ -57,8 +58,8 @@ type Config struct {
 	// entries are routed with maas_type=benefit without making another network
 	// request. Live refresh remains available from the management models route.
 	BenefitModels []ModelConfig `yaml:"benefit_models" json:"benefit_models"`
-	// DiscoverModels queries Agent Center per account. Optional live benefit
-	// discovery is management-only so it cannot block registration or chat.
+	// DiscoverModels queries Agent Center per account. Initial benefit discovery
+	// is bounded to five seconds; routing reuses account-scoped persisted results.
 	DiscoverModels bool `yaml:"discover_models" json:"discover_models"`
 	// DiscoverBuiltinModels controls the additional account-scoped
 	// /v1/model/builtin request. Operators can disable it if that endpoint is

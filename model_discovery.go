@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"net/http"
 	"net/url"
+	"path/filepath"
 	"sort"
 	"strconv"
 	"strings"
@@ -73,7 +74,16 @@ func modelsForAuth(raw []byte) ([]byte, error) {
 	// the optional benefit gateway: a slow request there must never hide working
 	// Agent Center models. Operator-confirmed benefit_models are still merged by
 	// accountAgentModelCatalog without network I/O.
-	catalog := accountAgentModelCatalog(config(), cred, req.HostCallbackID)
+	discoveryCfg := *config()
+	discoveryCfg.DiscoveryProxyURL = firstNonEmptyString(discoveryCfg.DiscoveryProxyURL, req.Attributes["proxy_url"], req.Host.ProxyURL)
+	if discoveryCfg.StateDir == "" && filepath.IsAbs(req.Host.AuthDir) {
+		discoveryCfg.scheduleStatePath = filepath.Join(req.Host.AuthDir, pluginStateDir, "schedule.state")
+	}
+	warning := bootstrapBenefitCatalog(&discoveryCfg, cred)
+	catalog := accountAgentModelCatalog(&discoveryCfg, cred, req.HostCallbackID)
+	if warning != "" {
+		catalog.Warnings = append(catalog.Warnings, warning)
+	}
 	if len(catalog.Warnings) > 0 {
 		logWarn("account model discovery incomplete", map[string]any{"auth_id": req.AuthID, "source": catalog.Source, "warnings": catalog.Warnings})
 	}
@@ -121,6 +131,20 @@ func accountModelCatalogScoped(cfg *Config, cred *credential, callbackID string,
 			}
 		} else {
 			result.Warnings = []string{"Sign in to discover the models available to this account"}
+		}
+	}
+	if cfg.DiscoverModels {
+		if saved, ok := storedBenefitCatalog(cfg, cred); ok {
+			seen := map[string]bool{}
+			for _, m := range result.Models {
+				seen[m.ID] = true
+			}
+			for _, m := range saved.Models {
+				if !seen[m.ID] {
+					result.Models = append(result.Models, m)
+					seen[m.ID] = true
+				}
+			}
 		}
 	}
 	if len(result.Models) == 0 {
@@ -354,6 +378,9 @@ func discoverModelCatalog(cfg *Config, cred *credential, callbackID string) mode
 		if err != nil {
 			result.Warnings = append(result.Warnings, "Benefit model catalog: "+err.Error())
 		} else {
+			if errSave := saveBenefitCatalog(cfg, cred, models); errSave != nil {
+				result.Warnings = append(result.Warnings, "福利模型未持久化："+errSave.Error())
+			}
 			seen := make(map[string]bool, len(result.Models))
 			for _, model := range result.Models {
 				seen[model.ID] = true

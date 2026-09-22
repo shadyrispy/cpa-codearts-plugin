@@ -82,8 +82,8 @@ plugins:
       # account-model view to see IDs, names, sources and discovery warnings.
       models: []
 
-      # Discover the account's agents and their visible models. CPA cold start
-      # and chat routing never wait on the optional benefit gateway. Agent
+      # Discover account models, including bounded initial benefit discovery.
+      # Chat routing never queries the optional benefit gateway. Agent
       # results are cached for 5 minutes; partial failures retry after 30s.
       discover_models: true
 
@@ -101,7 +101,8 @@ plugins:
       # through base_url with maas_type: benefit, as in the official extension.
       benefit_gateway_url: "https://opengw.developer.huaweicloud.com"
 
-      # Restart-persistent last-known-good benefit models. Only add models that
+      # Optional manual override; discovered benefit models are now persisted
+      # automatically per account under state_dir. Only add models that
       # this account actually received from an explicit panel/API refresh. They
       # are registered without querying the optional gateway and always route
       # with maas_type: benefit. This list is plugin-wide: with multiple
@@ -163,8 +164,9 @@ plugins:
       # The CLIProxyAPI plugin ABI has no timer: the host never calls a plugin on
       # a schedule, so the plugin runs its own cron. Expressions accept the
       # standard 5-field form (minute first) or the 6-field form with seconds.
-      # Official developer-gateway daily benefit. Opt in here or on the panel.
-      # Manual "领取今日额度" works even when this or the total switch is off.
+      # Official daily USER_LOGIN CREDIT activity (ops delivery/claim/confirm).
+      # NOT the developer gateway's benefit token pool.
+      # Manual "领取每日活动积分" works even when this or the total switch is off.
       # Uses Beijing dates, catches up after startup, and deduplicates on disk.
       daily_claim:
         enabled: false
@@ -174,6 +176,10 @@ plugins:
       # Docker example with /data mounted: "/data/codearts-provider-state"
       # Empty uses auth-dir/.codearts-provider-state (ordinary file-backed CPA).
       state_dir: ""
+
+      # Initial benefit model discovery is bounded to five seconds. It inherits
+      # CPA's proxy; override only if needed (direct:// explicitly means direct).
+      discovery_proxy_url: ""
 
       # Panel switches are persisted under auth-dir/.codearts-provider-state/
       # and override the corresponding YAML flags. No credentials are stored

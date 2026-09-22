@@ -93,10 +93,12 @@ func TestExplicitStateDirectorySurvivesAuthSpoolReset(t *testing.T) {
 	if err := os.RemoveAll(filepath.Dir(file.Path)); err != nil {
 		t.Fatal(err)
 	} // fixture-owned t.TempDir only
-	testHost(t, func(string, any) (json.RawMessage, error) { return json.RawMessage(`{"files":[]}`), nil })
+	restoreEmpty := setHostCall(func(string, any) (json.RawMessage, error) { return json.RawMessage(`{"files":[]}`), nil })
+	defer restoreEmpty()
 	fresh := defaultConfig()
 	fresh.StateDir = cfg.StateDir
 	installScheduledConfig(fresh)
+	restoreEmpty()
 	if config().schedulePending || config().Schedule.Enabled || config().scheduleTasks()[0].isEnabled() {
 		t.Fatal("spool reset lost persistent switches")
 	}

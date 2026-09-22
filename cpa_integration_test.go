@@ -39,6 +39,8 @@ func TestCPAIntegration(t *testing.T) {
 	var benefitCalls atomic.Int32
 	var dailyClaimCalls atomic.Int32
 	var dailyClaimFail atomic.Bool
+	var welfareMu sync.Mutex
+	welfareStatus := map[string]string{}
 	var sessionMu sync.Mutex
 	activeSessions := map[string]bool{}
 	sessionStarts := map[string]int{}
@@ -78,18 +80,47 @@ func TestCPAIntegration(t *testing.T) {
 			return
 		}
 		switch r.URL.Path {
-		case epDailyClaim:
-			dailyClaimCalls.Add(1)
-			body, _ := io.ReadAll(r.Body)
-			if r.Method != http.MethodPost || len(body) != 0 || r.Header.Get("X-Domain-Id") != "" || r.Header.Get("Content-Type") != "application/json" || !strings.Contains(r.Header.Get("Authorization"), "SignedHeaders=content-type;host;x-sdk-date;x-security-token,") {
-				http.Error(w, "incorrect claim protocol", 400)
+		case "/v1/ops/delivery", epWelfareClaim, epWelfareConfirm:
+			welfareMu.Lock()
+			defer welfareMu.Unlock()
+			account := strings.Split(r.Header.Get("Authorization"), ",")[0]
+			state := welfareStatus[account]
+			if state == "" {
+				state = "ELIGIBLE"
+			}
+			if r.Header.Get("Agent-Type") != "PromptCenter" {
+				http.Error(w, "wrong activity headers", 400)
 				return
 			}
-			if dailyClaimFail.Load() {
-				http.Error(w, "claim temporarily unavailable", 503)
+			if r.URL.Path == "/v1/ops/delivery" {
+				if r.Method != "GET" || r.URL.Query().Get("channel") != "IDE" {
+					http.Error(w, "invalid delivery", 400)
+					return
+				}
+				fmt.Fprintf(w, `{"code":0,"data":{"items":[{"campaignId":1,"type":"USER_LOGIN","benefitUnit":"CREDIT","benefitAmount":1000,"claimable":%t,"status":%q}]}}`, state == "ELIGIBLE", state)
 				return
 			}
-			fmt.Fprint(w, dailyClaimOK)
+			var b map[string]any
+			_ = json.NewDecoder(r.Body).Decode(&b)
+			if r.Method != "POST" || b["campaignId"] != float64(1) {
+				http.Error(w, "incorrect campaign", 400)
+				return
+			}
+			if r.URL.Path == epWelfareClaim {
+				dailyClaimCalls.Add(1)
+				if dailyClaimFail.Load() {
+					http.Error(w, "claim unavailable", 503)
+					return
+				}
+				if b["channel"] != "IDE" || b["idempotentKey"] == nil {
+					http.Error(w, "incorrect claim", 400)
+					return
+				}
+				welfareStatus[account] = "CLAIMED"
+			} else {
+				welfareStatus[account] = "CONFIRMED"
+			}
+			fmt.Fprint(w, `{"code":0,"data":{"campaignId":1}}`)
 		case "/snap-manager/v1/statistics/plugin":
 			w.Header().Set("Content-Type", "application/json")
 			fmt.Fprint(w, `{"metrics":[{"name":"usageTokenChatMessages","value":20,"show":true}],"package":{"spec_code":"fixture-plan"}}`)
@@ -244,6 +275,7 @@ func TestCPAIntegration(t *testing.T) {
 	const benefitModelConfig = "      benefit_models:\n        - {id: deepseek-v4-flash-0731, display_name: deepseek-v4-flash-0731, context_length: 1048576, max_output_tokens: 393216}\n        - {id: deepseek-v4-pro-0813, display_name: deepseek-v4-pro-0813, context_length: 1048576, max_output_tokens: 393216}\n        - {id: glm-5.3-flash, display_name: glm-5.3-flash, context_length: 1048576, max_output_tokens: 131072}\n"
 	configYAML := fmt.Sprintf("host: 127.0.0.1\nport: %d\nauth-dir: %q\napi-keys: [audit-client]\nremote-management:\n  allow-remote: false\n  secret-key: audit-admin\n  disable-control-panel: true\nrequest-retry: 0\nplugins:\n  enabled: true\n  dir: %q\n  configs:\n    codearts-provider:\n      enabled: true\n      base_url: %q\n      benefit_gateway_url: %q\n      oauth_token_url: %q\n      discover_models: true\n", port, filepath.ToSlash(authDir), filepath.ToSlash(pluginDir), upstream.URL, upstream.URL, upstream.URL+"/v1/oauth2/tokens") + benefitModelConfig + staticModelConfig
 	stateDir := filepath.Join(dir, "persistent-state")
+	configYAML = strings.Replace(configYAML, benefitModelConfig, "", 1) // No configured benefit fallback may mask discovery.
 	configYAML += fmt.Sprintf("      state_dir: %q\n", filepath.ToSlash(stateDir))
 	if err = os.WriteFile(configPath, []byte(configYAML), 0600); err != nil {
 		t.Fatal(err)
@@ -384,8 +416,8 @@ func TestCPAIntegration(t *testing.T) {
 		}
 		t.Fatalf("discovered model missing: %d %s", status, body)
 	}
-	// The alias and configured benefit model are static; GLM-5.2 proves the
-	// imported account has completed refresh plus live Agent discovery.
+	// Only the alias is static. GLM-5.2 and the benefit ID require account
+	// refresh plus live regional and benefit discovery.
 	assertModels("audit-model", "glm-5.3-flash", "GLM-5.2")
 	if renewCalls.Load() != 1 {
 		t.Fatalf("expired credential was renewed %d times, want exactly once before model discovery", renewCalls.Load())
@@ -405,7 +437,7 @@ func TestCPAIntegration(t *testing.T) {
 	if status != 200 || !bytes.Contains(body, []byte("hello from fixture")) {
 		t.Fatalf("benefit model routing failed: %d %s", status, body)
 	}
-	t.Log("four Agent, two built-in and three configured benefit models appeared; benefit routing passed through CPA")
+	t.Log("four Agent, two built-in and three discovered benefit models appeared; benefit routing passed through CPA")
 	status, body = request("GET", "/v0/management/codearts-provider/accounts", "")
 	var accountList struct {
 		Accounts []struct {
@@ -687,7 +719,7 @@ func TestCPAIntegration(t *testing.T) {
 		}
 	}
 	t.Log("panel serves the Chinese single-authorization dashboard")
-	for _, want := range []string{"领取今日额度", "定时任务总开关", "data-task-toggle"} {
+	for _, want := range []string{"领取每日活动积分", "定时任务总开关", "data-task-toggle"} {
 		if !bytes.Contains(body, []byte(want)) {
 			t.Fatalf("panel lacks %s", want)
 		}
@@ -827,7 +859,7 @@ func TestCPAIntegration(t *testing.T) {
 	dailyClaimFail.Store(false)
 	// Age ONLY fixture attempt records to make a retry eligible without a real
 	// ten-minute delay. Production code never exposes a force/retry bypass.
-	statePaths, _ := filepath.Glob(filepath.Join(stateDir, "daily-claim-*.state"))
+	statePaths, _ := filepath.Glob(filepath.Join(stateDir, "daily-welfare-*.state"))
 	if len(statePaths) == 0 {
 		t.Fatal("claim attempt was not persisted")
 	}
@@ -845,7 +877,7 @@ func TestCPAIntegration(t *testing.T) {
 	_, _ = request("POST", scheduleBase+"/checkin", `{"task":"daily-benefit-claim"}`)
 	waitClaim(2)
 	for _, task := range schedule.Tasks {
-		if task.ID == dailyClaimTaskID && (task.Error != "" || !strings.Contains(task.Result, "领取已受理")) {
+		if task.ID == dailyClaimTaskID && (task.Error != "" || !strings.Contains(task.Result, "官方确认")) {
 			t.Fatalf("manual claim with both flags off failed: %+v", task)
 		}
 	}
@@ -866,8 +898,8 @@ func TestCPAIntegration(t *testing.T) {
 			t.Fatalf("chat session lifecycle is unbalanced: busy=%d idle=%d", starts, sessionFinishes[sessionID])
 		}
 	}
-	if benefitCatalogCalls.Load() != 0 {
-		t.Fatalf("critical CPA paths issued %d live benefit catalogue requests", benefitCatalogCalls.Load())
+	if benefitCatalogCalls.Load() == 0 {
+		t.Fatal("CPA never discovered benefit models without a configured fallback")
 	}
-	t.Log("empty general static model configuration registered Agent, built-in and configured benefit models and executed both routes")
+	t.Log("empty static configuration registered Agent, built-in and discovered benefit models and executed both routes")
 }

@@ -29,6 +29,10 @@ func modelFixture(t *testing.T, name string) []byte {
 func resetModelCache(t *testing.T) {
 	t.Helper()
 	clear := func() {
+		benefitCatalogMemory.Lock()
+		benefitCatalogMemory.entries = map[string]benefitCatalogState{}
+		benefitCatalogMemory.retry = map[string]time.Time{}
+		benefitCatalogMemory.Unlock()
 		discoveredModels.Lock()
 		discoveredModels.entries = map[string]modelCacheEntry{}
 		discoveredModels.Unlock()

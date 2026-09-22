@@ -2,6 +2,7 @@ package main
 
 import (
 	"bytes"
+	"context"
 	"crypto/sha256"
 	"encoding/base64"
 	"encoding/json"
@@ -41,6 +42,17 @@ func testEnvelopeResult[T any](t *testing.T, raw []byte, err error) T {
 func testHost(t *testing.T, fn func(string, any) (json.RawMessage, error)) {
 	t.Helper()
 	t.Cleanup(setHostCall(fn))
+	previous, _ := auxiliaryDoSlot.Load().(auxiliaryDoFunc)
+	auxiliaryDoSlot.Store(auxiliaryDoFunc(func(ctx context.Context, cfg *Config, method, endpoint string, headers map[string]string, body []byte) (*hostHTTPResponse, error) {
+		raw, err := fn("host.http.do", map[string]any{"method": method, "url": endpoint, "headers": toHeaderMap(headers), "body": body})
+		if err != nil {
+			return nil, err
+		}
+		var resp hostHTTPResponse
+		err = json.Unmarshal(raw, &resp)
+		return &resp, err
+	}))
+	t.Cleanup(func() { auxiliaryDoSlot.Store(previous) })
 }
 
 func TestCredentialPersistReloadAndRenew(t *testing.T) {

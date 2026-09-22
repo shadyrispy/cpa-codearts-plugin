@@ -90,15 +90,11 @@ func fetchBenefitBalance(cfg *Config, cred *credential, callbackIDs ...string) (
 		return benefitBalance{}, fmt.Errorf("benefit balance requires a cancellable management request")
 	}
 	endpoint := strings.TrimRight(cfg.BenefitGatewayURL, "/") + epBenefitBalance
-	headers := map[string]string{
-		"Accept":      "application/json",
-		"X-Language":  cfg.Language,
-		"plugin-name": cfg.PluginName,
-	}
-	if cfg.PluginVersion != "" {
-		headers["plugin-version"] = cfg.PluginVersion
-	}
-	signed, errSign := signRequest(http.MethodGet, endpoint, headers, nil, cred, cfg.SignHost)
+	// Developer gateway is not the regional activity service. Match the official
+	// host/date/STS signature without X-Domain-Id or extra regional headers.
+	copyCred := *cred
+	copyCred.DomainID = ""
+	signed, errSign := signRequest(http.MethodGet, endpoint, nil, nil, &copyCred, true)
 	if errSign != nil {
 		return benefitBalance{}, fmt.Errorf("sign benefit balance request: %w", errSign)
 	}
