@@ -48,20 +48,92 @@ type quotaSnapshot struct {
 	// ResetDate is the upstream quota reset date ("end_date").
 	ResetDate string `json:"reset_date"`
 
-	// CodeCompletionsPercent and ChatMessagesPercent are the consumed
-	// percentages the extension displays as progress bars.
-	CodeCompletionsPercent float64 `json:"code_completions_percent"`
-	ChatMessagesPercent    float64 `json:"chat_messages_percent"`
-	ShowCodeCompletions    bool    `json:"show_code_completions"`
-	ShowChatMessages       bool    `json:"show_chat_messages"`
+	// Meters are the usage rows the upstream both reports and asks to display.
+	// A retired or unknown field is absent from this list rather than present
+	// with a zero: the gateway signals "not reported" with a negative value and
+	// marks fields it no longer shows with show:false, and rendering either as
+	// 0% would tell the operator that nothing has been used.
+	Meters []quotaMeter `json:"meters,omitempty"`
 
 	// Features is the upstream feature enablement map.
 	Features map[string]bool `json:"features"`
+
+	// Benefit is the limited-time daily token pool from the benefit gateway. It
+	// is separate from the subscription meters above: a benefit model can be
+	// exhausted while every subscription meter still reads zero.
+	Benefit *benefitBalance `json:"benefit,omitempty"`
+	// BenefitError records a failed benefit allowance lookup without discarding
+	// the subscription snapshot that did succeed.
+	BenefitError string `json:"benefit_error,omitempty"`
 
 	// FetchedAt is when this snapshot was taken.
 	FetchedAt time.Time `json:"fetched_at"`
 	// Error records the last fetch failure for this account, if any.
 	Error string `json:"error,omitempty"`
+}
+
+// quotaMeter is one displayable usage metric from
+// /snap-manager/v1/statistics/plugin.
+//
+// Upstream migrates metric names instead of deprecating them: the message-count
+// row was retired (usageDataChatMessages, now show:false with a negative value)
+// and its replacement reports tokens (usageTokenChatMessages with
+// usage_token_num/package_token_amount). Every metric is parsed generically, so
+// the next rename shows up as an extra row with its raw name instead of
+// disappearing from the dashboard.
+type quotaMeter struct {
+	Name  string `json:"name"`
+	Label string `json:"label"`
+	// UsedPercent is the consumed share the upstream itself displays, or nil when
+	// the upstream has no value to report.
+	UsedPercent     *float64 `json:"used_percent,omitempty"`
+	UsedTokens      int64    `json:"used_tokens,omitempty"`
+	AllowanceTokens int64    `json:"allowance_tokens,omitempty"`
+}
+
+// quotaMeterLabels localises known metric names; anything else keeps the raw
+// name, which is still more useful than hiding it.
+var quotaMeterLabels = map[string]string{
+	"usageDataCodeCompletions":   "代码补全额度",
+	"usageDataChatMessages":      "对话消息额度",
+	"usageTokenChatMessages":     "对话 token 额度",
+	"usageTotalPackageCredit":    "套餐积分",
+	"usageBasicPackageCredit":    "基础包积分",
+	"usageOnDemandPackageCredit": "按需付费积分",
+	"usageBonusPackageCredit":    "赠送积分",
+}
+
+// remainingFraction converts a meter into the host's "remaining fraction" model.
+// It reports false when the meter carries no usable ratio, so an unknown value is
+// skipped instead of being advertised as a full bucket.
+func (m quotaMeter) remainingFraction() (float64, bool) {
+	if m.UsedPercent == nil {
+		return 0, false
+	}
+	used := *m.UsedPercent
+	if used < 0 {
+		return 0, false
+	}
+	if used > 100 {
+		used = 100
+	}
+	return (100 - used) / 100, true
+}
+
+// Describe renders the host-facing description. The metric name is used rather
+// than the localised label because the host surface is not language-specific.
+func (m quotaMeter) Describe() string {
+	if m.UsedPercent == nil {
+		if m.AllowanceTokens > 0 {
+			return fmt.Sprintf("%s: %d of %d tokens", m.Name, m.UsedTokens, m.AllowanceTokens)
+		}
+		return fmt.Sprintf("%s reported without a percentage", m.Name)
+	}
+	text := fmt.Sprintf("%s used: %.1f%%", m.Name, *m.UsedPercent)
+	if m.AllowanceTokens > 0 || m.UsedTokens > 0 {
+		text += fmt.Sprintf(" (%d of %d tokens)", m.UsedTokens, m.AllowanceTokens)
+	}
+	return text
 }
 
 // quotaCache holds the most recent snapshot per auth index. The scheduled
@@ -175,6 +247,19 @@ func fetchQuotaSnapshot(authIndex string, cred *credential) (quotaSnapshot, erro
 	if cred != nil {
 		snapshot.Label = firstNonEmptyString(cred.UserName, cred.UserID)
 	}
+	// Read on every refresh, including the partial-failure path: the daily benefit
+	// pool is the quota that actually runs out mid-day, so a stale value would be
+	// the most misleading thing to keep showing. A failure here is recorded on the
+	// snapshot rather than failing the refresh, because the subscription meters
+	// above are still valid answers.
+	if cfg.APIMode != "native" {
+		balance, errBenefit := fetchBenefitBalance(cfg, cred)
+		if errBenefit != nil {
+			snapshot.BenefitError = errBenefit.Error()
+		} else {
+			snapshot.Benefit = &balance
+		}
+	}
 	quotas.put(snapshot)
 	return snapshot, nil
 }
@@ -185,9 +270,11 @@ type statisticsResponse struct {
 	Show *statisticsShow `json:"show"`
 	End  string          `json:"end_date"`
 	Metr []struct {
-		Name  string  `json:"name"`
-		Value float64 `json:"value"`
-		Show  bool    `json:"show"`
+		Name             string  `json:"name"`
+		Value            float64 `json:"value"`
+		UsageTokenNum    int64   `json:"usage_token_num"`
+		PackageTokenAmnt int64   `json:"package_token_amount"`
+		Show             bool    `json:"show"`
 	} `json:"metrics"`
 	Package *struct {
 		SpecCode      string `json:"spec_code"`
@@ -217,14 +304,28 @@ func parseQuotaSnapshot(body []byte) (quotaSnapshot, error) {
 		Features:  map[string]bool{},
 	}
 	for _, metric := range parsed.Metr {
-		switch metric.Name {
-		case "usageDataCodeCompletions":
-			snapshot.CodeCompletionsPercent = metric.Value
-			snapshot.ShowCodeCompletions = metric.Show
-		case "usageDataChatMessages":
-			snapshot.ChatMessagesPercent = metric.Value
-			snapshot.ShowChatMessages = metric.Show
+		if strings.TrimSpace(metric.Name) == "" || !metric.Show {
+			// show:false is the upstream instruction not to display this row; the
+			// retired message-count metric arrives that way with value -1.
+			continue
 		}
+		meter := quotaMeter{
+			Name:            metric.Name,
+			Label:           quotaMeterLabels[metric.Name],
+			UsedTokens:      metric.UsageTokenNum,
+			AllowanceTokens: metric.PackageTokenAmnt,
+		}
+		if meter.Label == "" {
+			meter.Label = metric.Name
+		}
+		if metric.Value >= 0 {
+			value := metric.Value
+			meter.UsedPercent = &value
+		}
+		if meter.UsedPercent == nil && meter.UsedTokens == 0 && meter.AllowanceTokens == 0 {
+			continue // nothing to show
+		}
+		snapshot.Meters = append(snapshot.Meters, meter)
 	}
 	if parsed.Package != nil {
 		snapshot.Plan = parsed.Package.SpecCode
@@ -322,23 +423,28 @@ func toQuotaFetchResponse(snapshot quotaSnapshot) pluginapi.QuotaFetchResponse {
 	}
 
 	var buckets []pluginapi.QuotaBucket
-	// The upstream reports consumption percentage, while the host models a
-	// "remaining fraction", so the value is inverted. A negative upstream value
-	// means "not reported" and is skipped.
-	if snapshot.ShowCodeCompletions || snapshot.CodeCompletionsPercent > 0 {
+	// The upstream reports consumption while the host models a "remaining
+	// fraction". A meter without a ratio of its own is skipped rather than
+	// reported as a full bucket.
+	for _, meter := range snapshot.Meters {
+		fraction, ok := meter.remainingFraction()
+		if !ok {
+			continue
+		}
 		buckets = append(buckets, pluginapi.QuotaBucket{
 			Window:            "quota-period",
-			RemainingFraction: usedPercentToRemaining(snapshot.CodeCompletionsPercent),
+			RemainingFraction: fraction,
 			ResetTime:         snapshot.ResetDate,
-			Description:       fmt.Sprintf("Code completions used: %.1f%%", snapshot.CodeCompletionsPercent),
+			Description:       meter.Describe(),
 		})
 	}
-	if snapshot.ShowChatMessages || snapshot.ChatMessagesPercent > 0 {
+	if snapshot.Benefit != nil && snapshot.Benefit.DailyTokenLimit > 0 {
+		used := snapshot.Benefit.DailyPercent()
 		buckets = append(buckets, pluginapi.QuotaBucket{
-			Window:            "quota-period",
-			RemainingFraction: usedPercentToRemaining(snapshot.ChatMessagesPercent),
-			ResetTime:         snapshot.ResetDate,
-			Description:       fmt.Sprintf("Chat messages used: %.1f%%", snapshot.ChatMessagesPercent),
+			Window:            "1d",
+			RemainingFraction: usedPercentToRemaining(used),
+			Description: fmt.Sprintf("Benefit tokens used: %.1f%% (%d of %d daily tokens)",
+				used, snapshot.Benefit.DailyTokensUsed, snapshot.Benefit.DailyTokenLimit),
 		})
 	}
 	if len(buckets) > 0 {
@@ -347,9 +453,30 @@ func toQuotaFetchResponse(snapshot quotaSnapshot) pluginapi.QuotaFetchResponse {
 		}
 	}
 
-	response.Summary = []pluginapi.QuotaMetric{
-		{Key: "code_completions_used_percent", Label: "Code completions used (%)", Value: snapshot.CodeCompletionsPercent, Unit: "percent"},
-		{Key: "chat_messages_used_percent", Label: "Chat messages used (%)", Value: snapshot.ChatMessagesPercent, Unit: "percent"},
+	response.Summary = []pluginapi.QuotaMetric{}
+	for _, meter := range snapshot.Meters {
+		if meter.UsedPercent != nil {
+			response.Summary = append(response.Summary, pluginapi.QuotaMetric{
+				Key: strings.ToLower(meter.Name) + "_used_percent",
+				// The host shows the key when no label fits, so keep the metric name.
+				Label: meter.Name + " used (%)", Value: *meter.UsedPercent, Unit: "percent",
+			})
+		}
+		if meter.UsedTokens > 0 || meter.AllowanceTokens > 0 {
+			response.Summary = append(response.Summary, pluginapi.QuotaMetric{
+				Key: strings.ToLower(meter.Name) + "_used_tokens", Label: meter.Name + " used (tokens)",
+				Value: float64(meter.UsedTokens), Unit: "tokens",
+			})
+		}
+	}
+	// Only a capped pool gets summary metrics: a "limit 0" reads as exhausted to
+	// the host, while it actually means this account has no daily cap. The panel
+	// still shows the raw counters for that case from /accounts.
+	if snapshot.Benefit != nil && snapshot.Benefit.DailyTokenLimit > 0 {
+		response.Summary = append(response.Summary,
+			pluginapi.QuotaMetric{Key: "benefit_daily_tokens_used", Label: "Benefit tokens used today", Value: float64(snapshot.Benefit.DailyTokensUsed), Unit: "tokens"},
+			pluginapi.QuotaMetric{Key: "benefit_daily_token_limit", Label: "Benefit daily token limit", Value: float64(snapshot.Benefit.DailyTokenLimit), Unit: "tokens"},
+		)
 	}
 	if snapshot.ResetDate != "" {
 		response.Summary = append(response.Summary, pluginapi.QuotaMetric{

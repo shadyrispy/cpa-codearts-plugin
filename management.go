@@ -350,15 +350,18 @@ type accountView struct {
 	LoginType string `json:"login_type"`
 	ExpiresAt string `json:"expires_at"`
 
-	Plan                   string  `json:"plan,omitempty"`
-	PlanName               string  `json:"plan_name,omitempty"`
-	PlanURL                string  `json:"plan_url,omitempty"`
-	ResetDate              string  `json:"reset_date,omitempty"`
-	CodeCompletionsPercent float64 `json:"code_completions_percent"`
-	ChatMessagesPercent    float64 `json:"chat_messages_percent"`
-	Features               any     `json:"features,omitempty"`
-	QuotaFetchedAt         string  `json:"quota_fetched_at,omitempty"`
-	QuotaError             string  `json:"quota_error,omitempty"`
+	Plan      string       `json:"plan,omitempty"`
+	PlanName  string       `json:"plan_name,omitempty"`
+	PlanURL   string       `json:"plan_url,omitempty"`
+	ResetDate string       `json:"reset_date,omitempty"`
+	Meters    []quotaMeter `json:"meters,omitempty"`
+	Features  any          `json:"features,omitempty"`
+	// Benefit is the limited-time daily token pool, reported next to the
+	// subscription meters because it is accounted separately upstream.
+	Benefit        *benefitBalance `json:"benefit,omitempty"`
+	BenefitError   string          `json:"benefit_error,omitempty"`
+	QuotaFetchedAt string          `json:"quota_fetched_at,omitempty"`
+	QuotaError     string          `json:"quota_error,omitempty"`
 
 	LastRefresh string `json:"last_refresh,omitempty"`
 	NextRefresh string `json:"next_refresh,omitempty"`
@@ -409,9 +412,10 @@ func codeartsAccounts() ([]accountView, error) {
 			view.PlanName = snapshot.PlanName
 			view.PlanURL = snapshot.PlanURL
 			view.ResetDate = snapshot.ResetDate
-			view.CodeCompletionsPercent = snapshot.CodeCompletionsPercent
-			view.ChatMessagesPercent = snapshot.ChatMessagesPercent
+			view.Meters = snapshot.Meters
 			view.Features = snapshot.Features
+			view.Benefit = snapshot.Benefit
+			view.BenefitError = snapshot.BenefitError
 			view.QuotaError = snapshot.Error
 			if !snapshot.FetchedAt.IsZero() {
 				view.QuotaFetchedAt = snapshot.FetchedAt.Format(time.RFC3339)
