@@ -109,8 +109,8 @@ const panelTemplate = `<!doctype html>
 
   <div class="card">
     <h2>授权</h2>
-    <label for="managementKey">CPA 管理密钥（仅保存在当前页面内存中，刷新后需重新输入）</label>
-    <input id="managementKey" type="password" autocomplete="off" placeholder="输入 CPA 管理密钥">
+    <label for="managementKey">CPA 管理密钥（从 CPA 主面板打开时自动获取；手动输入后本标签页记住，刷新不用再输）</label>
+    <input id="managementKey" type="password" autocomplete="off" placeholder="自动获取成功时可留空">
     <div class="bar" style="margin-top:10px">
       <button class="primary" id="login">开始授权</button>
       <button id="refresh">刷新状态</button>
@@ -165,16 +165,74 @@ const panelTemplate = `<!doctype html>
   var P = "__PROVIDER__";
   var BASE = "/v0/management/" + P;
 
-  // The management UI keeps the admin key in same-origin localStorage. Resource
-  // pages are not authenticated themselves, so privileged calls carry this key.
+  // Privileged calls carry the management key because the resource page itself
+  // is unauthenticated. Acquisition follows the CPA panel convention shared by
+  // the qoder/trae dashboards: a value typed here (remembered for the tab), the
+  // tab's sessionStorage, the same-origin CPA main panel store when embedded, or
+  // a one-time ?key= parameter. The previous key names ("apiKey", "adminKey", …)
+  // are never written by CPA, so automatic acquisition always missed.
+  var PANEL_STORE = "cli-proxy-auth";
+  var ENC_PREFIX = "enc::v1::";
+  var SECRET_SALT = "cli-proxy-api-webui::secure-storage";
+  var SS_KEY = P + "-mgmt-key";
+
+  function encBytes(text) { return new TextEncoder().encode(text); }
+  function xorBytes(data, key) {
+    var out = new Uint8Array(data.length);
+    for (var i = 0; i < data.length; i++) out[i] = data[i] ^ key[i % key.length];
+    return out;
+  }
+  function base64Bytes(text) {
+    var bin = window.atob(text);
+    var out = new Uint8Array(bin.length);
+    for (var i = 0; i < bin.length; i++) out[i] = bin.charCodeAt(i);
+    return out;
+  }
+  function deobfuscate(value) {
+    if (!value || value.indexOf(ENC_PREFIX) !== 0) return value;
+    try {
+      var key = encBytes(SECRET_SALT + "|" + window.location.host + "|" + window.navigator.userAgent);
+      return new TextDecoder().decode(xorBytes(base64Bytes(value.slice(ENC_PREFIX.length)), key));
+    } catch (e) { return value; }
+  }
+  function store(key, value) {
+    try { window.sessionStorage.setItem(key, value); } catch (e) {}
+  }
+  function recall(key) {
+    try { return window.sessionStorage.getItem(key); } catch (e) { return null; }
+  }
+  function embeddedKey() {
+    try { if (window.self === window.top) return null; } catch (e) { return null; }
+    var raw;
+    try { raw = window.localStorage.getItem(PANEL_STORE); } catch (e) { return null; }
+    if (!raw) return null;
+    try {
+      var parsed = JSON.parse(deobfuscate(raw));
+      var state = (parsed && parsed.state) || parsed || {};
+      return typeof state.managementKey === "string" && state.managementKey ? state.managementKey : null;
+    } catch (e) { return null; }
+  }
+  function urlKey() {
+    var match = /[?&]key=([^&]+)/.exec(window.location.search);
+    if (!match) return null;
+    var value = match[1];
+    try { value = decodeURIComponent(value); } catch (e) {}
+    // Drop the secret from the address bar and browser history.
+    window.history.replaceState(null, "", window.location.pathname);
+    return value || null;
+  }
+
   function adminKey() {
     var entered = document.getElementById("managementKey").value.trim();
-    if (entered) return entered;
-    var keys = ["apiKey", "api_key", "adminKey", "cliproxy_api_key", "cpa_api_key"];
-    for (var i = 0; i < keys.length; i++) {
-      var v = window.localStorage.getItem(keys[i]);
-      if (v) return v;
-    }
+    if (entered) { store(SS_KEY, entered); return entered; }
+    var remembered = recall(SS_KEY);
+    if (remembered) return remembered;
+    var embedded = embeddedKey();
+    if (embedded) return embedded;
+    // urlKey() erases ?key= from the address bar, so the value must be kept in
+    // sessionStorage here or later callers would read an empty query string.
+    var fromUrl = urlKey();
+    if (fromUrl) { store(SS_KEY, fromUrl); return fromUrl; }
     return "";
   }
 
@@ -216,6 +274,62 @@ const panelTemplate = `<!doctype html>
     });
   }
 
+  function tokenCount(n) {
+    var v = Number(n);
+    if (!isFinite(v)) return "?";
+    if (Math.abs(v) >= 1e8) return (v / 1e8).toFixed(2) + " 亿";
+    if (Math.abs(v) >= 1e4) return (v / 1e4).toFixed(1) + " 万";
+    return String(Math.round(v));
+  }
+
+  // The benefit pool is a separate upstream account from the meters above, and
+  // an uncapped dimension must not be drawn as an empty bar.
+  function benefitBlock(a) {
+    var b = a.benefit;
+    if (!b) {
+      return a.benefit_error ? '<div class="meta err">福利额度查询失败：' + esc(a.benefit_error) + '</div>' : "";
+    }
+    var limit = Number(b.daily_token_limit);
+    var used = Number(b.daily_tokens_used);
+    var capped = limit > 0;
+    var out = capped ? meter("福利每日 token", Math.min(used / limit * 100, 100)) : "";
+    var bits = [];
+    if (capped) {
+      var left = limit - used;
+      bits.push("今日 " + tokenCount(used) + " / " + tokenCount(limit) +
+        (left <= 0 ? "（今日已用尽，次日重新领取后恢复）" : "（剩 " + tokenCount(left) + "）"));
+    } else {
+      bits.push("今日已用 " + tokenCount(used) + "（无日上限）");
+    }
+    var monthLimit = Number(b.monthly_token_limit);
+    bits.push(monthLimit > 0
+      ? "本月 " + tokenCount(b.monthly_tokens_used) + " / " + tokenCount(monthLimit)
+      : "本月累计 " + tokenCount(b.monthly_tokens_used) + "（无月上限）");
+    out += '<div class="meta">' + bits.join(" · ") + '</div>';
+    if (a.benefit_error) out += '<div class="meta err">福利额度刷新失败：' + esc(a.benefit_error) + '</div>';
+    return out;
+  }
+
+  // Upstream decides which usage rows exist, so render what it reports instead of
+  // two hard-coded names: a renamed metric then still shows up rather than
+  // silently disappearing from the card.
+  function meterRows(a) {
+    return (a.meters || []).map(function (m) {
+      var label = m.label || m.name;
+      var has = m.used_percent !== undefined && m.used_percent !== null;
+      var out = has ? meter(label, Number(m.used_percent)) : "";
+      var bits = [];
+      if (!out) bits.push(label + "：上游未给出百分比");
+      var used = Number(m.used_tokens) || 0, allow = Number(m.allowance_tokens) || 0;
+      // An allowance below the usage is an upstream sentinel rather than a real
+      // cap (a trial row reports 1 token against 1408 used), so it is not drawn
+      // as a fraction the account has somehow exceeded.
+      if (allow > 0 && used <= allow) bits.push("token " + tokenCount(used) + " / " + tokenCount(allow));
+      else if (used > 0) bits.push("已用 " + tokenCount(used) + " token");
+      return out + (bits.length ? '<div class="meta">' + bits.map(esc).join(" · ") + '</div>' : "");
+    }).join("");
+  }
+
   function meter(label, pct) {
     if (pct === null || pct === undefined || pct < 0) return "";
     var v = Number(pct);
@@ -243,8 +357,8 @@ const panelTemplate = `<!doctype html>
       if (a.reset_date) bits.push("额度重置：" + esc(a.reset_date));
       return '<div class="acct"><div class="top"><span class="who">' + head + '</span>' + pill + '</div>' +
         (bits.length ? '<div class="meta">' + bits.join(" · ") + '</div>' : '') +
-        meter("代码补全额度", a.code_completions_percent) +
-        meter("对话消息额度", a.chat_messages_percent) +
+        meterRows(a) +
+        benefitBlock(a) +
         (a.quota_error ? '<div class="meta err">额度查询失败：' + esc(a.quota_error) + '</div>' : '') +
         '<div style="margin-top:9px"><button data-models="' + esc(a.auth_index) + '">查看账号模型</button></div>' +
         '<div data-model-list="' + esc(a.auth_index) + '" class="meta">模型列表从此账号的华为服务获取。</div>' +

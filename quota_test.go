@@ -3,6 +3,7 @@ package main
 import (
 	"encoding/json"
 	"net/http"
+	"strings"
 	"testing"
 
 	"github.com/router-for-me/CLIProxyAPI/v7/sdk/pluginapi"
@@ -40,14 +41,23 @@ func TestParseQuotaSnapshotMatchesUpstreamShape(t *testing.T) {
 	if errParse != nil {
 		t.Fatalf("parseQuotaSnapshot: %v", errParse)
 	}
-	if snapshot.CodeCompletionsPercent != 42.5 {
-		t.Errorf("code completions = %v, want 42.5", snapshot.CodeCompletionsPercent)
+	if len(snapshot.Meters) != 3 {
+		t.Fatalf("meters = %+v, want the two known rows plus an unknown one", snapshot.Meters)
 	}
-	if snapshot.ChatMessagesPercent != 7 {
-		t.Errorf("chat messages = %v, want 7", snapshot.ChatMessagesPercent)
+	byName := map[string]quotaMeter{}
+	for _, meter := range snapshot.Meters {
+		byName[meter.Name] = meter
 	}
-	if !snapshot.ShowCodeCompletions || !snapshot.ShowChatMessages {
-		t.Error("the show flags were not carried over")
+	if got := byName["usageDataCodeCompletions"]; got.UsedPercent == nil || *got.UsedPercent != 42.5 {
+		t.Errorf("code completions = %+v, want 42.5%%", got)
+	}
+	if got := byName["usageDataChatMessages"]; got.UsedPercent == nil || *got.UsedPercent != 7 {
+		t.Errorf("chat messages = %+v, want 7%%", got)
+	}
+	// An unrecognised metric is kept under its raw name rather than dropped, so a
+	// future upstream rename still reaches the dashboard.
+	if got, ok := byName["someOtherMetric"]; !ok || got.Label != "someOtherMetric" {
+		t.Errorf("unknown metric was dropped or localised wrongly: %+v (present=%v)", got, ok)
 	}
 	if snapshot.ResetDate != "2026-10-01" {
 		t.Errorf("reset date = %q, want 2026-10-01", snapshot.ResetDate)
@@ -77,8 +87,8 @@ func TestParseQuotaSnapshotToleratesPartialResponses(t *testing.T) {
 		if errParse != nil {
 			t.Fatalf("parseQuotaSnapshot(%s): %v", body, errParse)
 		}
-		if snapshot.CodeCompletionsPercent != 0 {
-			t.Errorf("body %s: percent = %v, want 0", body, snapshot.CodeCompletionsPercent)
+		if len(snapshot.Meters) != 0 {
+			t.Errorf("body %s: invented meters: %+v", body, snapshot.Meters)
 		}
 	}
 	if _, errParse := parseQuotaSnapshot([]byte("not json")); errParse == nil {
@@ -108,14 +118,15 @@ func TestUsedPercentToRemaining(t *testing.T) {
 // TestToQuotaFetchResponseShape verifies the mapped response satisfies the
 // host's expected quota schema, including the subscription and reset time.
 func TestToQuotaFetchResponseShape(t *testing.T) {
+	eighty, twenty := 80.0, 20.0
 	snapshot := quotaSnapshot{
-		Plan:                   "snap.enterprise",
-		PlanName:               "Enterprise",
-		ResetDate:              "2026-10-01",
-		CodeCompletionsPercent: 80,
-		ChatMessagesPercent:    20,
-		ShowCodeCompletions:    true,
-		ShowChatMessages:       true,
+		Plan:      "snap.enterprise",
+		PlanName:  "Enterprise",
+		ResetDate: "2026-10-01",
+		Meters: []quotaMeter{
+			{Name: "usageDataCodeCompletions", Label: "代码补全额度", UsedPercent: &eighty},
+			{Name: "usageDataChatMessages", Label: "对话消息额度", UsedPercent: &twenty},
+		},
 	}
 	raw, errMarshal := json.Marshal(toQuotaFetchResponse(snapshot))
 	if errMarshal != nil {
@@ -334,5 +345,85 @@ func TestManagementRouteSuffix(t *testing.T) {
 		if got := managementRouteSuffix(input); got != want {
 			t.Errorf("managementRouteSuffix(%q) = %q, want %q", input, got, want)
 		}
+	}
+}
+
+// TestParseQuotaSnapshotFollowsTheMetricMigration uses the live document captured
+// on 2026-09-21, where the message-count row was retired in favour of a token
+// row. The old code read only the two retired names, so the dashboard showed no
+// chat allowance at all while upstream was reporting one.
+func TestParseQuotaSnapshotFollowsTheMetricMigration(t *testing.T) {
+	body := []byte(`{"metrics":[` +
+		`{"name":"usageDataChatMessages","value":-1,"usage_token_num":0,"package_token_amount":0,"show":false},` +
+		`{"name":"usageTokenChatMessages","value":0,"usage_token_num":2167,"package_token_amount":5000000,"show":true}` +
+		`],"start_date":"2026-09-02","end_date":"2026-10-03","package":{"spec_code":"codearts.agent.trial"}}`)
+
+	snapshot, errParse := parseQuotaSnapshot(body)
+	if errParse != nil {
+		t.Fatal(errParse)
+	}
+	if len(snapshot.Meters) != 1 {
+		t.Fatalf("meters = %+v, want only the displayed token row", snapshot.Meters)
+	}
+	meter := snapshot.Meters[0]
+	if meter.Name != "usageTokenChatMessages" || meter.Label != "对话 token 额度" {
+		t.Errorf("meter = %+v", meter)
+	}
+	if meter.UsedTokens != 2167 || meter.AllowanceTokens != 5000000 {
+		t.Errorf("token counters were lost: %+v", meter)
+	}
+	if meter.UsedPercent == nil || *meter.UsedPercent != 0 {
+		t.Errorf("used percent = %v, want a reported 0", meter.UsedPercent)
+	}
+}
+
+// TestParseQuotaSnapshotNeverInventsZero verifies the failure mode the migration
+// caused: an absent metric used to be reported as "0% used", which is a claim of
+// an untouched quota rather than the truth ("nothing was reported").
+func TestParseQuotaSnapshotNeverInventsZero(t *testing.T) {
+	// Only the retired row exists, and upstream marks it hidden.
+	snapshot, errParse := parseQuotaSnapshot([]byte(`{"metrics":[` +
+		`{"name":"usageDataChatMessages","value":-1,"show":false}]}`))
+	if errParse != nil {
+		t.Fatal(errParse)
+	}
+	if len(snapshot.Meters) != 0 {
+		t.Fatalf("hidden metric was displayed: %+v", snapshot.Meters)
+	}
+	response := toQuotaFetchResponse(snapshot)
+	for _, bucket := range response.Groups {
+		t.Fatalf("an unknown quota was advertised to the host: %+v", bucket)
+	}
+	for _, metric := range response.Summary {
+		if strings.Contains(strings.ToLower(metric.Key), "chat") {
+			t.Fatalf("summary invented a value: %+v", metric)
+		}
+	}
+}
+
+// TestQuotaMeterTokenCountersWithoutPercentage covers a metric that reports only
+// counters: it must reach the panel and the host as counters, and must not be
+// turned into a percentage the upstream never published.
+func TestQuotaMeterTokenCountersWithoutPercentage(t *testing.T) {
+	snapshot, errParse := parseQuotaSnapshot([]byte(`{"metrics":[` +
+		`{"name":"usageTokenSomethingNew","value":-1,"usage_token_num":30,"package_token_amount":100,"show":true}]}`))
+	if errParse != nil {
+		t.Fatal(errParse)
+	}
+	if len(snapshot.Meters) != 1 {
+		t.Fatalf("meters = %+v", snapshot.Meters)
+	}
+	meter := snapshot.Meters[0]
+	if meter.UsedPercent != nil {
+		t.Errorf("a negative value became a percentage: %v", *meter.UsedPercent)
+	}
+	if _, ok := meter.remainingFraction(); ok {
+		t.Error("a meter without a ratio must not be advertised as a bucket")
+	}
+	if !strings.Contains(meter.Describe(), "30 of 100 tokens") {
+		t.Errorf("Describe() = %q", meter.Describe())
+	}
+	if meter.Label != "usageTokenSomethingNew" {
+		t.Errorf("unknown metric lost its raw name: %q", meter.Label)
 	}
 }
