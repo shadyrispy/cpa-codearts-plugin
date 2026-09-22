@@ -5,6 +5,7 @@ import (
 	"os"
 	"path/filepath"
 	"testing"
+	"time"
 
 	"github.com/router-for-me/CLIProxyAPI/v7/sdk/pluginapi"
 )
@@ -76,5 +77,30 @@ func TestDailyTaskReservedIDRejected(t *testing.T) {
 	request, _ := json.Marshal(map[string]any{"config_yaml": []byte("schedule:\n  tasks:\n    - id: daily-benefit-claim\n      type: http\n")})
 	if _, err := parseConfig(request); err == nil {
 		t.Fatal("built-in ID may redirect a claim to a custom task")
+	}
+}
+
+func TestExplicitStateDirectorySurvivesAuthSpoolReset(t *testing.T) {
+	cfg, file, cred, calls := dailyClaimFixture(t)
+	cfg.StateDir = t.TempDir() // A separate volume, outside the recreated auth spool.
+	if resp := switchRequest(`{"enabled":false,"tasks":[{"id":"token-renew","enabled":false}]}`); resp.StatusCode != 200 {
+		t.Fatalf("save: %s", resp.Body)
+	}
+	now := time.Now()
+	if _, err := claimAccount(cfg, file, cred, now, true); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.RemoveAll(filepath.Dir(file.Path)); err != nil {
+		t.Fatal(err)
+	} // fixture-owned t.TempDir only
+	testHost(t, func(string, any) (json.RawMessage, error) { return json.RawMessage(`{"files":[]}`), nil })
+	fresh := defaultConfig()
+	fresh.StateDir = cfg.StateDir
+	installScheduledConfig(fresh)
+	if config().schedulePending || config().Schedule.Enabled || config().scheduleTasks()[0].isEnabled() {
+		t.Fatal("spool reset lost persistent switches")
+	}
+	if result, err := claimAccount(config(), file, cred, now.Add(time.Minute), true); err != nil || result != "already" || calls.Load() != 1 {
+		t.Fatal("spool reset lost successful claim")
 	}
 }

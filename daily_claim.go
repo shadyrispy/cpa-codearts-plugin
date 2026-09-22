@@ -36,14 +36,17 @@ type dailyClaimState struct {
 }
 
 func dailyClaimPath(cfg *Config, file pluginapi.HostAuthFileEntry, cred *credential) (string, error) {
-	if !filepath.IsAbs(file.Path) {
+	if cfg.StateDir == "" && !filepath.IsAbs(file.Path) {
 		return "", fmt.Errorf("账号缺少可持久化的认证文件路径")
 	}
 	// Account identity, not temporary keys: refreshes and duplicate logins must
 	// not cause a second claim. Fall back to the file name for imported AK/SK.
-	identity := firstNonEmptyString(cred.DomainID, cred.UserID, file.Name, filepath.Base(file.Path))
+	identity := firstNonEmptyString(cred.DomainID, cred.UserID, file.Name, file.AuthIndex)
+	if identity == "" {
+		return "", fmt.Errorf("账号缺少稳定标识，无法记录每日领取")
+	}
 	hash := sha256.Sum256([]byte(strings.TrimRight(cfg.BenefitGatewayURL, "/") + "\n" + identity))
-	return pluginStatePath(filepath.Dir(file.Path), fmt.Sprintf("daily-claim-%x.state", hash))
+	return cfg.statePath(filepath.Dir(file.Path), fmt.Sprintf("daily-claim-%x.state", hash))
 }
 
 func claimAccount(cfg *Config, file pluginapi.HostAuthFileEntry, cred *credential, now time.Time, manual bool) (string, error) {

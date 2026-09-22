@@ -169,6 +169,12 @@ plugins:
       daily_claim:
         enabled: false
 
+      # Database/object-store hosts may wipe their local auth spool on startup.
+      # Set an absolute, persistent directory OUTSIDE the spool on those hosts.
+      # Docker example with /data mounted: "/data/codearts-provider-state"
+      # Empty uses auth-dir/.codearts-provider-state (ordinary file-backed CPA).
+      state_dir: ""
+
       # Panel switches are persisted under auth-dir/.codearts-provider-state/
       # and override the corresponding YAML flags. No credentials are stored
       # there; keep this directory on persistent storage across container updates.

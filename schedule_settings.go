@@ -109,10 +109,10 @@ func installScheduledConfig(cfg *Config) {
 
 func restoreScheduledConfigLocked(cfg *Config) bool {
 	directory := authDir()
-	if !filepath.IsAbs(directory) {
+	if cfg.StateDir == "" && !filepath.IsAbs(directory) {
 		return false
 	}
-	path, err := pluginStatePath(directory, "schedule.state")
+	path, err := cfg.statePath(directory, "schedule.state")
 	if err != nil {
 		updated := *cfg
 		updated.schedulePending, updated.Schedule.Enabled, updated.scheduleStateError = false, false, err.Error()
@@ -175,7 +175,7 @@ func updateScheduleSwitches(change scheduleSwitchChange) pluginapi.ManagementRes
 	if change.Enabled == nil && len(change.Tasks) == 0 {
 		return errorJSON(400, "请指定要修改的开关")
 	}
-	path, err := pluginStatePath(authDir(), "schedule.state")
+	path, err := cfg.statePath(authDir(), "schedule.state")
 	if err != nil {
 		return errorJSON(409, err.Error())
 	}

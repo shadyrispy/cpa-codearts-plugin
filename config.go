@@ -3,6 +3,7 @@ package main
 import (
 	"encoding/json"
 	"fmt"
+	"path/filepath"
 	"strings"
 	"time"
 
@@ -102,7 +103,11 @@ type Config struct {
 	// schedules it internally; this block drives that scheduler.
 	Schedule ScheduleConfig `yaml:"schedule" json:"schedule"`
 	// DailyClaim is opt-in; manual claims remain available when disabled.
-	DailyClaim         DailyClaimConfig `yaml:"daily_claim" json:"daily_claim"`
+	DailyClaim DailyClaimConfig `yaml:"daily_claim" json:"daily_claim"`
+	// StateDir overrides auth-dir/.codearts-provider-state. Database/object
+	// stores may recreate their auth spool on startup; use a persistent directory
+	// outside that spool so switches and successful claims survive a restart.
+	StateDir           string `yaml:"state_dir" json:"state_dir"`
 	scheduleStatePath  string
 	scheduleStateError string
 	schedulePending    bool
@@ -289,6 +294,9 @@ func parseConfig(request []byte) (*Config, error) {
 		return nil, errUnmarshal
 	}
 	cfg.normalize()
+	if cfg.StateDir != "" && !filepath.IsAbs(cfg.StateDir) {
+		return nil, fmt.Errorf("state_dir must be an absolute persistent directory")
+	}
 	for _, task := range cfg.Schedule.Tasks {
 		if task.ID == dailyClaimTaskID || task.Type == TaskDailyClaim {
 			return nil, fmt.Errorf("daily-benefit-claim is built in; configure daily_claim.enabled instead of adding a task")
@@ -302,6 +310,7 @@ func (c *Config) normalize() {
 	if c == nil {
 		return
 	}
+	c.StateDir = strings.TrimSpace(c.StateDir)
 	c.BaseURL = strings.TrimRight(strings.TrimSpace(c.BaseURL), "/")
 	c.BenefitGatewayURL = strings.TrimRight(strings.TrimSpace(c.BenefitGatewayURL), "/")
 	c.WebLoginBase = strings.TrimRight(strings.TrimSpace(c.WebLoginBase), "/")

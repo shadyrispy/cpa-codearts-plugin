@@ -243,6 +243,8 @@ func TestCPAIntegration(t *testing.T) {
 	const staticModelConfig = "      model_map: {audit-model: GLM-5.2}\n      models: [{id: audit-model, display_name: Audit alias}]\n"
 	const benefitModelConfig = "      benefit_models:\n        - {id: deepseek-v4-flash-0731, display_name: deepseek-v4-flash-0731, context_length: 1048576, max_output_tokens: 393216}\n        - {id: deepseek-v4-pro-0813, display_name: deepseek-v4-pro-0813, context_length: 1048576, max_output_tokens: 393216}\n        - {id: glm-5.3-flash, display_name: glm-5.3-flash, context_length: 1048576, max_output_tokens: 131072}\n"
 	configYAML := fmt.Sprintf("host: 127.0.0.1\nport: %d\nauth-dir: %q\napi-keys: [audit-client]\nremote-management:\n  allow-remote: false\n  secret-key: audit-admin\n  disable-control-panel: true\nrequest-retry: 0\nplugins:\n  enabled: true\n  dir: %q\n  configs:\n    codearts-provider:\n      enabled: true\n      base_url: %q\n      benefit_gateway_url: %q\n      oauth_token_url: %q\n      discover_models: true\n", port, filepath.ToSlash(authDir), filepath.ToSlash(pluginDir), upstream.URL, upstream.URL, upstream.URL+"/v1/oauth2/tokens") + benefitModelConfig + staticModelConfig
+	stateDir := filepath.Join(dir, "persistent-state")
+	configYAML += fmt.Sprintf("      state_dir: %q\n", filepath.ToSlash(stateDir))
 	if err = os.WriteFile(configPath, []byte(configYAML), 0600); err != nil {
 		t.Fatal(err)
 	}
@@ -825,7 +827,7 @@ func TestCPAIntegration(t *testing.T) {
 	dailyClaimFail.Store(false)
 	// Age ONLY fixture attempt records to make a retry eligible without a real
 	// ten-minute delay. Production code never exposes a force/retry bypass.
-	statePaths, _ := filepath.Glob(filepath.Join(authDir, pluginStateDir, "daily-claim-*.state"))
+	statePaths, _ := filepath.Glob(filepath.Join(stateDir, "daily-claim-*.state"))
 	if len(statePaths) == 0 {
 		t.Fatal("claim attempt was not persisted")
 	}

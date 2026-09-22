@@ -15,6 +15,20 @@ func pluginStatePath(authDirectory, name string) (string, error) {
 		return "", fmt.Errorf("无法确定认证目录，请先添加账号后重试")
 	}
 	dir := filepath.Join(authDirectory, pluginStateDir)
+	return statePathInDirectory(dir, name)
+}
+
+func (c *Config) statePath(authDirectory, name string) (string, error) {
+	if c.StateDir != "" {
+		return statePathInDirectory(c.StateDir, name)
+	}
+	return pluginStatePath(authDirectory, name)
+}
+
+func statePathInDirectory(dir, name string) (string, error) {
+	if !filepath.IsAbs(dir) {
+		return "", fmt.Errorf("state_dir 必须是绝对路径")
+	}
 	info, err := os.Lstat(dir)
 	if err != nil && !os.IsNotExist(err) {
 		return "", fmt.Errorf("无法读取插件状态目录")

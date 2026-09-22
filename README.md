@@ -339,10 +339,17 @@ six attempts per account per Beijing day. A newly added account is picked up at
 the next check. Disabled/foreign accounts are excluded; quota-exhausted accounts
 remain eligible. Credentials are refreshed before use when needed.
 
-Attempt/success records live in `auth-dir/.codearts-provider-state/` as hashed
+Attempt/success records default to `auth-dir/.codearts-provider-state/` as hashed
 `daily-claim-*.state` files, independent of credential JSON, with no keys, tokens,
 or raw responses. Unreadable, corrupt or unwritable state prevents a claim.
-Keep this directory on persistent storage. Deduplication is per plugin process
+Keep this directory on persistent storage. **Database/object-store deployments:**
+CPA may clear and rebuild its auth spool during startup, even on a persistent
+volume. In v0.1.15+, set an absolute `state_dir` **outside** that spool, e.g.
+`state_dir: /data/codearts-provider-state` with `/data` mounted persistently.
+This directory then holds both `schedule.state` and `daily-claim-*.state`.
+Changing directories does not migrate existing records; stop CPA and copy them
+to the new directory before restarting if you already have saved state.
+Deduplication is per plugin process
 plus its durable ledger: do not run multiple CPA instances against the same
 directory. A process crash after upstream acceptance but before local success
 is saved can produce a later retry; this is not an exactly-once guarantee.
@@ -514,8 +521,9 @@ To return entirely to YAML defaults, stop CPA and back up/move only `schedule.st
 leaving `daily-claim-*.state` intact. Missing accounts mean the directory is unknown:
 add an account before saving; cron waits until it can restore the saved state.
 A corrupt state file pauses automatic tasks and displays an error, rather than
-silently re-enabling them. Docker must persist this auth directory, including when
-credentials themselves use a database backend.
+silently re-enabling them. Docker must persist the selected state directory.
+With a database backend, configure `state_dir` outside the host's disposable
+auth spool as described above.
 
 ### Dashboard
 
