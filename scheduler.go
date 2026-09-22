@@ -356,6 +356,9 @@ func runQuotaRefreshTask() error {
 			lastErr = errFetch
 			continue
 		}
+		// This window is where the benefit catalogue gets confirmed: it already
+		// reads the account's benefit balance, and it is off every request path.
+		refreshAccountBenefitCatalogue(file.AuthIndex, cred)
 		refreshed++
 	}
 	if refreshed == 0 && lastErr != nil {
@@ -621,6 +624,11 @@ func renewCredential(cred *credential) error {
 func persistRenewedCredential(previous, updated *credential) error {
 	if previous == nil || updated == nil || !updated.valid() {
 		return fmt.Errorf("refreshed credential is incomplete")
+	}
+	if updated.BenefitCatalogue == nil {
+		// A renew response only describes tokens, so carry the remembered benefit
+		// catalogue across; dropping it would hide those models again on restart.
+		updated.BenefitCatalogue = previous.BenefitCatalogue
 	}
 	storage, errMarshal2 := json.Marshal(map[string]any{storageKey: *updated})
 	if errMarshal2 != nil {

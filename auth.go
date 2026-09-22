@@ -870,17 +870,30 @@ func credentialFromStorage(storage []byte) (*credential, error) {
 		}
 		oauthContext = &parsed
 	}
+	var catalogue *benefitCatalogueSnapshot
+	if rawCatalogue, ok := document["benefit_catalogue"]; ok && rawCatalogue != nil {
+		encoded, errMarshal := json.Marshal(rawCatalogue)
+		if errMarshal != nil {
+			return nil, fmt.Errorf("encode benefit catalogue: %w", errMarshal)
+		}
+		var parsed benefitCatalogueSnapshot
+		if errUnmarshal := json.Unmarshal(encoded, &parsed); errUnmarshal != nil {
+			return nil, fmt.Errorf("decode benefit catalogue: %w", errUnmarshal)
+		}
+		catalogue = &parsed
+	}
 	return &credential{
-		AccessKeyID:     firstString(document, "access_key_id", "accessKeyId", "ak"),
-		SecretAccessKey: firstString(document, "secret_access_key", "secretAccessKey", "sk"),
-		SecurityToken:   firstString(document, "security_token", "securityToken", "accessToken"),
-		DomainID:        firstString(document, "domain_id", "domainId", "X-Domain-Id"),
-		UserName:        firstString(document, "user_name", "userName"),
-		UserID:          firstString(document, "user_id", "userId"),
-		ExpiresAt:       firstString(document, "expires_at", "expiresAt"),
-		LoginType:       firstString(document, "login_type", "loginType"),
-		RefreshToken:    firstString(document, "refresh_token", "refreshToken"),
-		OAuthContext:    oauthContext,
+		AccessKeyID:      firstString(document, "access_key_id", "accessKeyId", "ak"),
+		SecretAccessKey:  firstString(document, "secret_access_key", "secretAccessKey", "sk"),
+		SecurityToken:    firstString(document, "security_token", "securityToken", "accessToken"),
+		DomainID:         firstString(document, "domain_id", "domainId", "X-Domain-Id"),
+		UserName:         firstString(document, "user_name", "userName"),
+		UserID:           firstString(document, "user_id", "userId"),
+		ExpiresAt:        firstString(document, "expires_at", "expiresAt"),
+		LoginType:        firstString(document, "login_type", "loginType"),
+		RefreshToken:     firstString(document, "refresh_token", "refreshToken"),
+		OAuthContext:     oauthContext,
+		BenefitCatalogue: catalogue,
 	}, nil
 }
 

@@ -555,6 +555,9 @@ func handleQuotaRefresh(req pluginapi.ManagementRequest) pluginapi.ManagementRes
 			errorsSeen = append(errorsSeen, file.AuthIndex+": "+errFetch.Error())
 			continue
 		}
+		// The panel's refresh is the operator-facing equivalent of the scheduled
+		// account refresh, so it confirms the benefit catalogue the same way.
+		refreshAccountBenefitCatalogue(file.AuthIndex, cred)
 		refreshed++
 	}
 	body, _ := json.Marshal(map[string]any{

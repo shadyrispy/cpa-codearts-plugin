@@ -48,6 +48,9 @@ type credential struct {
 	LoginType       string             `json:"login_type"`
 	RefreshToken    string             `json:"refresh_token,omitempty"`
 	OAuthContext    *oauthLoginContext `json:"oauth_context,omitempty"`
+	// BenefitCatalogue carries the last benefit model list confirmed for this
+	// account so the models survive a restart. See benefitCatalogueSnapshot.
+	BenefitCatalogue *benefitCatalogueSnapshot `json:"benefit_catalogue,omitempty"`
 }
 
 func (c *credential) valid() bool {

@@ -47,6 +47,24 @@ var modelCatalogFlights = struct {
 	entries map[string]*modelCatalogFlight
 }{entries: make(map[string]*modelCatalogFlight)}
 
+// benefitCatalogueSnapshot is the last benefit model list the plugin confirmed
+// for one account, kept inside the plugin-owned part of the credential.
+//
+// CPA asks for plugin models on its cold-start registration path, and the
+// benefit gateway must not be contacted there: a slow answer makes the host drop
+// the whole registration, which is worse than losing the optional models. That
+// leaves the time-limited benefit models invisible after every restart until an
+// operator opens the management route by hand. Replaying the previous list needs
+// no network at all, so the cold path stays bounded.
+type benefitCatalogueSnapshot struct {
+	FetchedAt time.Time     `json:"fetched_at"`
+	Models    []ModelConfig `json:"models"`
+}
+
+// benefitCatalogueRevalidate bounds how long a confirmed list is treated as
+// current before another background read is attempted.
+var benefitCatalogueRevalidate = 6 * time.Hour
+
 func modelsForAuth(raw []byte) ([]byte, error) {
 	var req struct {
 		pluginapi.AuthModelRequest
@@ -71,7 +89,8 @@ func modelsForAuth(raw []byte) ([]byte, error) {
 	}
 	// CPA calls this on its cold-start registration path. Keep that path free of
 	// the optional benefit gateway: a slow request there must never hide working
-	// Agent Center models. Operator-confirmed benefit_models are still merged by
+	// Agent Center models. Operator-confirmed benefit_models and the list the
+	// scheduled account refresh left on this credential are still merged by
 	// accountAgentModelCatalog without network I/O.
 	catalog := accountAgentModelCatalog(config(), cred, req.HostCallbackID)
 	if len(catalog.Warnings) > 0 {
@@ -103,20 +122,14 @@ func accountModelCatalogScoped(cfg *Config, cred *credential, callbackID string,
 				result = discoverModelCatalog(cfg, cred, callbackID)
 			} else {
 				result = discoverAgentModelCatalog(cfg, cred, callbackID)
-				// A successful explicit management refresh may have populated the
-				// full cache. Reuse only its already-fetched benefit entries; never
-				// perform benefit network I/O on this critical path.
-				if full, ok := cachedModelCatalog(modelCatalogCacheKey(cfg, cred, "full")); ok {
-					seen := make(map[string]bool, len(result.Models))
-					for _, model := range result.Models {
-						seen[model.ID] = true
-					}
-					for _, model := range full.Models {
-						if model.Source == "benefit" && !seen[model.ID] {
-							seen[model.ID] = true
-							result.Models = append(result.Models, model)
-						}
-					}
+				// Replay benefit entries that are already known: either this process
+				// fetched them (an explicit management refresh or a background warm
+				// filled the full cache), or a previous process confirmed them and
+				// left the list on the credential. Neither source performs benefit
+				// network I/O on this critical path.
+				result = mergeBenefitModels(result, cachedBenefitModels(cfg, cred))
+				if cred.BenefitCatalogue != nil {
+					result = mergeBenefitModels(result, cred.BenefitCatalogue.Models)
 				}
 			}
 		} else {
@@ -191,11 +204,20 @@ func discoverAccountModels(cfg *Config, cred *credential, callbackID string) ([]
 // Cache entries are isolated by the full discovery configuration and credential,
 // including rotated tokens. Only hashes are retained as keys.
 func modelCatalogCacheKey(cfg *Config, cred *credential, scope string) string {
+	// The replayed benefit list is not part of what a catalogue describes, so a
+	// credential whose list was just refreshed must keep hitting the cached agent
+	// catalogues instead of refetching them.
+	target := cred
+	if cred != nil {
+		plain := *cred
+		plain.BenefitCatalogue = nil
+		target = &plain
+	}
 	data, _ := json.Marshal(struct {
 		Config     *Config
 		Credential *credential
 		Scope      string
-	}{cfg, cred, scope})
+	}{cfg, target, scope})
 	return sha256Hex(data)
 }
 
@@ -232,6 +254,160 @@ func storeModelCatalog(key string, result modelCatalogResult) {
 		discoveredModels.entries[key] = modelCacheEntry{catalog: cloneModelCatalog(result), expires: now.Add(ttl)}
 	}
 	discoveredModels.Unlock()
+}
+
+// cachedBenefitModels returns the benefit entries a live read already fetched for
+// this account, or nothing when that read has not happened or has expired.
+func cachedBenefitModels(cfg *Config, cred *credential) []ModelConfig {
+	full, ok := cachedModelCatalog(modelCatalogCacheKey(cfg, cred, "full"))
+	if !ok {
+		return nil
+	}
+	models := make([]ModelConfig, 0, len(full.Models))
+	for _, model := range full.Models {
+		if model.Source == "benefit" {
+			models = append(models, model)
+		}
+	}
+	return models
+}
+
+// mergeBenefitModels adds the benefit entries the agent catalogues do not carry,
+// and keeps the benefit route for names both sides list.
+func mergeBenefitModels(result modelCatalogResult, benefit []ModelConfig) modelCatalogResult {
+	seen := make(map[string]bool, len(result.Models)+len(benefit))
+	for _, model := range result.Models {
+		seen[model.ID] = true
+	}
+	for _, model := range benefit {
+		if model.ID == "" || seen[model.ID] {
+			continue
+		}
+		seen[model.ID] = true
+		model.Source = "benefit"
+		result.Models = append(result.Models, model)
+	}
+	return result
+}
+
+// refreshAccountBenefitCatalogue confirms the benefit list while an account is
+// being refreshed — a place where the optional gateway cannot delay anything a
+// client waits for. A failure is logged only: the refresh itself succeeded.
+func refreshAccountBenefitCatalogue(authIndex string, cred *credential) {
+	if errConfirm := confirmBenefitCatalogue(config(), authIndex, cred, time.Now()); errConfirm != nil {
+		logWarn("benefit catalogue refresh failed", map[string]any{
+			"auth_index": authIndex, "error": errConfirm.Error(),
+		})
+	}
+}
+
+// benefitCatalogueStale reports whether this account should confirm its benefit
+// list again. Live benefit discovery has to be switched on to know anything, so
+// every gate that guards the live read also guards the refresh.
+func benefitCatalogueStale(cfg *Config, cred *credential, now time.Time) bool {
+	if cfg == nil || !cfg.DiscoverModels || cfg.APIMode == "native" || strings.TrimSpace(cfg.BenefitGatewayURL) == "" {
+		return false
+	}
+	if !cred.valid() {
+		return false
+	}
+	if cred.BenefitCatalogue == nil || len(cred.BenefitCatalogue.Models) == 0 {
+		return true
+	}
+	return now.Sub(cred.BenefitCatalogue.FetchedAt) >= benefitCatalogueRevalidate
+}
+
+// confirmBenefitCatalogue reads the live benefit list for one account and leaves
+// it on the credential, so the next registration (and every restart after that)
+// can advertise those models without ever putting a benefit request on a
+// critical path. It runs from the scheduled account refresh, never from a
+// registration reply. An unsuccessful read keeps the previous list.
+func confirmBenefitCatalogue(cfg *Config, authIndex string, cred *credential, now time.Time) error {
+	if !benefitCatalogueStale(cfg, cred, now) {
+		return nil
+	}
+	full := discoverModelCatalog(cfg, cred, "")
+	benefit := make([]ModelConfig, 0, len(full.Models))
+	for _, model := range full.Models {
+		if model.Source == "benefit" {
+			benefit = append(benefit, model)
+		}
+	}
+	if len(benefit) == 0 {
+		if len(full.Warnings) > 0 {
+			return fmt.Errorf("no benefit catalogue to remember: %s", strings.Join(full.Warnings, "; "))
+		}
+		return nil
+	}
+	if benefitCatalogueUnchanged(cred.BenefitCatalogue, benefit) {
+		return nil
+	}
+	return persistBenefitCatalogue(authIndex, benefit, now)
+}
+
+// benefitCatalogueUnchanged ignores arrival order and the stored timestamp, so a
+// stable list does not rewrite the credential on every refresh.
+func benefitCatalogueUnchanged(stored *benefitCatalogueSnapshot, fresh []ModelConfig) bool {
+	if stored == nil || len(stored.Models) != len(fresh) {
+		return false
+	}
+	byID := make(map[string]ModelConfig, len(stored.Models))
+	for _, model := range stored.Models {
+		byID[model.ID] = model
+	}
+	for _, model := range fresh {
+		known, exists := byID[model.ID]
+		if !exists || known.ContextLength != model.ContextLength || known.MaxOutputTokens != model.MaxOutputTokens {
+			return false
+		}
+	}
+	return true
+}
+
+// persistBenefitCatalogue stores the confirmed benefit list in the plugin-owned
+// part of one credential. It re-reads what the host holds right now and adds
+// only this field, so a token rotated while the list was being read is never
+// rolled back, and host-owned keys (priority, note, weight, ...) survive.
+func persistBenefitCatalogue(authRef string, models []ModelConfig, fetchedAt time.Time) error {
+	files, errList := hostAuthList()
+	if errList != nil {
+		return errList
+	}
+	for _, file := range files {
+		if normalizeProvider(file.Provider) != providerID && normalizeProvider(file.Type) != providerID {
+			continue
+		}
+		if authRef != "" && file.Name != authRef && file.ID != authRef && file.AuthIndex != authRef {
+			continue
+		}
+		storage, errGet := hostAuthGet(file.AuthIndex)
+		if errGet != nil {
+			return errGet
+		}
+		current, errCred := credentialFromStorage(storage)
+		if errCred != nil || !current.valid() {
+			return fmt.Errorf("the stored credential is unreadable")
+		}
+		catalogue := make([]ModelConfig, 0, len(models))
+		for _, model := range models {
+			model.Source = "benefit"
+			catalogue = append(catalogue, model)
+		}
+		current.BenefitCatalogue = &benefitCatalogueSnapshot{FetchedAt: fetchedAt, Models: catalogue}
+		updated, errMarshal := json.Marshal(map[string]any{storageKey: *current})
+		if errMarshal != nil {
+			return errMarshal
+		}
+		wrap, errMerge := mergeCredentialFile(storage, updated)
+		if errMerge != nil {
+			return errMerge
+		}
+		if file.Name == "" {
+			return fmt.Errorf("credential %s has no file name to save to", file.AuthIndex)
+		}
+		return hostAuthSave(file.Name, wrap)
+	}
+	return fmt.Errorf("no stored credential matches %s", authRef)
 }
 
 // acquireModelCatalogFlight coalesces concurrent cache misses for the same
