@@ -308,14 +308,65 @@ Responses clients (`/v1/responses`), with tool calls and usage preserved.
 
 ## Daily check-in (签到 / 积分领取)
 
+### Built-in daily benefit (v0.1.14)
+
+The plugin page includes **领取今日额度**, a **定时任务总开关**, and an
+individual automatic switch for every task, including **daily-benefit-claim**.
+Manual execution is independent of both automatic switches. The bulk button
+executes only enabled tasks; it never implicitly opts into a disabled claim.
+
+Enable automatic claims from the page, or configure:
+
+```yaml
+daily_claim:
+  enabled: true
+schedule:
+  enabled: true
+```
+
+This adds the built-in task without replacing your existing tasks. Do not add a
+task with its reserved ID `daily-benefit-claim` or type `daily_claim` yourself.
+The claim matches the official 26.9.101 capture: `POST
+https://opengw.developer.huaweicloud.com/api/v1/benefit/claim`, empty body,
+`Content-Type: application/json`, and signed headers
+`content-type;host;x-sdk-date;x-security-token` (no regional `X-Domain-Id`).
+Only `error_code: "0000"` with a CodeArts result counts as accepted.
+
+Automatic checks run at minute 05/15/25/35/45/55 and once on scheduler startup,
+using Beijing (UTC+8) dates and skipping 00:00–00:04. Each account is skipped
+after today's success; failed requests are at least ten minutes apart, at most
+six attempts per account per Beijing day. A newly added account is picked up at
+the next check. Disabled/foreign accounts are excluded; quota-exhausted accounts
+remain eligible. Credentials are refreshed before use when needed.
+
+Attempt/success records live in `auth-dir/.codearts-provider-state/` as hashed
+`daily-claim-*.state` files, independent of credential JSON, with no keys, tokens,
+or raw responses. Unreadable, corrupt or unwritable state prevents a claim.
+Keep this directory on persistent storage. Deduplication is per plugin process
+plus its durable ledger: do not run multiple CPA instances against the same
+directory. A process crash after upstream acceptance but before local success
+is saved can produce a later retry; this is not an exactly-once guarantee.
+
+The task runs in the background, not on chat/model/quota paths. CPA's HTTP ABI
+does not provide a separate cron-request deadline, so the host transport
+controls network timeout; a slow task cannot overlap itself. Closing a switch
+stops future automatic triggers but does not cancel a request already started.
+Acceptance does not guarantee extra tokens or an entitlement extension; Huawei
+determines eligibility. Use **刷新福利额度** to check the actual allowance.
+
+For a one-time API trigger:
+`POST /v0/management/codearts-provider/checkin` with
+`{"task":"daily-benefit-claim"}` (CPA management key required).
+
+### Custom activity check-in (legacy)
+
 The 26.9.101 capture includes a benefit claim at the developer gateway before
 using a benefit model. Model discovery only reads the catalog; it does not
 perform that claim or guarantee an account has remaining benefit quota. An exhausted
 pool is still reported honestly at request time: the gateway signals it inside an
 HTTP 200 stream, and that envelope is classified as `insufficient_quota` (HTTP 403)
 rather than served to the client as a successful empty completion. Claim the
-entitlement in the official client, or schedule the `checkin` task, when it is used
-up.
+eligible entitlement in the official client or use the built-in claim above.
 
 The plugin's existing `checkin` task remains a configurable automation for a
 verified claim request. It is separate from model discovery and must be
@@ -450,14 +501,21 @@ All routes live under `/v0/management/codearts-provider/` and require the admin 
 | `GET` | `/usage` | Token usage rollup from host usage records: totals, per-model, per-account, recent. |
 | `GET` | `/schedule` | Configured tasks with `next_run`, `last_run`, `last_error`. |
 | `POST` | `/schedule/run` | Run one task now (body: `{task}`). |
-| `POST` | `/schedule/config` | Toggle the scheduler or individual tasks at runtime. |
+| `POST` | `/schedule/config` | Persist the total switch and/or `tasks:[{id,enabled}]`; unknown IDs reject the entire change. |
 | `POST` | `/import` | Import a credential (`{access_key_id, secret_access_key, security_token, domain_id, user_name, name}`). |
 | `GET` | `/export` | Export all credentials in re-importable form. Returns live secrets — handle accordingly. |
 | `POST` | `/delete` | Delete one account's auth file (body: `{auth_index}`). |
 
-`/schedule/config` changes the running state only and responds with
-`persistent: false`. The plugin does not rewrite `config.yaml`: that file belongs
-to the operator.
+`/schedule/config` saves switches to `auth-dir/.codearts-provider-state/schedule.state`
+and responds with `persistent: true` only after a successful write. Saved flags
+override their YAML counterparts across restarts/reconfiguration. Cron expressions
+and task definitions still come from YAML; the plugin never rewrites `config.yaml`.
+To return entirely to YAML defaults, stop CPA and back up/move only `schedule.state`,
+leaving `daily-claim-*.state` intact. Missing accounts mean the directory is unknown:
+add an account before saving; cron waits until it can restore the saved state.
+A corrupt state file pauses automatic tasks and displays an error, rather than
+silently re-enabling them. Docker must persist this auth directory, including when
+credentials themselves use a database backend.
 
 ### Dashboard
 
@@ -903,8 +961,9 @@ Rebuild the library before running it: the test loads the file named by
   guarantee that a request fits the model's context window.
 - **Benefit model listing is separate from entitlement claiming.** The plugin
   routes configured or explicitly refreshed benefit models but does not
-  automatically claim an activity. Use the official client to claim eligible
-  benefits, or a verified `checkin` task configured for that activity.
+  claim as a side effect of listing models. Daily developer-gateway claiming is
+  opt-in through `daily_claim.enabled` or the panel; custom activities can still
+  use a verified `checkin` task.
 - **Credential renewal has three independent triggers.** Temporary credentials
   advertise `NextRefreshAfter` plus a one-hour refresh interval to the host; the
   plugin's enabled-by-default cron runs `token_renew` hourly; and model, chat and

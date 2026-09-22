@@ -624,11 +624,7 @@ func handleQuotaRefresh(req pluginapi.ManagementRequest, callbackIDs ...string) 
 
 func handleScheduleGet() pluginapi.ManagementResponse {
 	cfg := config()
-	body, _ := json.Marshal(map[string]any{
-		"enabled":  cfg.Schedule.Enabled,
-		"timezone": firstNonEmptyString(cfg.Schedule.Timezone, time.Local.String()),
-		"tasks":    describeTasks(cfg),
-	})
+	body, _ := json.Marshal(scheduleView(cfg))
 	return jsonResponse(http.StatusOK, body)
 }
 
@@ -657,68 +653,16 @@ func handleScheduleRun(req pluginapi.ManagementRequest) pluginapi.ManagementResp
 	return jsonResponse(http.StatusOK, out)
 }
 
-// handleScheduleConfig toggles the scheduler and individual tasks at runtime.
-//
-// The change is applied in memory and by restarting the cron runner. It is not
-// written back to config.yaml: the host owns that file, and silently rewriting
-// operator configuration is not this plugin's business. The response says so.
+// Persist only plugin-owned switches, never rewrite CPA's config.yaml.
 func handleScheduleConfig(req pluginapi.ManagementRequest) pluginapi.ManagementResponse {
-	var body struct {
-		Enabled *bool `json:"enabled"`
-		Tasks   []struct {
-			ID      string `json:"id"`
-			Enabled *bool  `json:"enabled"`
-		} `json:"tasks"`
-	}
+	var body scheduleSwitchChange
 	if len(req.Body) > 0 {
 		if errUnmarshal := json.Unmarshal(req.Body, &body); errUnmarshal != nil {
 			return errorJSON(http.StatusBadRequest, "invalid body: "+errUnmarshal.Error())
 		}
 	}
 
-	cfg := config()
-	// Work on a copy so a partial failure cannot leave a half-mutated config.
-	updated := *cfg
-	updated.Schedule = cfg.Schedule
-	updated.Schedule.Tasks = append([]ScheduleTask(nil), cfg.Schedule.Tasks...)
-
-	if body.Enabled != nil {
-		updated.Schedule.Enabled = *body.Enabled
-	}
-	for _, change := range body.Tasks {
-		id := strings.TrimSpace(change.ID)
-		if id == "" {
-			continue
-		}
-		found := false
-		for index := range updated.Schedule.Tasks {
-			if updated.Schedule.Tasks[index].ID != id {
-				continue
-			}
-			found = true
-			if change.Enabled != nil {
-				value := *change.Enabled
-				updated.Schedule.Tasks[index].Enabled = &value
-			}
-			break
-		}
-		if !found {
-			return errorJSON(http.StatusNotFound, "unknown task "+id)
-		}
-	}
-
-	currentConfig.Store(&updated)
-	startScheduler(&updated)
-
-	out, _ := json.Marshal(map[string]any{
-		"success":    true,
-		"enabled":    updated.Schedule.Enabled,
-		"tasks":      describeTasks(&updated),
-		"persistent": false,
-		"note": "runtime change only; edit plugins.configs." + providerID +
-			".schedule in config.yaml to persist it",
-	})
-	return jsonResponse(http.StatusOK, out)
+	return updateScheduleSwitches(body)
 }
 
 // ---------------------------------------------------------------------------
@@ -923,8 +867,8 @@ func handleCheckin(req pluginapi.ManagementRequest) pluginapi.ManagementResponse
 
 	cfg := config()
 	var candidates []ScheduleTask
-	for _, task := range cfg.scheduleTasks() {
-		if task.Type == TaskCheckin {
+	for _, task := range cfg.visibleScheduleTasks() {
+		if task.Type == TaskCheckin || task.Type == TaskDailyClaim {
 			candidates = append(candidates, task)
 		}
 	}
@@ -986,8 +930,8 @@ func handleBenefits() pluginapi.ManagementResponse {
 	}
 	next := scheduler.nextRuns()
 	var tasks []taskView
-	for _, task := range cfg.scheduleTasks() {
-		if task.Type != TaskCheckin {
+	for _, task := range cfg.visibleScheduleTasks() {
+		if task.Type != TaskCheckin && task.Type != TaskDailyClaim {
 			continue
 		}
 		view := taskView{
@@ -1015,10 +959,8 @@ func handleBenefits() pluginapi.ManagementResponse {
 		"configured":       len(tasks) > 0,
 		"schedule_enabled": scheduleEnabled,
 		"tasks":            tasks,
-		"explanation": "The CodeArts Doer extension contains no check-in call: the daily benefit page " +
-			"(the \"Wish Wall\") is a server-hosted web app opened from the extension's wishWallUrl, " +
-			"and the claim is performed inside that page. This plugin schedules the claim for you once you " +
-			"supply the request, captured from that page.",
+		"explanation": "daily-benefit-claim uses the official developer gateway claim, independent of automatic switches. " +
+			"Enable daily_claim and the scheduler for automatic claims; success means accepted, not additional quota guaranteed.",
 		"how_to_capture": []string{
 			"Open the daily benefit page in a browser and sign in.",
 			"Open devtools -> Network, clear it, then click the daily claim button.",

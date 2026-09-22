@@ -93,6 +93,11 @@ const panelTemplate = `<!doctype html>
   .steps li { margin:3px 0; }
   .status { border:1px dashed var(--line); border-radius:8px; padding:9px 11px;
             font-size:13px; margin-top:10px; }
+  .toggle { display:inline-flex; align-items:center; gap:8px; color:var(--fg); cursor:pointer; white-space:nowrap; }
+  .toggle input { width:18px; height:18px; margin:0; padding:0; accent-color:var(--accent); }
+  input:focus-visible,button:focus-visible { outline:2px solid var(--accent); outline-offset:3px; }
+  .task-table { overflow-x:auto; }
+  .schedule-head { display:flex; gap:16px; flex-wrap:wrap; align-items:center; margin-bottom:10px; }
 </style>
 </head>
 <body>
@@ -105,7 +110,7 @@ const panelTemplate = `<!doctype html>
   </header>
   <div class="sub">把华为 CodeArts Doer（CodeArts Agent / 编程助手）账号授权给 CLIProxyAPI，供 Claude Code、OpenAI 兼容客户端等调用。</div>
 
-  <div id="msg"></div>
+  <div id="msg" role="status" aria-live="polite"></div>
 
   <div class="card">
     <h2>授权</h2>
@@ -143,7 +148,8 @@ const panelTemplate = `<!doctype html>
   <div class="card">
     <h2>定时任务</h2>
     <div class="bar">
-      <button id="runAll">立即执行全部任务</button>
+      <button id="claimDaily" class="primary">领取今日额度</button>
+      <button id="runAll">执行已启用任务</button>
       <button id="refreshQuota">刷新额度</button>
     </div>
     <div id="schedule"><div class="empty">加载中…</div></div>
@@ -381,38 +387,65 @@ const panelTemplate = `<!doctype html>
   function renderSchedule(s) {
     var host = document.getElementById("schedule");
     var tasks = (s && s.tasks) || [];
-    if (!tasks.length) {
-      host.innerHTML = '<div class="empty">调度未启用，也没有配置任务。</div>';
-      return;
-    }
+    s = s || {};
     var rows = tasks.map(function (t) {
-      var state = t.last_error ? '<span class="err">' + esc(t.last_error) + '</span>'
+      var state = t.running ? '执行中…' : t.last_error ? '<span class="err">' + esc(t.last_error) + '</span>'
                   : (t.last_result ? '<span class="ok">' + esc(t.last_result) + '</span>' : "—");
       return '<tr><td class="mono">' + esc(t.id) + '</td><td class="mono">' + esc(t.type) + '</td>' +
         '<td class="mono">' + esc(t.cron) + '</td>' +
-        '<td>' + (t.enabled === false ? '<span class="pill off">停用</span>' : '<span class="pill on">启用</span>') + '</td>' +
+        '<td><label class="toggle"><input type="checkbox" data-task-toggle="' + esc(t.id) + '"' +
+        (t.enabled !== false ? ' checked' : '') + ' aria-label="自动执行 ' + esc(t.id) + '">自动</label></td>' +
         '<td class="mono">' + esc(t.next_run || "—") + '</td>' +
         '<td class="mono">' + esc(t.last_run || "—") + '</td>' +
         '<td>' + state + '</td>' +
-        '<td><button data-run="' + esc(t.id) + '">执行</button></td></tr>';
+        '<td><button data-run="' + esc(t.id) + '" data-enabled="' + (t.enabled !== false) + '"' +
+        (t.running ? ' disabled' : '') + '>执行一次</button></td></tr>';
     }).join("");
-    host.innerHTML = '<div class="sub" style="margin-bottom:8px">' +
-      (s.enabled ? '<span class="ok">调度已启用</span>' : '<span class="pill off">调度未启用</span>') +
-      ' · 时区 ' + esc(s.timezone || "本机时区") + '</div>' +
-      '<table><thead><tr><th>任务</th><th>类型</th><th>Cron</th><th>状态</th>' +
+    host.innerHTML = '<div class="schedule-head"><label class="toggle"><input type="checkbox" data-schedule-toggle' +
+      (s.enabled ? ' checked' : '') + '>定时任务总开关</label><span class="sub" style="margin:0">' +
+      (s.enabled ? '自动调度已开启' : '自动调度已暂停') + ' · 时区 ' + esc(s.timezone || "本机时区") + '</span></div>' +
+      '<div class="sub">开关保存后重启仍保留。总开关只控制自动执行，手动按钮始终可用；已开始的任务会执行完毕。<br>' +
+      '每日领取按北京时间计日，00:05 后每 10 分钟补检查；当天成功后不再领取，失败最多尝试 6 次。</div>' +
+      (s.pending ? '<div class="sub">正在等待账号目录，自动调度暂未启动；请先添加账号。</div>' : '') +
+      (s.persistence_error ? '<div class="err">开关恢复失败：' + esc(s.persistence_error) + '，已暂停自动调度。</div>' : '') +
+      '<div class="task-table"><table><thead><tr><th>任务</th><th>类型</th><th>Cron</th><th>自动执行</th>' +
       '<th>下次执行</th><th>上次执行</th><th>结果</th><th></th></tr></thead><tbody>' +
-      rows + '</tbody></table>';
+      rows + '</tbody></table></div>';
   }
 
+  var scheduleSaving = false, scheduleRevision = 0;
+  function saveSchedule(change) {
+    if (scheduleSaving) return Promise.resolve();
+    scheduleSaving = true;
+    scheduleRevision++;
+    var controls = document.querySelectorAll('[data-schedule-toggle],[data-task-toggle]');
+    for (var i = 0; i < controls.length; i++) controls[i].disabled = true;
+    say('正在保存开关…');
+    return call(BASE + '/schedule/config', { method: 'POST', body: change })
+      .then(function (s) { renderSchedule(s); say(s.note || '开关已保存，重启后保留。', 'ok'); })
+      .catch(function (e) {
+        // Re-read authoritative state, including a save whose response was lost.
+        return call(BASE + '/schedule').then(renderSchedule).catch(function () {
+          for (var i = 0; i < controls.length; i++) controls[i].disabled = true;
+        }).then(function () { say('开关保存失败：' + e.message + '；请刷新确认当前状态。', 'err'); });
+      }).finally(function () { scheduleSaving = false; });
+  }
+
+  document.addEventListener('change', function (ev) {
+    var t = ev.target;
+    if (t.hasAttribute('data-schedule-toggle')) saveSchedule({ enabled: t.checked });
+    else if (t.hasAttribute('data-task-toggle')) saveSchedule({ tasks: [{ id: t.getAttribute('data-task-toggle'), enabled: t.checked }] });
+  });
+
   function load() {
+    var revision = scheduleRevision;
     say("加载中…");
     Promise.all([
       call(BASE + "/accounts"),
       call(BASE + "/schedule")
     ]).then(function (out) {
       renderAccounts(out[0] && out[0].accounts);
-      renderSchedule(out[1]);
-      say("");
+      if (!scheduleSaving && revision === scheduleRevision) { renderSchedule(out[1]); say(""); }
     }).catch(function (e) {
       say("加载失败：" + e.message + "（管理接口需要 CPA 管理密钥，请填写后重试）", "err");
     });
@@ -508,17 +541,29 @@ const panelTemplate = `<!doctype html>
   };
 
   document.getElementById("runAll").onclick = function () {
-    var btns = document.querySelectorAll("[data-run]");
+    var btns = document.querySelectorAll('[data-run][data-enabled="true"]:not(:disabled)');
     if (!btns.length) { say("没有可执行的任务。", "err"); return; }
     var ids = [];
     for (var i = 0; i < btns.length; i++) ids.push(btns[i].getAttribute("data-run"));
     say("正在执行 " + ids.length + " 个任务…");
     Promise.all(ids.map(function (id) {
-      return call(BASE + "/schedule/run", { method: "POST", body: { task: id } }).catch(function () { return null; });
+      return call(BASE + "/schedule/run", { method: "POST", body: { task: id } });
     })).then(function () {
       say("任务已启动，正在刷新状态…");
       setTimeout(load, 1200);
-    });
+    }).catch(function (e) { say('部分任务可能已启动，其他任务启动失败：' + e.message, 'err'); });
+  };
+
+  document.getElementById('claimDaily').onclick = function () {
+    var button = this;
+    button.disabled = true;
+    say('正在启动每日领取…');
+    call(BASE + '/checkin', { method: 'POST', body: { task: 'daily-benefit-claim' } })
+      .then(function () {
+        say('领取任务已启动，请在下方任务结果查看；上游受理不保证重复增加额度。');
+        setTimeout(load, 1500);
+      }).catch(function (e) { say('启动领取失败：' + e.message, 'err'); })
+      .finally(function () { button.disabled = false; });
   };
 
   document.addEventListener("click", function (ev) {

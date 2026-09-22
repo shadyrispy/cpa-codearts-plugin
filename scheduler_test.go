@@ -304,8 +304,8 @@ func TestDescribeTasksReportsConfigAndErrors(t *testing.T) {
 		},
 	}
 	described := describeTasks(cfg)
-	if len(described) != 2 {
-		t.Fatalf("described %d tasks, want 2", len(described))
+	if len(described) != 3 {
+		t.Fatalf("described %d tasks, want 2 configured and 1 opt-in daily task", len(described))
 	}
 	// Sorted by id, so "bad" comes first.
 	if described[0]["id"] != "bad" {
@@ -314,11 +314,11 @@ func TestDescribeTasksReportsConfigAndErrors(t *testing.T) {
 	if described[0]["cron_error"] == nil {
 		t.Error("an invalid cron expression must be reported in cron_error")
 	}
-	if described[1]["cron_error"] != nil {
-		t.Errorf("a valid cron expression must not report cron_error: %v", described[1]["cron_error"])
+	if described[2]["cron_error"] != nil {
+		t.Errorf("a valid cron expression must not report cron_error: %v", described[2]["cron_error"])
 	}
-	if described[1]["enabled"] != true {
-		t.Errorf("enabled flag = %v, want true", described[1]["enabled"])
+	if described[2]["enabled"] != true {
+		t.Errorf("enabled flag = %v, want true", described[2]["enabled"])
 	}
 }
 

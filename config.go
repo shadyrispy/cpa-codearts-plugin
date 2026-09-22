@@ -2,6 +2,7 @@ package main
 
 import (
 	"encoding/json"
+	"fmt"
 	"strings"
 	"time"
 
@@ -100,9 +101,18 @@ type Config struct {
 	// plugin ABI exposes no cron facility, so a plugin that needs periodic work
 	// schedules it internally; this block drives that scheduler.
 	Schedule ScheduleConfig `yaml:"schedule" json:"schedule"`
+	// DailyClaim is opt-in; manual claims remain available when disabled.
+	DailyClaim         DailyClaimConfig `yaml:"daily_claim" json:"daily_claim"`
+	scheduleStatePath  string
+	scheduleStateError string
+	schedulePending    bool
 
 	// Scheduler configures credential selection for this provider.
 	Scheduler SchedulerConfig `yaml:"scheduler" json:"scheduler"`
+}
+
+type DailyClaimConfig struct {
+	Enabled bool `yaml:"enabled" json:"enabled"`
 }
 
 // SchedulerConfig controls how the plugin picks among credential candidates.
@@ -279,6 +289,11 @@ func parseConfig(request []byte) (*Config, error) {
 		return nil, errUnmarshal
 	}
 	cfg.normalize()
+	for _, task := range cfg.Schedule.Tasks {
+		if task.ID == dailyClaimTaskID || task.Type == TaskDailyClaim {
+			return nil, fmt.Errorf("daily-benefit-claim is built in; configure daily_claim.enabled instead of adding a task")
+		}
+	}
 	return cfg, nil
 }
 
@@ -451,13 +466,23 @@ func (c *Config) scheduleTasks() []ScheduleTask {
 	if c == nil {
 		return defaultScheduleTasks()
 	}
-	if len(c.Schedule.Tasks) > 0 {
-		return c.Schedule.Tasks
+	tasks := append([]ScheduleTask(nil), c.Schedule.Tasks...)
+	if len(tasks) == 0 && !c.Schedule.DisableDefaults {
+		tasks = defaultScheduleTasks()
 	}
-	if c.Schedule.DisableDefaults {
-		return nil
+	if c.DailyClaim.Enabled {
+		tasks = append(tasks, dailyClaimTask(true))
 	}
-	return defaultScheduleTasks()
+	return tasks
+}
+
+// Include the opt-in task in the panel even before automatic claiming is on.
+func (c *Config) visibleScheduleTasks() []ScheduleTask {
+	tasks := c.scheduleTasks()
+	if !c.DailyClaim.Enabled {
+		tasks = append(tasks, dailyClaimTask(false))
+	}
+	return tasks
 }
 
 func config() *Config {

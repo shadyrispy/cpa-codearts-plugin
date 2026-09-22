@@ -83,7 +83,7 @@ import (
 // normalizes provider identifiers.
 const providerID = "codearts-provider"
 
-const pluginVersion = "0.1.13"
+const pluginVersion = "0.1.14"
 
 var (
 	// currentConfig holds the last configuration delivered by the host. It is
@@ -180,10 +180,9 @@ func handleMethod(method string, request []byte) ([]byte, error) {
 		if errConfig != nil {
 			return nil, fmt.Errorf("parse plugin config: %w", errConfig)
 		}
-		currentConfig.Store(cfg)
 		// Scheduled work is owned by the plugin: the host ABI has no timer, so
 		// the cron runner is (re)built here on every register/reconfigure.
-		startScheduler(cfg)
+		installScheduledConfig(cfg)
 		if logSink != nil {
 			if reconfigure {
 				logSink.info("plugin reconfigured", map[string]any{"base_url": cfg.BaseURL})
@@ -200,6 +199,7 @@ func handleMethod(method string, request []byte) ([]byte, error) {
 	case pluginabi.MethodPluginQuiesce:
 		// Quiesce runs while the host runtime is still healthy, so it is the
 		// safe place to stop background work.
+		stopScheduleSettings()
 		shutdownScheduler()
 		stopLoginSessions()
 		closeAllActiveStreams()

@@ -156,8 +156,8 @@ func TestBenefitsAndCheckinExplainUnconfiguredState(t *testing.T) {
 	if errUnmarshal := json.Unmarshal(resp.Body, &described); errUnmarshal != nil {
 		t.Fatalf("benefits body is not JSON: %v", errUnmarshal)
 	}
-	if described["configured"] != false {
-		t.Errorf("configured = %v, want false", described["configured"])
+	if described["configured"] != true {
+		t.Errorf("built-in daily claim must be available: %v", described["configured"])
 	}
 	if described["explanation"] == nil {
 		t.Error("the explanation should always be present")
@@ -166,17 +166,13 @@ func TestBenefitsAndCheckinExplainUnconfiguredState(t *testing.T) {
 		t.Error("capture instructions should be present when nothing is configured")
 	}
 
-	checkin := handleCheckin(pluginapiManagementRequest(`{}`))
+	checkin := handleCheckin(pluginapiManagementRequest(`{"task":"unknown-checkin"}`))
 	var out map[string]any
 	if errUnmarshal := json.Unmarshal(checkin.Body, &out); errUnmarshal != nil {
 		t.Fatalf("checkin body is not JSON: %v", errUnmarshal)
 	}
-	if out["configured"] != false {
-		t.Errorf("checkin configured = %v, want false", out["configured"])
-	}
-	steps, _ := out["how_to_enable"].([]any)
-	if len(steps) == 0 {
-		t.Error("checkin should explain how to enable the task")
+	if checkin.StatusCode != 404 {
+		t.Error("unknown custom checkin task must remain not found")
 	}
 }
 

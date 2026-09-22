@@ -163,6 +163,15 @@ plugins:
       # The CLIProxyAPI plugin ABI has no timer: the host never calls a plugin on
       # a schedule, so the plugin runs its own cron. Expressions accept the
       # standard 5-field form (minute first) or the 6-field form with seconds.
+      # Official developer-gateway daily benefit. Opt in here or on the panel.
+      # Manual "领取今日额度" works even when this or the total switch is off.
+      # Uses Beijing dates, catches up after startup, and deduplicates on disk.
+      daily_claim:
+        enabled: false
+
+      # Panel switches are persisted under auth-dir/.codearts-provider-state/
+      # and override the corresponding YAML flags. No credentials are stored
+      # there; keep this directory on persistent storage across container updates.
       schedule:
         enabled: true
         # IANA zone the expressions are evaluated in. Empty means the host's
@@ -188,6 +197,7 @@ plugins:
             cron: "*/30 * * * *"
             enabled: true
 
+          # Legacy/custom activity only; not required for daily_claim above.
           # Activity-specific benefit check-in (每日签到). Model discovery never
           # claims an entitlement. Configure a verified claim request and its
           # signing requirements here, or claim in the official client.

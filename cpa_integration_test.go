@@ -37,6 +37,8 @@ func TestCPAIntegration(t *testing.T) {
 	var blockBenefit atomic.Bool
 	benefitEntered, benefitCancelled := make(chan struct{}, 1), make(chan struct{}, 1)
 	var benefitCalls atomic.Int32
+	var dailyClaimCalls atomic.Int32
+	var dailyClaimFail atomic.Bool
 	var sessionMu sync.Mutex
 	activeSessions := map[string]bool{}
 	sessionStarts := map[string]int{}
@@ -76,6 +78,18 @@ func TestCPAIntegration(t *testing.T) {
 			return
 		}
 		switch r.URL.Path {
+		case epDailyClaim:
+			dailyClaimCalls.Add(1)
+			body, _ := io.ReadAll(r.Body)
+			if r.Method != http.MethodPost || len(body) != 0 || r.Header.Get("X-Domain-Id") != "" || r.Header.Get("Content-Type") != "application/json" || !strings.Contains(r.Header.Get("Authorization"), "SignedHeaders=content-type;host;x-sdk-date;x-security-token,") {
+				http.Error(w, "incorrect claim protocol", 400)
+				return
+			}
+			if dailyClaimFail.Load() {
+				http.Error(w, "claim temporarily unavailable", 503)
+				return
+			}
+			fmt.Fprint(w, dailyClaimOK)
 		case "/snap-manager/v1/statistics/plugin":
 			w.Header().Set("Content-Type", "application/json")
 			fmt.Fprint(w, `{"metrics":[{"name":"usageTokenChatMessages","value":20,"show":true}],"package":{"spec_code":"fixture-plan"}}`)
@@ -285,6 +299,11 @@ func TestCPAIntegration(t *testing.T) {
 	defer stop()
 	start := func() {
 		t.Helper()
+		logPath := filepath.Join(dir, "cpa.log")
+		var logOffset int64
+		if info, err := os.Stat(logPath); err == nil {
+			logOffset = info.Size()
+		}
 		process = exec.Command(executable, "-config", configPath)
 		process.Dir = dir
 		log, err := os.OpenFile(filepath.Join(dir, "cpa.log"), os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0600)
@@ -303,7 +322,12 @@ func TestCPAIntegration(t *testing.T) {
 			resp, err := client.Get(base + "/")
 			if err == nil {
 				resp.Body.Close()
-				return
+				// The listener becomes reachable before host account bootstrap is
+				// finished. Importing then races its stale initial file snapshot.
+				logs, _ := os.ReadFile(logPath)
+				if int64(len(logs)) >= logOffset && bytes.Contains(logs[logOffset:], []byte("file watcher started")) {
+					return
+				}
 			}
 			time.Sleep(100 * time.Millisecond)
 		}
@@ -661,6 +685,11 @@ func TestCPAIntegration(t *testing.T) {
 		}
 	}
 	t.Log("panel serves the Chinese single-authorization dashboard")
+	for _, want := range []string{"领取今日额度", "定时任务总开关", "data-task-toggle"} {
+		if !bytes.Contains(body, []byte(want)) {
+			t.Fatalf("panel lacks %s", want)
+		}
+	}
 
 	nextStatus.Store(429)
 	status, body = request("POST", "/v1/chat/completions", `{"model":"audit-model","messages":[{"role":"user","content":"rate limit"}],"stream":true}`)
@@ -714,6 +743,120 @@ func TestCPAIntegration(t *testing.T) {
 		assertSessionsIdle()
 	}
 	t.Log("unterminated in-stream quota faults reach clients instead of empty success")
+
+	// Test management switches in the actual ABI host, including auth loading
+	// after registration. Do not rely on the host's config watcher to persist UI.
+	const scheduleBase = "/v0/management/codearts-provider"
+	status, body = request("POST", scheduleBase+"/schedule/config", `{"enabled":false,"tasks":[{"id":"token-renew","enabled":false},{"id":"daily-benefit-claim","enabled":true}]}`)
+	if status != 200 || !bytes.Contains(body, []byte(`"persistent":true`)) {
+		t.Fatalf("switch save failed: %d %s", status, body)
+	}
+	stop()
+	start()
+	deadline = time.Now().Add(12 * time.Second)
+	var schedule struct {
+		Enabled bool `json:"enabled"`
+		Pending bool `json:"pending"`
+		Tasks   []struct {
+			ID      string `json:"id"`
+			Enabled bool   `json:"enabled"`
+			Running bool   `json:"running"`
+			Count   int    `json:"run_count"`
+			Error   string `json:"last_error"`
+			Result  string `json:"last_result"`
+		} `json:"tasks"`
+	}
+	for time.Now().Before(deadline) {
+		status, body = request("GET", scheduleBase+"/schedule", "")
+		schedule.Tasks = nil
+		if json.Unmarshal(body, &schedule) == nil && !schedule.Pending {
+			break
+		}
+		time.Sleep(100 * time.Millisecond)
+	}
+	if status != 200 || schedule.Pending || schedule.Enabled {
+		t.Fatalf("restart lost total switch: %s", body)
+	}
+	for _, task := range schedule.Tasks {
+		if task.ID == "token-renew" && task.Enabled {
+			t.Fatal("restart lost individual switch")
+		}
+		if task.ID == dailyClaimTaskID && !task.Enabled {
+			t.Fatal("restart lost daily opt-in")
+		}
+	}
+	if dailyClaimCalls.Load() != 0 {
+		t.Fatal("disabled scheduler claimed automatically")
+	}
+
+	// A failed claim must not block an ordinary chat, and its task result must
+	// be reported as failure. All credentials and upstreams are test fixtures.
+	dailyClaimFail.Store(true)
+	status, body = request("POST", scheduleBase+"/checkin", `{"task":"daily-benefit-claim"}`)
+	if status != 200 {
+		t.Fatalf("manual trigger failed: %s", body)
+	}
+	waitClaim := func(minCount int) {
+		t.Helper()
+		deadline := time.Now().Add(10 * time.Second)
+		for time.Now().Before(deadline) {
+			_, payload := request("GET", scheduleBase+"/schedule", "")
+			schedule.Tasks = nil // omitted fields must not reuse an earlier failure.
+			_ = json.Unmarshal(payload, &schedule)
+			for _, task := range schedule.Tasks {
+				if task.ID == dailyClaimTaskID && task.Count >= minCount && !task.Running {
+					return
+				}
+			}
+			time.Sleep(50 * time.Millisecond)
+		}
+		t.Fatal("claim did not complete")
+	}
+	waitClaim(1)
+	for _, task := range schedule.Tasks {
+		if task.ID == dailyClaimTaskID && task.Error == "" {
+			t.Fatal("failed claim was reported successful")
+		}
+	}
+	status, body = request("POST", "/v1/chat/completions", `{"model":"glm-5.3-flash","messages":[{"role":"user","content":"claim failure isolation"}]}`)
+	if status != 200 || !bytes.Contains(body, []byte("hello from fixture")) {
+		t.Fatalf("claim failure affected chat: %d %s", status, body)
+	}
+	dailyClaimFail.Store(false)
+	// Age ONLY fixture attempt records to make a retry eligible without a real
+	// ten-minute delay. Production code never exposes a force/retry bypass.
+	statePaths, _ := filepath.Glob(filepath.Join(authDir, pluginStateDir, "daily-claim-*.state"))
+	if len(statePaths) == 0 {
+		t.Fatal("claim attempt was not persisted")
+	}
+	for _, path := range statePaths {
+		var state dailyClaimState
+		if err := readPluginState(path, &state); err != nil {
+			t.Fatal(err)
+		}
+		state.LastAttempt = time.Now().Add(-11 * time.Minute)
+		if err := savePluginState(path, state); err != nil {
+			t.Fatal(err)
+		}
+	}
+	_, _ = request("POST", scheduleBase+"/schedule/config", `{"tasks":[{"id":"daily-benefit-claim","enabled":false}]}`)
+	_, _ = request("POST", scheduleBase+"/checkin", `{"task":"daily-benefit-claim"}`)
+	waitClaim(2)
+	for _, task := range schedule.Tasks {
+		if task.ID == dailyClaimTaskID && (task.Error != "" || !strings.Contains(task.Result, "领取已受理")) {
+			t.Fatalf("manual claim with both flags off failed: %+v", task)
+		}
+	}
+	claimed := dailyClaimCalls.Load()
+	_, _ = request("POST", scheduleBase+"/schedule/config", `{"enabled":true,"tasks":[{"id":"daily-benefit-claim","enabled":true}]}`)
+	waitClaim(3) // startup catch-up, but today's successes are already on disk.
+	stop()
+	start()
+	waitClaim(1)
+	if dailyClaimCalls.Load() != claimed {
+		t.Fatal("restart or catch-up repeated today's accepted claim")
+	}
+	t.Log("daily claim exact protocol, failure isolation, manual trigger, persistent switches and restart dedup passed")
 	sessionMu.Lock()
 	defer sessionMu.Unlock()
 	for sessionID, starts := range sessionStarts {

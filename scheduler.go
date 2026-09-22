@@ -38,14 +38,8 @@ const (
 	// It exists so a deployment can schedule an endpoint this plugin does not
 	// model natively yet, without waiting for a plugin change.
 	TaskHTTP TaskType = "http"
-	// TaskCheckin claims the daily benefit.
-	//
-	// The CodeArts Doer extension implements no check-in call of its own: the
-	// activity/benefit page (the "Wish Wall", which the extension opens from its
-	// server-provided wishWallUrl) is a server-hosted web app, and the claim
-	// happens inside that page against an endpoint that never appears in the
-	// extension bundle. This task therefore drives a URL you supply, captured
-	// once from that page, and then scheduled here.
+	// TaskCheckin retains custom activity requests. The built-in developer
+	// gateway benefit uses TaskDailyClaim and a persistent daily ledger.
 	TaskCheckin TaskType = "checkin"
 )
 
@@ -88,7 +82,7 @@ func startScheduler(cfg *Config) {
 	scheduler.stop()
 
 	tasks := cfg.scheduleTasks()
-	if !cfg.Schedule.Enabled || len(tasks) == 0 {
+	if !cfg.Schedule.Enabled || cfg.schedulePending || cfg.scheduleStateError != "" || len(tasks) == 0 {
 		if cfg.Schedule.Enabled {
 			logInfo("scheduler enabled but no tasks are configured", nil)
 		}
@@ -128,9 +122,7 @@ func startScheduler(cfg *Config) {
 			})
 			continue
 		}
-		entryID, errAdd := runner.AddFunc(spec, func() {
-			runTask(task)
-		})
+		entryID, errAdd := runner.AddFunc(spec, func() { runAutomaticTask(cfg, task) })
 		if errAdd != nil {
 			logWarn("skipping scheduled task that cron rejected", map[string]any{
 				"task":  task.ID,
@@ -148,6 +140,11 @@ func startScheduler(cfg *Config) {
 	scheduler.mu.Unlock()
 
 	runner.Start()
+	for _, task := range tasks {
+		if task.Type == TaskDailyClaim && task.isEnabled() {
+			go runAutomaticTask(cfg, task)
+		}
+	}
 
 	ids := make([]string, 0, len(tasks))
 	for _, task := range tasks {
@@ -250,6 +247,24 @@ func (s *Scheduler) setRunning(taskID string, running bool) bool {
 
 // runTask executes one task, guarding against overlap and recording the result.
 func runTask(task ScheduleTask) {
+	runTaskMode(task, false)
+}
+
+func runAutomaticTask(cfg *Config, task ScheduleTask) {
+	// Ignore queued ticks belonging to a superseded configuration.
+	if config() != cfg || !cfg.Schedule.Enabled || !task.isEnabled() {
+		return
+	}
+	scheduler.mu.Lock()
+	started := scheduler.started
+	scheduler.mu.Unlock()
+	if !started {
+		return
+	}
+	runTaskMode(task, false)
+}
+
+func runTaskMode(task ScheduleTask, manual bool) {
 	if !scheduler.setRunning(task.ID, true) {
 		logWarn("scheduled task is still running, skipping this tick", map[string]any{"task": task.ID})
 		return
@@ -257,7 +272,12 @@ func runTask(task ScheduleTask) {
 	defer scheduler.setRunning(task.ID, false)
 
 	started := time.Now()
-	errRun := executeTask(task)
+	var errRun error
+	if task.Type == TaskDailyClaim {
+		errRun = runDailyClaimSweep(task, time.Now, manual)
+	} else {
+		errRun = executeTask(task)
+	}
 	scheduler.record(task.ID, started, errRun)
 
 	fields := map[string]any{
@@ -284,6 +304,8 @@ func executeTask(task ScheduleTask) error {
 		return runHTTPTask(task)
 	case TaskCheckin:
 		return runCheckinTask(task)
+	case TaskDailyClaim:
+		return runDailyClaimSweep(task, time.Now, false)
 	default:
 		return fmt.Errorf("unknown task type %q", task.Type)
 	}
@@ -502,7 +524,7 @@ func validateCron(expression string) error {
 func describeTasks(cfg *Config) []map[string]any {
 	nextRuns := scheduler.nextRuns()
 	states := scheduler.snapshot()
-	tasks := cfg.scheduleTasks()
+	tasks := cfg.visibleScheduleTasks()
 
 	out := make([]map[string]any, 0, len(tasks))
 	for _, task := range tasks {
@@ -512,6 +534,9 @@ func describeTasks(cfg *Config) []map[string]any {
 			"cron":    task.Cron,
 			"enabled": task.isEnabled(),
 		}
+		scheduler.mu.Lock()
+		entry["running"] = scheduler.running[task.ID]
+		scheduler.mu.Unlock()
 		if task.Path != "" {
 			entry["path"] = task.Path
 		}
@@ -552,9 +577,9 @@ func describeTasks(cfg *Config) []map[string]any {
 // used by the management API so an operator can verify a task without waiting.
 func triggerTask(taskID string) error {
 	cfg := config()
-	for _, task := range cfg.scheduleTasks() {
+	for _, task := range cfg.visibleScheduleTasks() {
 		if task.ID == taskID {
-			go runTask(task)
+			go runTaskMode(task, true)
 			return nil
 		}
 	}

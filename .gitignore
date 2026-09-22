@@ -86,6 +86,7 @@ Thumbs.db
 .agents/
 .ace-tool/
 .test_tmp/
+.codearts-provider-state/
 .tmp/
 .merkle-snapshot.json
 

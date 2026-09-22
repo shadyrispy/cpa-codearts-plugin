@@ -94,3 +94,64 @@ test('successful optional request cancels its timer', async () => {
 test('the complete dashboard script remains syntactically valid', () => {
   new vm.Script(source.slice(source.indexOf('<script>') + '<script>'.length, source.indexOf('</script>')));
 });
+
+function schedulePanel(callImpl) {
+  const elements = { schedule: { innerHTML: '' }, claimDaily: {}, runAll: {} };
+  const controls = [{ disabled: false }, { disabled: false }];
+  let message;
+  const context = vm.createContext({
+    document: { getElementById: id => elements[id], querySelectorAll: () => controls, addEventListener() {} },
+    BASE: '/management', call: callImpl, say: text => { message = text; },
+    setTimeout() {}, load() {},
+  });
+  vm.runInContext(source.slice(source.indexOf('  function esc('), source.indexOf('  function tokenCount(')) +
+    source.slice(source.indexOf('  function renderSchedule('), source.indexOf('  function load()')), context);
+  return { context, elements, controls, message: () => message };
+}
+
+test('schedule renders total and individual switches, escaped IDs, and no automatic claim by default', () => {
+  const p = schedulePanel();
+  p.context.renderSchedule({ enabled: false, tasks: [{ id: 'daily-benefit-claim', enabled: false }, { id: '<unsafe>"', enabled: true }] });
+  const html = p.elements.schedule.innerHTML;
+  assert.match(html, /data-schedule-toggle>/);
+  assert.match(html, /data-task-toggle="daily-benefit-claim" aria-label/);
+  assert.match(html, /data-run="daily-benefit-claim" data-enabled="false"/);
+  assert(!html.includes('<unsafe>'));
+  p.context.renderSchedule({ enabled: false, tasks: [] });
+  assert.match(p.elements.schedule.innerHTML, /定时任务总开关/);
+});
+
+test('switch saves serialize and apply the authoritative response', async () => {
+  let resolve, calls = 0;
+  const p = schedulePanel((url, opts) => {
+    calls++;
+    assert.equal(url, '/management/schedule/config');
+    assert.equal(opts.body.enabled, false);
+    return new Promise(r => { resolve = r; });
+  });
+  const saving = p.context.saveSchedule({ enabled: false });
+  assert(p.controls.every(c => c.disabled));
+  await p.context.saveSchedule({ enabled: true });
+  assert.equal(calls, 1);
+  resolve({ enabled: false, persistent: true, tasks: [], note: 'saved' });
+  await saving;
+  assert.equal(p.context.scheduleSaving, false);
+  assert.equal(p.message(), 'saved');
+});
+
+test('failed save reloads server flags instead of presenting a false saved state', async () => {
+  const p = schedulePanel(url => url.endsWith('/config') ? Promise.reject(Error('read only')) : Promise.resolve({ enabled: true, tasks: [] }));
+  await p.context.saveSchedule({ enabled: false });
+  assert.match(p.elements.schedule.innerHTML, /data-schedule-toggle checked/);
+  assert.match(p.message(), /read only/);
+});
+
+test('manual claim names the built-in task and bulk run excludes disabled tasks', async () => {
+  const calls = [];
+  const p = schedulePanel((url, opts) => { calls.push({url, opts}); return Promise.resolve({}); });
+  vm.runInContext(source.slice(source.indexOf("  document.getElementById('claimDaily').onclick"), source.indexOf('  document.addEventListener("click"')), p.context);
+  p.elements.claimDaily.onclick();
+  assert.equal(calls[0].opts.body.task, 'daily-benefit-claim');
+  assert.equal(calls[0].url, '/management/checkin');
+  assert(source.includes('[data-run][data-enabled="true"]:not(:disabled)'));
+});
