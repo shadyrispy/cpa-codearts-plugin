@@ -100,7 +100,7 @@ func TestAsyncFaultTerminatesOnceWithoutSuccess(t *testing.T) {
 					req := executorRequest{}
 					req.Model, req.Format = "probe", protocol
 					session := &executorStreamSession{streamID: "client", stop: func() { stops++ }}
-					runUpstreamStream(cfg, req, &hostHTTPStreamOpen{StreamID: "upstream"}, session, cred)
+					runUpstreamStream(cfg, req, &hostHTTPStreamOpen{StreamID: "upstream"}, session, nil, cred)
 					if reads != 1 || failures != 1 || closes != 1 || stops != 1 {
 						t.Fatalf("reads=%d failures=%d closes=%d stops=%d", reads, failures, closes, stops)
 					}

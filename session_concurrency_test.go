@@ -271,12 +271,20 @@ func TestExecutorAsyncPermitHeldUntilStreamCloses(t *testing.T) {
 	unblock := make(chan struct{})
 	done := make(chan struct{})
 	var once sync.Once
+	answering := true
 	testHost(t, func(method string, request any) (json.RawMessage, error) {
 		switch method {
 		case "host.http.do_stream":
 			return json.Marshal(hostHTTPStreamOpen{StatusCode: 200, StreamID: "limit-upstream"})
 		case "host.http.stream_read":
-			close(entered)
+			// The executor only returns once the stream has proved it is answering,
+			// so the first read has to deliver content; the pump then parks on the
+			// second read with the permit still held.
+			if answering {
+				answering = false
+				close(entered)
+				return json.Marshal(hostHTTPStreamChunk{Payload: []byte(answerFrame)})
+			}
 			<-unblock
 			return json.Marshal(hostHTTPStreamChunk{Done: true})
 		case "host.http.stream_close":
