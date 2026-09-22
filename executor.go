@@ -172,7 +172,7 @@ func executorExecuteStream(request []byte) ([]byte, error) {
 		if response.StatusCode != http.StatusOK {
 			return upstreamHTTPErrorEnvelope(response, cred)
 		}
-		return bufferedStreamResponse(cfg, req.Model, clientProtocol(req.Format), response.Body)
+		return bufferedStreamResponse(cfg, req.Model, clientProtocol(req.Format), response.Body, cred)
 	}
 
 	// Open before accepting the stream so CPA can observe 401/403/429 and
@@ -200,7 +200,7 @@ func executorExecuteStream(request []byte) ([]byte, error) {
 		defer session.stop()
 		timer := time.AfterFunc(cfg.requestTimeout(), func() { session.fail("upstream request timed out") })
 		defer timer.Stop()
-		runUpstreamStream(cfg, req, open, session)
+		runUpstreamStream(cfg, req, open, session, cred)
 	}()
 
 	// An empty chunk list tells the host to consume the async stream bridge.
@@ -239,8 +239,12 @@ func (s *executorStreamSession) success() {
 // runUpstreamStream drives one upstream streaming request and forwards
 // translated frames to the host. Every exit path goes through the session, so
 // the upstream stream is closed exactly once.
-func runUpstreamStream(cfg *Config, req executorRequest, open *hostHTTPStreamOpen, session *executorStreamSession) {
+func runUpstreamStream(cfg *Config, req executorRequest, open *hostHTTPStreamOpen, session *executorStreamSession, credentials ...*credential) {
 	translator := newStreamRenderer(cfg, req.Model, clientProtocol(req.Format))
+	var cred *credential
+	if len(credentials) > 0 {
+		cred = credentials[0]
+	}
 
 	for {
 		payload, done, errRead := hostHTTPStreamRead(open.StreamID)
@@ -258,6 +262,10 @@ func runUpstreamStream(cfg *Config, req executorRequest, open *hostHTTPStreamOpe
 				}
 			}
 		}
+		if fault := translator.streamFault(); fault != nil {
+			session.fail(redactUpstreamError(fault.Message, cred, false))
+			return
+		}
 		if done {
 			break
 		}
@@ -266,12 +274,13 @@ func runUpstreamStream(cfg *Config, req executorRequest, open *hostHTTPStreamOpe
 	// An in-stream envelope means the answer never arrived, so the stream must not
 	// be terminated as a success the client cannot distinguish from an empty
 	// reply; failing it lets the host report and route around the condition.
+	frames := translator.finish()
 	if fault := translator.streamFault(); fault != nil {
-		session.fail(redactUpstreamError(fault.Message, nil, false))
+		session.fail(redactUpstreamError(fault.Message, cred, false))
 		return
 	}
 
-	for _, frame := range translator.finish() {
+	for _, frame := range frames {
 		if errEmit := hostStreamEmit(session.streamID, translator.hostPayload(frame)); errEmit != nil {
 			session.success()
 			return
@@ -282,12 +291,16 @@ func runUpstreamStream(cfg *Config, req executorRequest, open *hostHTTPStreamOpe
 
 // bufferedStreamResponse renders the whole upstream response as one SSE reply
 // for clients whose host connection cannot consume an async stream bridge.
-func bufferedStreamResponse(cfg *Config, model, protocol string, body []byte) ([]byte, error) {
+func bufferedStreamResponse(cfg *Config, model, protocol string, body []byte, credentials ...*credential) ([]byte, error) {
 	renderer := newStreamRenderer(cfg, model, protocol)
 	frames := renderer.feed(body)
 	frames = append(frames, renderer.finish()...)
 	if fault := renderer.streamFault(); fault != nil {
-		return failEnvelope(fault.Code, fault.Message, fault.Status)
+		var cred *credential
+		if len(credentials) > 0 {
+			cred = credentials[0]
+		}
+		return upstreamFailureEnvelope(fault, cred)
 	}
 
 	chunks := make([]pluginapi.ExecutorStreamChunk, 0, len(frames))
@@ -659,6 +672,7 @@ type streamRenderer struct {
 	anthropic  *anthropicStreamRenderer
 	decoder    sseDecoder
 	done       bool
+	finished   bool
 	// fault records the first in-stream error envelope so the caller can fail the
 	// stream instead of closing it as a success with no content.
 	fault *upstreamStreamFault
@@ -698,33 +712,20 @@ func newStreamRenderer(cfg *Config, model, protocol string) *streamRenderer {
 
 // feed consumes upstream bytes and returns frames to forward verbatim.
 func (r *streamRenderer) feed(data []byte) [][]byte {
-	if r.anthropic != nil {
-		// The upstream still speaks OpenAI chunks (agent mode) or is normalised to
-		// them by the native translator; the Anthropic renderer owns the framing
-		// for this protocol.
-		var out [][]byte
-		for _, frame := range r.decoder.push(data) {
-			payload := executorStreamPayload([]byte(frame))
-			if len(payload) == 0 {
-				continue
-			}
-			if r.observeFault(payload) {
-				continue
-			}
-			out = append(out, r.anthropic.feed(payload)...)
-		}
-		return out
+	if r.finished || r.fault != nil {
+		return nil
 	}
-	if r.translator != nil {
-		// The native translator owns its own framing, so an in-stream envelope is
-		// reported by the aggregated path rather than withheld here.
-		return r.translator.translate(data)
-	}
-	// Agent mode already streams OpenAI SSE, so frames are forwarded unchanged
-	// once complete frames have been assembled.
+	// One decoder and fault check own every upstream mode, including native
+	// frames destined for Anthropic. Never translate an error into empty success.
 	var out [][]byte
 	for _, frame := range r.decoder.push(data) {
 		if r.observeFault(executorStreamPayload([]byte(frame))) {
+			break
+		}
+		if r.translator != nil {
+			if chunk, ok := parseFrame(frame); ok {
+				out = append(out, r.renderOpenAI(r.translator.translateChunk(chunk))...)
+			}
 			continue
 		}
 		if isDoneFrame([]byte(frame)) {
@@ -733,32 +734,41 @@ func (r *streamRenderer) feed(data []byte) [][]byte {
 			}
 			r.done = true
 		}
-		out = append(out, []byte(frame+"\n\n"))
+		out = append(out, r.renderOpenAI([][]byte{[]byte(frame + "\n\n")})...)
+	}
+	return out
+}
+
+func (r *streamRenderer) renderOpenAI(frames [][]byte) [][]byte {
+	if r.anthropic == nil {
+		return frames
+	}
+	var out [][]byte
+	for _, frame := range frames {
+		if payload := executorStreamPayload(frame); len(payload) > 0 {
+			out = append(out, r.anthropic.feed(payload)...)
+		}
 	}
 	return out
 }
 
 // finish emits the terminating frames for the stream.
 func (r *streamRenderer) finish() [][]byte {
-	if r.anthropic != nil {
-		var out [][]byte
-		// Flush a trailing frame that was not blank-line terminated.
-		if trailing := strings.TrimSpace(r.decoder.buffer.String()); trailing != "" {
-			if payload := executorStreamPayload([]byte(trailing)); len(payload) > 0 {
-				out = append(out, r.anthropic.feed(payload)...)
-			}
-		}
-		return append(out, r.anthropic.finish()...)
+	if r.finished {
+		return nil
+	}
+	// EOF flush goes through exactly the same fault check as complete frames.
+	out := r.feed([]byte("\n\n"))
+	r.finished = true
+	if r.fault != nil {
+		return out
 	}
 	if r.translator != nil {
-		return r.translator.finalFrames()
+		out = append(out, r.renderOpenAI(r.translator.finalFrames())...)
+		r.done = true
 	}
-	// Flush any trailing agent-mode frame that was not blank-line terminated.
-	var out [][]byte
-	if trailing := strings.TrimSpace(r.decoder.buffer.String()); trailing != "" {
-		if !isDoneFrame([]byte(trailing)) {
-			out = append(out, []byte(trailing+"\n\n"))
-		}
+	if r.anthropic != nil {
+		return append(out, r.anthropic.finish()...)
 	}
 	if !r.done {
 		out = append(out, []byte("data: [DONE]\n\n"))
@@ -825,7 +835,17 @@ func streamFrameFault(payload []byte) *upstreamStreamFault {
 	if code == "" || streamSuccessCodes[strings.ToLower(code)] {
 		return nil
 	}
-	if len(frame.Delta) > 0 || len(frame.Choices) > 0 || strings.TrimSpace(frame.Text) != "" {
+	var choices []struct {
+		Delta   json.RawMessage `json:"delta"`
+		Message json.RawMessage `json:"message"`
+		Text    string          `json:"text"`
+	}
+	_ = json.Unmarshal(frame.Choices, &choices)
+	hasContent := streamDeltaHasContent(frame.Delta)
+	for _, choice := range choices {
+		hasContent = hasContent || streamDeltaHasContent(choice.Delta) || streamDeltaHasContent(choice.Message) || choice.Text != ""
+	}
+	if hasContent || (strings.TrimSpace(frame.Text) != "" && strings.TrimSpace(frame.Text) != doneSentinel) {
 		return nil
 	}
 
@@ -854,6 +874,19 @@ func streamFrameFault(payload []byte) *upstreamStreamFault {
 		fault.Code, fault.Status = "rate_limit_exceeded", http.StatusTooManyRequests
 	}
 	return fault
+}
+
+// Null/empty containers and role-only deltas are metadata, not a partial answer.
+func streamDeltaHasContent(raw json.RawMessage) bool {
+	var delta struct {
+		Content          json.RawMessage   `json:"content"`
+		ReasoningContent string            `json:"reasoning_content"`
+		ToolCalls        []json.RawMessage `json:"tool_calls"`
+	}
+	if json.Unmarshal(raw, &delta) != nil {
+		return false
+	}
+	return decodeMessageContent(delta.Content) != "" || delta.ReasoningContent != "" || len(delta.ToolCalls) > 0
 }
 
 // upstreamFailureEnvelope maps an aggregation failure to a host-visible error,

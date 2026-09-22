@@ -225,9 +225,13 @@ you restart the gateway to finish.
 The repository includes
 [`/.github/workflows/release.yml`](../.github/workflows/release.yml). Pushing a
 tag such as `v0.1.1` runs tests, builds Linux/glibc amd64 and Windows amd64,
-checks both ABIs and archives, then creates the GitHub Release with the two zips
+checks both ABIs and archives, runs the Linux library in the official CPA v7.3.9
+host against local fixtures (including optional-request cancellation), then creates the GitHub Release with the two zips
 and `checksums.txt`. The workflow can also be rerun manually with an existing
 tag; existing assets are replaced with the rebuilt copies.
+
+Release notes come from `docs/releases/<tag>.md` when present; otherwise GitHub
+generates them. The test step includes the dashboard's Node regression tests.
 
 The job requests only `contents: write` and uses GitHub's built-in token.
 Protected environments and personal access tokens are not required. If an

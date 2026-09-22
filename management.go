@@ -50,6 +50,11 @@ func managementRoutes() []map[string]any {
 		},
 		{
 			"Method":      http.MethodGet,
+			"Path":        "/codearts-provider/benefit-balance",
+			"Description": "Refresh one account's optional benefit allowance independently (query: auth_index). Caller cancellation stops the upstream request.",
+		},
+		{
+			"Method":      http.MethodGet,
 			"Path":        "/codearts-provider/schedule",
 			"Description": "List configured cron tasks with next/last run state.",
 		},
@@ -156,7 +161,9 @@ func managementHandle(request []byte) ([]byte, error) {
 	case route == "/quota" && method == http.MethodGet:
 		return okEnvelope(handleQuotaGet(req.Query))
 	case route == "/quota/refresh" && method == http.MethodPost:
-		return okEnvelope(handleQuotaRefresh(req.ManagementRequest))
+		return okEnvelope(handleQuotaRefresh(req.ManagementRequest, req.HostCallbackID))
+	case route == "/benefit-balance" && method == http.MethodGet:
+		return okEnvelope(handleBenefitBalance(req.Query, req.HostCallbackID))
 	case route == "/schedule" && method == http.MethodGet:
 		return okEnvelope(handleScheduleGet())
 	case route == "/schedule/run" && method == http.MethodPost:
@@ -358,10 +365,11 @@ type accountView struct {
 	Features  any          `json:"features,omitempty"`
 	// Benefit is the limited-time daily token pool, reported next to the
 	// subscription meters because it is accounted separately upstream.
-	Benefit        *benefitBalance `json:"benefit,omitempty"`
-	BenefitError   string          `json:"benefit_error,omitempty"`
-	QuotaFetchedAt string          `json:"quota_fetched_at,omitempty"`
-	QuotaError     string          `json:"quota_error,omitempty"`
+	Benefit          *benefitBalance `json:"benefit,omitempty"`
+	BenefitError     string          `json:"benefit_error,omitempty"`
+	BenefitFetchedAt string          `json:"benefit_fetched_at,omitempty"`
+	QuotaFetchedAt   string          `json:"quota_fetched_at,omitempty"`
+	QuotaError       string          `json:"quota_error,omitempty"`
 
 	LastRefresh string `json:"last_refresh,omitempty"`
 	NextRefresh string `json:"next_refresh,omitempty"`
@@ -416,6 +424,9 @@ func codeartsAccounts() ([]accountView, error) {
 			view.Features = snapshot.Features
 			view.Benefit = snapshot.Benefit
 			view.BenefitError = snapshot.BenefitError
+			if !snapshot.BenefitFetchedAt.IsZero() {
+				view.BenefitFetchedAt = snapshot.BenefitFetchedAt.Format(time.RFC3339)
+			}
 			view.QuotaError = snapshot.Error
 			if !snapshot.FetchedAt.IsZero() {
 				view.QuotaFetchedAt = snapshot.FetchedAt.Format(time.RFC3339)
@@ -438,6 +449,47 @@ func handleAccounts() pluginapi.ManagementResponse {
 		"accounts": views,
 	})
 	return jsonResponse(http.StatusOK, body)
+}
+
+// Optional benefit I/O is never part of quota.fetch, the scheduler or account
+// listing. This one-account request can be cancelled independently by the UI.
+func handleBenefitBalance(query url.Values, callbackID string) pluginapi.ManagementResponse {
+	authIndex := strings.TrimSpace(query.Get("auth_index"))
+	if authIndex == "" {
+		return errorJSON(http.StatusBadRequest, "auth_index is required")
+	}
+	if strings.TrimSpace(callbackID) == "" {
+		return errorJSON(http.StatusNotImplemented, "host did not provide a cancellable management context")
+	}
+	if config().APIMode == "native" {
+		return errorJSON(http.StatusBadRequest, "benefit allowance is only available in agent mode")
+	}
+	files, errList := hostAuthList()
+	if errList != nil {
+		return errorJSON(http.StatusBadGateway, "could not read the account inventory")
+	}
+	for _, file := range files {
+		if file.AuthIndex != authIndex || (normalizeProvider(file.Provider) != providerID && normalizeProvider(file.Type) != providerID) {
+			continue
+		}
+		storage, errGet := hostAuthGet(authIndex)
+		if errGet != nil {
+			return errorJSON(http.StatusBadGateway, "could not read the account credential")
+		}
+		cred, errCred := credentialFromStorage(storage)
+		if errCred != nil || !cred.valid() {
+			return errorJSON(http.StatusBadRequest, "the account credential is incomplete")
+		}
+		balance, errFetch := fetchBenefitBalance(config(), cred, callbackID)
+		if errFetch != nil {
+			quotas.putBenefit(authIndex, nil, errFetch.Error())
+			return errorJSON(http.StatusBadGateway, errFetch.Error())
+		}
+		quotas.putBenefit(authIndex, &balance, "")
+		body, _ := json.Marshal(map[string]any{"auth_index": authIndex, "benefit": balance})
+		return jsonResponse(http.StatusOK, body)
+	}
+	return errorJSON(http.StatusNotFound, "CodeArts account was not found")
 }
 
 func handleAccountModels(query url.Values, callbackID string) pluginapi.ManagementResponse {
@@ -511,7 +563,7 @@ func handleQuotaGet(query map[string][]string) pluginapi.ManagementResponse {
 }
 
 // handleQuotaRefresh refreshes one or all accounts, forcing an upstream read.
-func handleQuotaRefresh(req pluginapi.ManagementRequest) pluginapi.ManagementResponse {
+func handleQuotaRefresh(req pluginapi.ManagementRequest, callbackIDs ...string) pluginapi.ManagementResponse {
 	authIndex := ""
 	if len(req.Body) > 0 {
 		var body struct {
@@ -550,7 +602,7 @@ func handleQuotaRefresh(req pluginapi.ManagementRequest) pluginapi.ManagementRes
 			errorsSeen = append(errorsSeen, file.AuthIndex+": credential is incomplete")
 			continue
 		}
-		if _, errFetch := fetchQuotaSnapshot(file.AuthIndex, cred); errFetch != nil {
+		if _, errFetch := fetchQuotaSnapshot(file.AuthIndex, cred, callbackIDs...); errFetch != nil {
 			failed++
 			errorsSeen = append(errorsSeen, file.AuthIndex+": "+errFetch.Error())
 			continue

@@ -64,7 +64,8 @@ type quotaSnapshot struct {
 	Benefit *benefitBalance `json:"benefit,omitempty"`
 	// BenefitError records a failed benefit allowance lookup without discarding
 	// the subscription snapshot that did succeed.
-	BenefitError string `json:"benefit_error,omitempty"`
+	BenefitError     string    `json:"benefit_error,omitempty"`
+	BenefitFetchedAt time.Time `json:"benefit_fetched_at,omitempty"`
 
 	// FetchedAt is when this snapshot was taken.
 	FetchedAt time.Time `json:"fetched_at"`
@@ -155,7 +156,35 @@ func (c *quotaCache) put(snapshot quotaSnapshot) {
 	if c.snapshots == nil {
 		c.snapshots = map[string]quotaSnapshot{}
 	}
+	// Package and benefit refreshes are independent. Merge under the same lock
+	// so a late package response cannot erase a newer benefit result.
+	if old, ok := c.snapshots[snapshot.AuthIndex]; ok && snapshot.Benefit == nil && snapshot.BenefitError == "" {
+		old = freshBenefitSnapshot(old)
+		snapshot.Benefit, snapshot.BenefitError = old.Benefit, old.BenefitError
+		snapshot.BenefitFetchedAt = old.BenefitFetchedAt
+	}
 	c.snapshots[snapshot.AuthIndex] = snapshot
+}
+
+func freshBenefitSnapshot(snapshot quotaSnapshot) quotaSnapshot {
+	if !snapshot.BenefitFetchedAt.IsZero() && time.Since(snapshot.BenefitFetchedAt) > 5*time.Minute {
+		snapshot.Benefit = nil
+		snapshot.BenefitError = "cached benefit allowance expired; refresh it separately"
+	}
+	return snapshot
+}
+
+func (c *quotaCache) putBenefit(authIndex string, balance *benefitBalance, message string) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.snapshots == nil {
+		c.snapshots = map[string]quotaSnapshot{}
+	}
+	snapshot := c.snapshots[authIndex]
+	snapshot.AuthIndex = authIndex
+	snapshot.Benefit, snapshot.BenefitError = balance, message
+	snapshot.BenefitFetchedAt = time.Now()
+	c.snapshots[authIndex] = snapshot
 }
 
 func (c *quotaCache) get(authIndex string) (quotaSnapshot, bool) {
@@ -165,7 +194,7 @@ func (c *quotaCache) get(authIndex string) (quotaSnapshot, bool) {
 	c.mu.RLock()
 	defer c.mu.RUnlock()
 	snapshot, ok := c.snapshots[authIndex]
-	return snapshot, ok
+	return freshBenefitSnapshot(snapshot), ok
 }
 
 func (c *quotaCache) all() map[string]quotaSnapshot {
@@ -176,7 +205,7 @@ func (c *quotaCache) all() map[string]quotaSnapshot {
 	defer c.mu.RUnlock()
 	out := make(map[string]quotaSnapshot, len(c.snapshots))
 	for key, value := range c.snapshots {
-		out[key] = value
+		out[key] = freshBenefitSnapshot(value)
 	}
 	return out
 }
@@ -192,7 +221,11 @@ func (c *quotaCache) forget(authIndex string) {
 
 // fetchQuotaSnapshot queries the statistics endpoint for one credential and
 // updates the cache. It returns the normalised snapshot.
-func fetchQuotaSnapshot(authIndex string, cred *credential) (quotaSnapshot, error) {
+func fetchQuotaSnapshot(authIndex string, cred *credential, callbackIDs ...string) (quotaSnapshot, error) {
+	var callbackID string
+	if len(callbackIDs) > 0 {
+		callbackID = callbackIDs[0]
+	}
 	if cred != nil && cred.valid() {
 		refreshed, errRefresh := prepareCredentialForUse(authIndex, cred)
 		if errRefresh != nil {
@@ -224,7 +257,7 @@ func fetchQuotaSnapshot(authIndex string, cred *credential) (quotaSnapshot, erro
 		headers = signed
 	}
 
-	response, errDo := hostHTTPDo(http.MethodGet, endpoint, headers, nil)
+	response, errDo := hostHTTPDoContext(callbackID, http.MethodGet, endpoint, headers, nil)
 	if errDo != nil {
 		errFetch := fmt.Errorf("statistics request failed: %w", errDo)
 		quotas.put(quotaSnapshot{AuthIndex: authIndex, FetchedAt: time.Now(), Error: errFetch.Error()})
@@ -247,20 +280,10 @@ func fetchQuotaSnapshot(authIndex string, cred *credential) (quotaSnapshot, erro
 	if cred != nil {
 		snapshot.Label = firstNonEmptyString(cred.UserName, cred.UserID)
 	}
-	// Read on every refresh, including the partial-failure path: the daily benefit
-	// pool is the quota that actually runs out mid-day, so a stale value would be
-	// the most misleading thing to keep showing. A failure here is recorded on the
-	// snapshot rather than failing the refresh, because the subscription meters
-	// above are still valid answers.
-	if cfg.APIMode != "native" {
-		balance, errBenefit := fetchBenefitBalance(cfg, cred)
-		if errBenefit != nil {
-			snapshot.BenefitError = errBenefit.Error()
-		} else {
-			snapshot.Benefit = &balance
-		}
-	}
+	// Optional benefit I/O belongs to its own cancellable management request.
+	// Automatic quota refresh must never wait on that separate gateway.
 	quotas.put(snapshot)
+	snapshot, _ = quotas.get(authIndex)
 	return snapshot, nil
 }
 
@@ -270,11 +293,11 @@ type statisticsResponse struct {
 	Show *statisticsShow `json:"show"`
 	End  string          `json:"end_date"`
 	Metr []struct {
-		Name             string  `json:"name"`
-		Value            float64 `json:"value"`
-		UsageTokenNum    int64   `json:"usage_token_num"`
-		PackageTokenAmnt int64   `json:"package_token_amount"`
-		Show             bool    `json:"show"`
+		Name             string   `json:"name"`
+		Value            *float64 `json:"value"`
+		UsageTokenNum    int64    `json:"usage_token_num"`
+		PackageTokenAmnt int64    `json:"package_token_amount"`
+		Show             bool     `json:"show"`
 	} `json:"metrics"`
 	Package *struct {
 		SpecCode      string `json:"spec_code"`
@@ -318,8 +341,8 @@ func parseQuotaSnapshot(body []byte) (quotaSnapshot, error) {
 		if meter.Label == "" {
 			meter.Label = metric.Name
 		}
-		if metric.Value >= 0 {
-			value := metric.Value
+		if metric.Value != nil && *metric.Value >= 0 {
+			value := *metric.Value
 			meter.UsedPercent = &value
 		}
 		if meter.UsedPercent == nil && meter.UsedTokens == 0 && meter.AllowanceTokens == 0 {
@@ -359,7 +382,10 @@ func quotaDescribe() pluginapi.QuotaDescribeResponse {
 // quotaFetch answers a quota request from the cache, refreshing on demand when
 // the cached entry is missing or stale.
 func quotaFetch(request []byte) ([]byte, error) {
-	var req pluginapi.QuotaFetchRequest
+	var req struct {
+		pluginapi.QuotaFetchRequest
+		HostCallbackID string `json:"host_callback_id"`
+	}
 	if len(request) > 0 {
 		if errUnmarshal := json.Unmarshal(request, &req); errUnmarshal != nil {
 			return nil, fmt.Errorf("decode quota fetch request: %w", errUnmarshal)
@@ -391,7 +417,7 @@ func quotaFetch(request []byte) ([]byte, error) {
 				return failEnvelope("missing_credential", "no credential is available for this account", http.StatusUnauthorized)
 			}
 		} else {
-			fresh, errFetch := fetchQuotaSnapshot(authIndex, cred)
+			fresh, errFetch := fetchQuotaSnapshot(authIndex, cred, req.HostCallbackID)
 			if errFetch != nil {
 				if ok {
 					// Serve the stale snapshot rather than an error; the error is

@@ -76,12 +76,18 @@ func parseBenefitBalance(body []byte) (benefitBalance, error) {
 
 // fetchBenefitBalance reads the daily benefit allowance for one credential. It
 // is signed exactly like the claim request, which the same gateway accepts.
-func fetchBenefitBalance(cfg *Config, cred *credential) (benefitBalance, error) {
+func fetchBenefitBalance(cfg *Config, cred *credential, callbackIDs ...string) (benefitBalance, error) {
 	if cfg == nil || strings.TrimSpace(cfg.BenefitGatewayURL) == "" {
 		return benefitBalance{}, fmt.Errorf("no benefit gateway URL is configured")
 	}
 	if cred == nil || !cred.valid() {
 		return benefitBalance{}, fmt.Errorf("benefit balance requires an account credential")
+	}
+	// The ABI cannot set an independent deadline on host.http.do. Never launch
+	// this optional request under a detached/background context. The management
+	// caller owns cancellation (the dashboard aborts this request after 5s).
+	if len(callbackIDs) == 0 || strings.TrimSpace(callbackIDs[0]) == "" {
+		return benefitBalance{}, fmt.Errorf("benefit balance requires a cancellable management request")
 	}
 	endpoint := strings.TrimRight(cfg.BenefitGatewayURL, "/") + epBenefitBalance
 	headers := map[string]string{
@@ -96,12 +102,16 @@ func fetchBenefitBalance(cfg *Config, cred *credential) (benefitBalance, error) 
 	if errSign != nil {
 		return benefitBalance{}, fmt.Errorf("sign benefit balance request: %w", errSign)
 	}
-	response, errDo := hostHTTPDo(http.MethodGet, endpoint, signed, nil)
+	response, errDo := hostHTTPDoContext(callbackIDs[0], http.MethodGet, endpoint, signed, nil)
 	if errDo != nil {
-		return benefitBalance{}, fmt.Errorf("benefit balance request failed: %w", errDo)
+		return benefitBalance{}, fmt.Errorf("benefit balance request failed or was cancelled")
 	}
 	if response.StatusCode != http.StatusOK {
-		return benefitBalance{}, fmt.Errorf("benefit balance returned HTTP %d: %s", response.StatusCode, truncate(string(response.Body), 200))
+		return benefitBalance{}, fmt.Errorf("benefit balance returned HTTP %d", response.StatusCode)
 	}
-	return parseBenefitBalance(response.Body)
+	balance, errParse := parseBenefitBalance(response.Body)
+	if errParse != nil {
+		return benefitBalance{}, fmt.Errorf("%s", redactUpstreamError(errParse.Error(), cred, false))
+	}
+	return balance, nil
 }

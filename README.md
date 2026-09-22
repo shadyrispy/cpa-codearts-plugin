@@ -446,6 +446,7 @@ All routes live under `/v0/management/codearts-provider/` and require the admin 
 | `POST` | `/login/callback` | Relay the browser callback URL for a gateway the browser cannot reach (body: `{state, callback_url}`). |
 | `GET` | `/quota` | Normalised quota view; `?auth_index=` narrows to one account. |
 | `POST` | `/quota/refresh` | Force an upstream quota read (body: `{auth_index}`, omit for all). |
+| `GET` | `/benefit-balance?auth_index=...` | Independently refresh one account's optional benefit allowance; cancel this request to cancel upstream I/O. |
 | `GET` | `/usage` | Token usage rollup from host usage records: totals, per-model, per-account, recent. |
 | `GET` | `/schedule` | Configured tasks with `next_run`, `last_run`, `last_error`. |
 | `POST` | `/schedule/run` | Run one task now (body: `{task}`). |
@@ -491,7 +492,7 @@ Its `metrics[].value` fields are **consumed percentages**, while CLIProxyAPI's
 quota model expects a `remainingFraction`, so the value is inverted
 (`(100 - used) / 100`). The plugin keeps the upstream's own selection: a metric is
 shown when upstream reports it **and** sets `show:true`. Absent metrics and
-negative values are not displayed, because inventing `0%` claims an untouched
+negative, missing or null percentage values are not displayed, because inventing `0%` claims an untouched
 quota where the truth is "nothing was reported".
 
 Upstream migrates metric names instead of deprecating them. Captured live on
@@ -522,9 +523,18 @@ plugin therefore also reads
 GET {benefit_gateway_url}/api/v1/user/tokens/balance
 ```
 
-signed like the claim request, on every quota refresh, and carries it as
-`benefit` (with `benefit_error` when that one call fails) in `/accounts` and on
-the panel as a separate daily meter. Two upstream conventions are preserved:
+signed like the claim request, through the separate authenticated
+`GET /v0/management/codearts-provider/benefit-balance?auth_index=...` route.
+Click **刷新福利额度** on an account card to query it; the panel aborts after five
+seconds and forwards cancellation through the host callback context. API clients
+should also set their own request deadline (for example, curl `--max-time 5`).
+The current host ABI has no independent per-request timeout setting, so the
+plugin does not launch detached optional requests. Automatic quota refresh and
+the scheduler query only the package endpoint; a slow benefit gateway cannot
+block them. The independently fetched result is cached for five minutes as
+`benefit` (with `benefit_error` on failure and `benefit_fetched_at` for freshness)
+in `/accounts`, the quota view and the panel. Expired balances are not reported
+as current quota. Two upstream conventions are preserved:
 `daily_token_limit: 0` means **uncapped**, not exhausted, so it is shown as raw
 counters instead of an empty bar; and usage above the cap is reported as measured
 rather than clamped to 100%, because the gateway keeps counting past the cap and

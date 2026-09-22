@@ -168,8 +168,8 @@ const panelTemplate = `<!doctype html>
   // Privileged calls carry the management key because the resource page itself
   // is unauthenticated. Acquisition follows the CPA panel convention shared by
   // the qoder/trae dashboards: a value typed here (remembered for the tab), the
-  // tab's sessionStorage, the same-origin CPA main panel store when embedded, or
-  // a one-time ?key= parameter. The previous key names ("apiKey", "adminKey", …)
+  // a one-time ?key= parameter, the same-origin CPA main panel store when
+  // embedded, then tab sessionStorage. Previous keys ("apiKey", "adminKey", …)
   // are never written by CPA, so automatic acquisition always missed.
   var PANEL_STORE = "cli-proxy-auth";
   var ENC_PREFIX = "enc::v1::";
@@ -213,26 +213,28 @@ const panelTemplate = `<!doctype html>
     } catch (e) { return null; }
   }
   function urlKey() {
-    var match = /[?&]key=([^&]+)/.exec(window.location.search);
-    if (!match) return null;
-    var value = match[1];
-    try { value = decodeURIComponent(value); } catch (e) {}
+    var query = new URLSearchParams(window.location.search);
+    if (!query.has("key")) return null;
+    var value = (query.get("key") || "").trim();
+    query.delete("key");
     // Drop the secret from the address bar and browser history.
-    window.history.replaceState(null, "", window.location.pathname);
+    var rest = query.toString();
+    window.history.replaceState(null, "", window.location.pathname +
+      (rest ? "?" + rest : "") + window.location.hash);
     return value || null;
   }
 
+  // Consume/clean the URL once, even if a typed or cached key wins later.
+  // Keep it in memory too: restricted browsers can reject sessionStorage.
+  var initialURLKey = urlKey();
   function adminKey() {
     var entered = document.getElementById("managementKey").value.trim();
     if (entered) { store(SS_KEY, entered); return entered; }
-    var remembered = recall(SS_KEY);
-    if (remembered) return remembered;
+    if (initialURLKey) { store(SS_KEY, initialURLKey); return initialURLKey; }
     var embedded = embeddedKey();
     if (embedded) return embedded;
-    // urlKey() erases ?key= from the address bar, so the value must be kept in
-    // sessionStorage here or later callers would read an empty query string.
-    var fromUrl = urlKey();
-    if (fromUrl) { store(SS_KEY, fromUrl); return fromUrl; }
+    var remembered = recall(SS_KEY);
+    if (remembered) return remembered;
     return "";
   }
 
@@ -251,9 +253,16 @@ const panelTemplate = `<!doctype html>
 
   function call(path, opts) {
     opts = opts || {};
+    var controller = null, timer = null;
+    if (opts.timeout) {
+      if (!window.AbortController) return Promise.reject(new Error("浏览器不支持可取消请求，请更新浏览器"));
+      controller = new window.AbortController();
+      timer = setTimeout(function () { controller.abort(); }, opts.timeout);
+    }
     return fetch(path, {
       method: opts.method || "GET",
       headers: headers(),
+      signal: controller ? controller.signal : undefined,
       body: opts.body ? JSON.stringify(opts.body) : undefined
     }).then(function (r) {
       return r.text().then(function (t) {
@@ -265,7 +274,7 @@ const panelTemplate = `<!doctype html>
         }
         return data;
       });
-    });
+    }).finally(function () { if (timer !== null) clearTimeout(timer); });
   }
 
   function esc(s) {
@@ -358,7 +367,8 @@ const panelTemplate = `<!doctype html>
       return '<div class="acct"><div class="top"><span class="who">' + head + '</span>' + pill + '</div>' +
         (bits.length ? '<div class="meta">' + bits.join(" · ") + '</div>' : '') +
         meterRows(a) +
-        benefitBlock(a) +
+        '<div data-benefit-result="' + esc(a.auth_index) + '">' + benefitBlock(a) + '</div>' +
+        '<div style="margin-top:9px"><button data-benefit="' + esc(a.auth_index) + '">刷新福利额度</button></div>' +
         (a.quota_error ? '<div class="meta err">额度查询失败：' + esc(a.quota_error) + '</div>' : '') +
         '<div style="margin-top:9px"><button data-models="' + esc(a.auth_index) + '">查看账号模型</button></div>' +
         '<div data-model-list="' + esc(a.auth_index) + '" class="meta">模型列表从此账号的华为服务获取。</div>' +
@@ -514,6 +524,19 @@ const panelTemplate = `<!doctype html>
   document.addEventListener("click", function (ev) {
     var t = ev.target;
     if (!t || t.tagName !== "BUTTON") return;
+    var benefitAccount = t.getAttribute("data-benefit");
+    if (benefitAccount) {
+      var benefitBox = t.parentNode.previousElementSibling;
+      t.disabled = true;
+      benefitBox.textContent = "正在查询福利额度（最多等待 5 秒）…";
+      call(BASE + "/benefit-balance?auth_index=" + encodeURIComponent(benefitAccount), { timeout: 5000 })
+        .then(function (data) { benefitBox.innerHTML = benefitBlock(data); })
+        .catch(function (e) {
+          benefitBox.textContent = e.name === "AbortError" ? "福利查询超时，可重试；套餐额度不受影响。" : "福利查询失败：" + e.message;
+        })
+        .finally(function () { t.disabled = false; });
+      return;
+    }
     var modelAccount = t.getAttribute("data-models");
     if (modelAccount) {
       var modelBox = t.parentNode.nextElementSibling;

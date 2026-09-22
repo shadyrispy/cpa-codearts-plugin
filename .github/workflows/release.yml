@@ -69,6 +69,7 @@ jobs:
           go test -race ./...
           go vet ./...
           test -z "$(gofmt -l -- *.go)"
+          node --test tools/panel-regression.test.cjs
 
       - name: Build release archives
         env:
@@ -98,6 +99,24 @@ jobs:
           done
           objdump -p /tmp/codearts-provider.so | grep -F 'NEEDED' | grep -F 'libc.so.6'
 
+      - name: Test the Linux plugin in an actual CPA host
+        shell: bash
+        run: |
+          set -euo pipefail
+          stage="$(mktemp -d)"
+          archive="CLIProxyAPI_7.3.9_linux_amd64.tar.gz"
+          base="https://github.com/router-for-me/CLIProxyAPI/releases/download/v7.3.9"
+          curl --fail --location --retry 3 --max-time 120 "$base/$archive" -o "$stage/$archive"
+          curl --fail --location --retry 3 --max-time 60 "$base/checksums.txt" -o "$stage/checksums.txt"
+          (
+            cd "$stage"
+            grep -F " $archive" checksums.txt | sha256sum --check --strict
+            tar -xzf "$archive" cli-proxy-api
+          )
+          CODEARTS_CPA_EXE="$stage/cli-proxy-api" \
+          CODEARTS_PLUGIN_DLL=/tmp/codearts-provider.so \
+            go test -run '^TestCPAIntegration$' -count=1 -v .
+
       - name: Create or update GitHub Release
         env:
           GH_TOKEN: ${{ github.token }}
@@ -113,8 +132,12 @@ jobs:
           if gh release view "$RELEASE_TAG" >/dev/null 2>&1; then
             gh release upload "$RELEASE_TAG" "${assets[@]}" --clobber
           else
+            notes=(--generate-notes)
+            if [ -f "docs/releases/$RELEASE_TAG.md" ]; then
+              notes=(--notes-file "docs/releases/$RELEASE_TAG.md")
+            fi
             gh release create "$RELEASE_TAG" "${assets[@]}" \
               --verify-tag \
               --title "$RELEASE_TAG" \
-              --generate-notes
+              "${notes[@]}"
           fi

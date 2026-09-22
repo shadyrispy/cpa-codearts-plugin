@@ -57,6 +57,7 @@ secret_key.txt
 /tools/abitest/abitest
 /tools/abitest/abitest.exe
 # `go build ./...` in the repo root writes an executable named after the module.
+/cpa-codearts-plugin
 /*.exe
 /dist/
 /coverage.out

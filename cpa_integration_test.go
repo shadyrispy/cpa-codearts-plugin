@@ -2,6 +2,7 @@ package main
 
 import (
 	"bytes"
+	"context"
 	"encoding/base64"
 	"encoding/json"
 	"fmt"
@@ -32,6 +33,10 @@ func TestCPAIntegration(t *testing.T) {
 	}
 	var chatCalls, loginCalls, renewCalls, benefitCatalogCalls atomic.Int32
 	var nextStatus atomic.Int32
+	var nextStreamFault atomic.Bool
+	var blockBenefit atomic.Bool
+	benefitEntered, benefitCancelled := make(chan struct{}, 1), make(chan struct{}, 1)
+	var benefitCalls atomic.Int32
 	var sessionMu sync.Mutex
 	activeSessions := map[string]bool{}
 	sessionStarts := map[string]int{}
@@ -71,6 +76,22 @@ func TestCPAIntegration(t *testing.T) {
 			return
 		}
 		switch r.URL.Path {
+		case "/snap-manager/v1/statistics/plugin":
+			w.Header().Set("Content-Type", "application/json")
+			fmt.Fprint(w, `{"metrics":[{"name":"usageTokenChatMessages","value":20,"show":true}],"package":{"spec_code":"fixture-plan"}}`)
+		case epBenefitBalance:
+			benefitCalls.Add(1)
+			if blockBenefit.Load() {
+				benefitEntered <- struct{}{}
+				select {
+				case <-r.Context().Done():
+					benefitCancelled <- struct{}{}
+				case <-time.After(10 * time.Second):
+					http.Error(w, "fixture cancellation was not propagated", http.StatusGatewayTimeout)
+				}
+				return
+			}
+			fmt.Fprint(w, `{"error_code":"0000","result":{"daily_token_limit":100,"daily_tokens_used":30}}`)
 		case "/snap-manager/v1/token/renew":
 			renewCalls.Add(1)
 			w.Header().Set("Content-Type", "application/json")
@@ -154,6 +175,11 @@ func TestCPAIntegration(t *testing.T) {
 				return
 			}
 			w.Header().Set("Content-Type", "text/event-stream")
+			if nextStreamFault.Load() {
+				// HTTP 200 with an error inside the final, unterminated SSE frame.
+				fmt.Fprint(w, "data: "+quotaFaultFrame)
+				return
+			}
 			if bytes.Contains(body, []byte("lookup")) {
 				fmt.Fprint(w, "data: {\"id\":\"chatcmpl-test\",\"object\":\"chat.completion.chunk\",\"model\":\"audit-model\",\"choices\":[{\"index\":0,\"delta\":{\"role\":\"assistant\",\"tool_calls\":[{\"index\":0,\"id\":\"call1\",\"type\":\"function\",\"function\":{\"name\":\"lookup\",\"arguments\":\"{}\"}}]},\"finish_reason\":null}]}\r\n\r\n")
 				fmt.Fprint(w, "data: {\"id\":\"chatcmpl-test\",\"object\":\"chat.completion.chunk\",\"model\":\"audit-model\",\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"tool_calls\"}]}\r\n\r\n")
@@ -363,6 +389,49 @@ func TestCPAIntegration(t *testing.T) {
 	if json.Unmarshal(body, &accountList) != nil || status != 200 || len(accountList.Accounts) != 1 {
 		t.Fatalf("account inventory failed: %d %s", status, body)
 	}
+	benefitPath := "/v0/management/codearts-provider/benefit-balance?auth_index=" + url.QueryEscape(accountList.Accounts[0].AuthIndex)
+	status, body = request("GET", benefitPath, "")
+	if status != http.StatusOK || !bytes.Contains(body, []byte(`"daily_tokens_used":30`)) {
+		t.Fatalf("independent benefit lookup failed: %d %s", status, body)
+	}
+	blockBenefit.Store(true)
+	ctxBenefit, cancelBenefit := context.WithCancel(context.Background())
+	defer cancelBenefit()
+	benefitReq, _ := http.NewRequestWithContext(ctxBenefit, http.MethodGet, base+benefitPath, nil)
+	benefitReq.Header.Set("Authorization", "Bearer audit-admin")
+	benefitDone := make(chan error, 1)
+	go func() {
+		response, err := client.Do(benefitReq)
+		if response != nil {
+			response.Body.Close()
+		}
+		benefitDone <- err
+	}()
+	select {
+	case <-benefitEntered:
+	case <-time.After(3 * time.Second):
+		t.Fatal("benefit request did not reach fixture")
+	}
+	// Keep the optional gateway blocked while the normal quota path completes.
+	quotaStarted := time.Now()
+	status, body = request("POST", "/v0/management/codearts-provider/quota/refresh", `{}`)
+	if status != http.StatusOK || !bytes.Contains(body, []byte(`"refreshed":1`)) || time.Since(quotaStarted) > 2*time.Second {
+		t.Fatalf("optional request blocked quota refresh: %d %s", status, body)
+	}
+	cancelBenefit()
+	select {
+	case <-benefitCancelled:
+	case <-time.After(3 * time.Second):
+		t.Fatal("browser cancellation did not stop optional upstream request")
+	}
+	if err := <-benefitDone; err == nil {
+		t.Fatal("cancelled benefit request succeeded")
+	}
+	blockBenefit.Store(false)
+	if benefitCalls.Load() != 2 {
+		t.Fatalf("quota refresh unexpectedly fetched benefits: %d calls", benefitCalls.Load())
+	}
+	t.Log("independent benefit refresh is cancellable through CPA and cannot block package refresh")
 	status, body = request("GET", "/v0/management/codearts-provider/models?auth_index="+url.QueryEscape(accountList.Accounts[0].AuthIndex), "")
 	var visibleCatalog modelCatalogResult
 	if json.Unmarshal(body, &visibleCatalog) != nil || status != 200 || len(visibleCatalog.Models) != 10 || visibleCatalog.Source != "discovered" || len(visibleCatalog.Warnings) != 0 {
@@ -628,6 +697,23 @@ func TestCPAIntegration(t *testing.T) {
 			t.Fatalf("discovered model %s was not callable without static configuration: %d %s", modelID, status, body)
 		}
 	}
+	for _, stream := range []bool{true, false} {
+		// Reset host cooldown state between failure cases.
+		stop()
+		start()
+		assertModels(capturedModelIDs...)
+		nextStreamFault.Store(true)
+		status, body = request("POST", "/v1/chat/completions", fmt.Sprintf(`{"model":"GLM-5.2","messages":[{"role":"user","content":"quota error"}],"stream":%t}`, stream))
+		nextStreamFault.Store(false)
+		if !bytes.Contains(body, []byte("insufficient quota")) || bytes.Contains(body, []byte(`"finish_reason":"stop"`)) {
+			t.Fatalf("in-stream quota error became empty success (stream=%t): %d %s", stream, status, body)
+		}
+		if !stream && status != http.StatusForbidden {
+			t.Fatalf("buffered quota status lost: %d %s", status, body)
+		}
+		assertSessionsIdle()
+	}
+	t.Log("unterminated in-stream quota faults reach clients instead of empty success")
 	sessionMu.Lock()
 	defer sessionMu.Unlock()
 	for sessionID, starts := range sessionStarts {
