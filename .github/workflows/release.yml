@@ -210,9 +210,12 @@ jobs:
           set -euo pipefail
           version="${RELEASE_TAG#v}"
           gh release download "$RELEASE_TAG" --pattern checksums.txt --clobber
-          # Keep one line per asset: the published Linux/Windows entries first,
-          # then this run's darwin ones, so a re-run converges instead of growing.
-          { cat checksums.txt; cat release-assets/checksums.txt; } | awk '!seen[$2]++' | sort -k2 > checksums.merged.txt
+          # Ours first, then the published rows: `!seen[$2]++` keeps the first
+          # row per file name, so the hashes for the archives this job just built
+          # always win. Reading the published file first would keep a stale
+          # darwin row when only this job is re-run, and the release would then
+          # ship fresh zips whose checksums no longer match.
+          { cat release-assets/checksums.txt; cat checksums.txt; } | awk '!seen[$2]++' | sort -k2 > checksums.merged.txt
           for asset in \
             "codearts-provider_${version}_linux_amd64.zip" \
             "codearts-provider_${version}_windows_amd64.zip" \
