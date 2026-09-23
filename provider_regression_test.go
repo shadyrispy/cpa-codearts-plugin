@@ -890,9 +890,8 @@ func TestStreamRejectsUpstreamBeforeAccepting(t *testing.T) {
 	}
 }
 
-// TestStreamTimeoutTerminatesOnce covers the lifecycle of a stream that times
-// out while its reader is also failing: CPA must see exactly one error frame and
-// one close, not a duplicate pair.
+// A silent stream that times out before answering must fail the RPC once and
+// never emit or close a client stream that CPA was never handed.
 func TestStreamTimeoutTerminatesOnce(t *testing.T) {
 	previous := currentConfig.Load()
 	short := defaultConfig()
@@ -948,12 +947,12 @@ func TestStreamTimeoutTerminatesOnce(t *testing.T) {
 		t.Fatal(err)
 	}
 	var env envelope
-	if err := json.Unmarshal(raw, &env); err != nil || !env.OK {
-		t.Fatalf("stream was not accepted: %s", raw)
+	if err := json.Unmarshal(raw, &env); err != nil || env.OK || env.Error == nil || env.Error.HTTPStatus != http.StatusGatewayTimeout {
+		t.Fatalf("silent stream did not fail before handoff: %s", raw)
 	}
 
 	deadline := time.Now().Add(10 * time.Second)
-	for time.Now().Before(deadline) && streamCloses.Load() < 1 {
+	for time.Now().Before(deadline) && upstreamCloses.Load() < 1 {
 		time.Sleep(50 * time.Millisecond)
 	}
 	// Give a duplicate close/error a chance to appear before asserting.
@@ -961,11 +960,11 @@ func TestStreamTimeoutTerminatesOnce(t *testing.T) {
 	if got := upstreamCloses.Load(); got != 1 {
 		t.Fatalf("upstream stream closed %d times, want 1", got)
 	}
-	if got := streamCloses.Load(); got != 1 {
-		t.Fatalf("client stream closed %d times, want 1", got)
+	if got := streamCloses.Load(); got != 0 {
+		t.Fatalf("unhanded client stream closed %d times", got)
 	}
-	if got := errorEmits.Load(); got != 1 {
-		t.Fatalf("error frames emitted %d times, want 1", got)
+	if got := errorEmits.Load(); got != 0 {
+		t.Fatalf("unhanded client stream received %d error frames", got)
 	}
 	if active, _ := activeStreams.Load("client"); active != nil {
 		t.Fatal("stream was left registered after it ended")

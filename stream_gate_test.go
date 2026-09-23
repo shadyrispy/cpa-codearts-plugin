@@ -32,8 +32,13 @@ const gateQuotaFrame = "data: " + quotaFaultFrame + "\n\n"
 
 // runGateStream drives one async executor stream against a scripted upstream.
 func runGateStream(t *testing.T, frames []hostHTTPStreamChunk) (envelope, *gateHost) {
+	return runGateStreamAs(t, frames, "agent", protocolOpenAI)
+}
+
+func runGateStreamAs(t *testing.T, frames []hostHTTPStreamChunk, mode, format string) (envelope, *gateHost) {
 	t.Helper()
 	cfg := defaultConfig()
+	cfg.APIMode = mode
 	cfg.DiscoverModels = false
 	cfg.ChatSessionHeartbeat = false
 	useModelTestConfig(t, cfg)
@@ -76,6 +81,7 @@ func runGateStream(t *testing.T, frames []hostHTTPStreamChunk) (envelope, *gateH
 	})
 	req := executorRequest{}
 	req.Model = "fixture-model"
+	req.Format = format
 	req.Payload = []byte(`{"messages":[{"role":"user","content":"hello"}]}`)
 	req.StorageJSON = mustMarshal(t, cred)
 	req.StreamID = "client-gate"
@@ -88,6 +94,70 @@ func runGateStream(t *testing.T, frames []hostHTTPStreamChunk) (envelope, *gateH
 		t.Fatal(errUnmarshal)
 	}
 	return result, host
+}
+
+func TestPreAnswerMetadataDoesNotHideQuota(t *testing.T) {
+	metadata := []string{
+		`data: {"id":"1","choices":[{"index":0,"delta":{"role":"assistant","content":""}}]}` + "\n\n",
+		`data: {"id":"1","choices":[{"index":0,"delta":{},"finish_reason":null}]}` + "\n\n",
+		`data: {"id":"1","choices":[],"usage":{"total_tokens":1}}` + "\n\n",
+		"data: [DONE]\n\n",
+		":heartbeat\n\n",
+	}
+	for _, format := range []string{protocolOpenAI, protocolClaude} {
+		for index, prefix := range metadata {
+			for _, split := range []bool{false, true} {
+				t.Run(fmt.Sprintf("%s/%d/split=%t", format, index, split), func(t *testing.T) {
+					frames := []hostHTTPStreamChunk{{Payload: []byte(prefix + gateQuotaFrame), Done: true}}
+					if split {
+						frames = []hostHTTPStreamChunk{{Payload: []byte(prefix)}, {Payload: []byte(gateQuotaFrame), Done: true}}
+					}
+					result, host := runGateStreamAs(t, frames, "agent", format)
+					if result.OK || result.Error == nil || result.Error.HTTPStatus != http.StatusForbidden {
+						t.Fatalf("metadata hid quota error: %+v", result)
+					}
+					host.mu.Lock()
+					defer host.mu.Unlock()
+					if len(host.emitted) > 0 || len(host.errs) > 0 || host.closes != 0 {
+						t.Fatalf("sent pre-answer metadata to client: %+v", host)
+					}
+				})
+			}
+		}
+	}
+}
+
+func TestMetadataBeforeAnswerPreservesFrameOrder(t *testing.T) {
+	role := `data: {"id":"1","choices":[{"index":0,"delta":{"role":"assistant"}}]}` + "\n\n"
+	result, host := runGateStream(t, []hostHTTPStreamChunk{{Payload: []byte(role)}, {Payload: []byte(answerFrame), Done: true}})
+	if !result.OK {
+		t.Fatalf("answer was rejected: %+v", result.Error)
+	}
+	waitFor(t, "ordered output", func() bool {
+		host.mu.Lock()
+		defer host.mu.Unlock()
+		return len(host.emitted) >= 2 && host.closes == 1
+	})
+	host.mu.Lock()
+	defer host.mu.Unlock()
+	if !strings.Contains(string(host.emitted[0]), `"role":"assistant"`) || !strings.Contains(string(host.emitted[1]), "answer") {
+		t.Fatalf("metadata and answer reordered: %q", host.emitted)
+	}
+}
+
+func TestNativeMetadataBeforeQuotaNeverHandsOver(t *testing.T) {
+	result, host := runGateStreamAs(t, []hostHTTPStreamChunk{
+		{Payload: []byte(`data: {"type":"stage","stage":[{"name":"plan"}]}` + "\n\n")},
+		{Payload: []byte(gateQuotaFrame), Done: true},
+	}, "native", protocolClaude)
+	if result.OK || result.Error == nil || result.Error.HTTPStatus != http.StatusForbidden {
+		t.Fatalf("native stage hid quota: %+v", result)
+	}
+	host.mu.Lock()
+	defer host.mu.Unlock()
+	if len(host.emitted) != 0 || host.closes != 0 {
+		t.Fatalf("native metadata reached client: %+v", host)
+	}
 }
 
 // waitFor polls a condition the pump goroutine satisfies asynchronously.
@@ -144,6 +214,46 @@ func TestAnsweredStreamKeepsStreamingAndReportsLaterFaultInBand(t *testing.T) {
 	}
 }
 
+func TestAnswerAndFaultInOneReadKeepsThePartialAnswer(t *testing.T) {
+	role := `data: {"id":"1","choices":[{"index":0,"delta":{"role":"assistant"}}]}` + "\n\n"
+	result, host := runGateStream(t, []hostHTTPStreamChunk{{Payload: []byte(role + answerFrame + gateQuotaFrame), Done: true}})
+	if !result.OK {
+		t.Fatalf("quota after real answer discarded the partial reply: %+v", result.Error)
+	}
+	waitFor(t, "partial answer and stream error", func() bool {
+		host.mu.Lock()
+		defer host.mu.Unlock()
+		return len(host.emitted) >= 2 && len(host.errs) == 1 && host.closes == 1
+	})
+	host.mu.Lock()
+	defer host.mu.Unlock()
+	if !strings.Contains(string(host.emitted[0]), `"role":"assistant"`) || !strings.Contains(string(host.emitted[1]), "answer") {
+		t.Fatalf("same-read answer was reordered: %q", host.emitted)
+	}
+}
+
+func TestFrameAnswerDetectionRejectsMetadataAndAllowsOutput(t *testing.T) {
+	for _, payload := range []string{
+		`{"choices":[{"delta":{"role":"assistant"}}]}`,
+		`{"choices":[{"delta":{"content":""}}]}`,
+		`{"choices":[],"usage":{"total_tokens":2}}`,
+		`[DONE]`,
+	} {
+		if streamFrameHasAnswer([]byte(payload)) {
+			t.Fatalf("metadata counted as answer: %s", payload)
+		}
+	}
+	for _, payload := range []string{
+		`{"choices":[{"delta":{"content":"hello"}}]}`,
+		`{"choices":[{"delta":{"reasoning_content":"thinking"}}]}`,
+		`{"choices":[{"delta":{"tool_calls":[{"index":0,"id":"x"}]}}]}`,
+	} {
+		if !streamFrameHasAnswer([]byte(payload)) {
+			t.Fatalf("actual output was not counted: %s", payload)
+		}
+	}
+}
+
 func TestSilentUpstreamIsReportedAsFaultBeforeHandoff(t *testing.T) {
 	result, _ := runGateStream(t, []hostHTTPStreamChunk{
 		{Error: "connection reset by peer"},
@@ -156,32 +266,29 @@ func TestSilentUpstreamIsReportedAsFaultBeforeHandoff(t *testing.T) {
 	}
 }
 
-// A stream that ends without ever answering still has to settle the gate: an
-// unreported head would leave the executor waiting out its full request deadline
-// (600s by default) before handing anything over.
-func TestCleanStreamWithoutAnswerIsHandedOverWithoutWaiting(t *testing.T) {
+func TestCleanStreamWithoutAnswerFailsWithoutWaiting(t *testing.T) {
 	started := time.Now()
 	result, host := runGateStream(t, nil)
 	if elapsed := time.Since(started); elapsed > 5*time.Second {
 		t.Fatalf("the gate waited %s for a head that never arrived", elapsed)
 	}
-	if !result.OK {
-		t.Fatalf("an empty-but-clean stream is not a failed request: %+v", result.Error)
+	if result.OK || result.Error == nil || result.Error.HTTPStatus != http.StatusBadGateway {
+		t.Fatalf("an empty stream became a successful completion: %+v", result)
 	}
-	waitFor(t, "the hand-off", func() bool {
+	waitFor(t, "cleanup", func() bool {
 		host.mu.Lock()
 		defer host.mu.Unlock()
-		return host.closes == 1
+		return host.closes == 0
 	})
 }
 
 func TestGateHandshakeNeverStrandsThePump(t *testing.T) {
 	gate := newStreamGate()
-	if fault := gate.await(20 * time.Millisecond); fault != nil {
-		t.Fatalf("an unanswered stream must be handed over, got %v", fault)
+	if fault := gate.await(20 * time.Millisecond); fault == nil || fault.Status != http.StatusGatewayTimeout {
+		t.Fatalf("an unanswered stream must fail, got %v", fault)
 	}
-	// The pump only notices afterwards: its report must not block, and the verdict
-	// the timed-out await queued has to be there for it to read.
+	// The pump only notices afterwards: its report must not block, and the
+	// timed-out executor must tell it not to emit to an unseen stream.
 	returned := make(chan struct{})
 	go func() {
 		gate.reportHead(&upstreamStreamFault{Code: "upstream_error", Status: http.StatusBadGateway, Message: "late"})
@@ -194,10 +301,28 @@ func TestGateHandshakeNeverStrandsThePump(t *testing.T) {
 	}
 	select {
 	case proceed := <-gate.verdict:
-		if !proceed {
-			t.Fatal("a timed-out gate told the pump to abort")
+		if proceed {
+			t.Fatal("a timed-out gate told the pump to emit")
 		}
 	case <-time.After(time.Second):
 		t.Fatal("the pump is blocked on a verdict that never arrives")
+	}
+}
+
+func TestGateNeverAcceptsAnswerAfterDeadline(t *testing.T) {
+	for i := 0; i < 100; i++ {
+		gate := newStreamGate()
+		gate.reportHead(nil)
+		if fault := gate.await(0); fault == nil || fault.Status != http.StatusGatewayTimeout {
+			t.Fatalf("accepted a stream after its deadline: %+v", fault)
+		}
+		if <-gate.verdict {
+			t.Fatal("timed-out stream was allowed to emit")
+		}
+	}
+	gate := newStreamGate()
+	gate.reportHead(nil)
+	if fault := gate.await(time.Second); fault != nil || !(<-gate.verdict) {
+		t.Fatalf("rejected an answer before the deadline: %+v", fault)
 	}
 }

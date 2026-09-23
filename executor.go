@@ -211,21 +211,21 @@ func executorExecuteStream(request []byte) ([]byte, error) {
 	}
 	session := &executorStreamSession{streamID: req.StreamID, stop: stop}
 	gate := newStreamGate()
+	deadline := time.Now().Add(cfg.requestTimeout())
 	go func() {
 		defer session.stop()
-		timer := time.AfterFunc(cfg.requestTimeout(), func() { session.fail("upstream request timed out") })
-		defer timer.Stop()
-		runUpstreamStream(cfg, req, open, session, gate, cred)
+		runUpstreamStreamUntil(cfg, req, open, session, gate, deadline, cred)
 	}()
 	// Hand the stream over only once it is known to be answering. An upstream
 	// envelope that arrives before any content is still reportable to the host as
 	// a failed request, which is what lets it cool this account and try the next
 	// one; after the first chunk reaches the client it no longer is.
-	fault := gate.await(cfg.requestTimeout())
+	fault := gate.await(time.Until(deadline))
 	// The pump owns the upstream handle from here on, including the abort path,
 	// so its deferred stop is the single cleanup.
 	handedOff = true
 	if fault != nil {
+		stop()
 		return failEnvelope(fault.Code, redactUpstreamError(fault.Message, cred, false), fault.Status)
 	}
 
@@ -267,14 +267,24 @@ func (g *streamGate) reportHead(fault *upstreamStreamFault) {
 	}
 }
 
-// await returns the fault the executor must report to the host, or nil to hand the
-// stream over. It waits no longer than the plugin's own request deadline, so a
-// silent upstream behaves exactly as it did before the gate existed.
+// await returns a host-visible failure if the stream never answers by the deadline.
 func (g *streamGate) await(wait time.Duration) *upstreamStreamFault {
+	timeout := func() *upstreamStreamFault {
+		return &upstreamStreamFault{Code: "upstream_timeout", Message: "upstream stream timed out before answering", Status: http.StatusGatewayTimeout}
+	}
+	if wait <= 0 {
+		g.verdict <- false
+		return timeout()
+	}
+	deadline := time.Now().Add(wait)
 	var fault *upstreamStreamFault
 	select {
 	case fault = <-g.head:
 	case <-time.After(wait):
+		fault = timeout()
+	}
+	if fault == nil && !time.Now().Before(deadline) {
+		fault = timeout()
 	}
 	g.verdict <- fault == nil
 	return fault
@@ -313,12 +323,61 @@ func (s *executorStreamSession) success() {
 // stream over, the first decisive thing the pump sees decides whether the client
 // gets a stream at all or a failed request the host can route around.
 func runUpstreamStream(cfg *Config, req executorRequest, open *hostHTTPStreamOpen, session *executorStreamSession, gate *streamGate, credentials ...*credential) {
+	runUpstreamStreamUntil(cfg, req, open, session, gate, time.Now().Add(cfg.requestTimeout()), credentials...)
+}
+
+func runUpstreamStreamUntil(cfg *Config, req executorRequest, open *hostHTTPStreamOpen, session *executorStreamSession, gate *streamGate, deadline time.Time, credentials ...*credential) {
 	translator := newStreamRenderer(cfg, req.Model, clientProtocol(req.Format))
 	var cred *credential
 	if len(credentials) > 0 {
 		cred = credentials[0]
 	}
 	released := gate == nil
+	var pending [][]byte
+	var pendingBytes int
+	var timer *time.Timer
+	defer func() {
+		if timer != nil {
+			timer.Stop()
+		}
+	}()
+	armTimeout := func() {
+		if gate != nil {
+			timer = time.AfterFunc(time.Until(deadline), func() { session.fail("upstream request timed out") })
+		}
+	}
+	// Hold only bounded pre-answer metadata. Anthropic can render message_start
+	// for a role-only chunk, but the host must see no bytes until real content.
+	queue := func(frames [][]byte) bool {
+		for _, frame := range frames {
+			pendingBytes += len(frame)
+			if pendingBytes > 64<<10 {
+				return false
+			}
+			pending = append(pending, frame)
+		}
+		return true
+	}
+	passHead := func() bool {
+		gate.reportHead(nil)
+		if !<-gate.verdict {
+			return false
+		}
+		released = true
+		armTimeout()
+		return true
+	}
+	emit := func(frames [][]byte) bool {
+		for _, frame := range frames {
+			if errEmit := hostStreamEmit(session.streamID, translator.hostPayload(frame)); errEmit != nil {
+				// Client cancellation closes the host bridge; there is no second
+				// response to send after that point.
+				session.success()
+				return false
+			}
+		}
+		return true
+	}
 
 	// reportFault ends a stream that produced no answer. Before the hand-off that
 	// is still a status the host can act on; after it, the session carries the
@@ -343,22 +402,21 @@ func runUpstreamStream(cfg *Config, req executorRequest, open *hostHTTPStreamOpe
 		}
 		if len(payload) > 0 {
 			frames := translator.feed(payload)
-			if len(frames) > 0 && !released {
-				gate.reportHead(nil)
-				if !<-gate.verdict {
-					// The host already has the failure; emitting now would answer the
-					// same request twice.
+			if !released {
+				if !queue(frames) {
+					reportFault(&upstreamStreamFault{Code: "upstream_error", Status: http.StatusBadGateway, Message: "upstream sent too much metadata before answering"})
 					return
 				}
-				released = true
+				frames = nil
+				if translator.hasAnswer() {
+					if !passHead() {
+						return
+					}
+					frames, pending = pending, nil
+				}
 			}
-			for _, frame := range frames {
-				if errEmit := hostStreamEmit(session.streamID, translator.hostPayload(frame)); errEmit != nil {
-					// The client went away; stop reading upstream without reporting
-					// a second error for a request the host already abandoned.
-					session.success()
-					return
-				}
+			if !emit(frames) {
+				return
 			}
 		}
 		// This gateway signals quota and rate-limit failures inside an HTTP 200
@@ -381,22 +439,22 @@ func runUpstreamStream(cfg *Config, req executorRequest, open *hostHTTPStreamOpe
 		reportFault(fault)
 		return
 	}
-	// The stream can also end cleanly without ever answering. The head still has
-	// to be settled then, or the executor would sit out its whole request deadline
-	// waiting for a report that never comes.
 	if !released {
-		gate.reportHead(nil)
-		if !<-gate.verdict {
+		if !translator.hasAnswer() {
+			reportFault(&upstreamStreamFault{Code: "upstream_empty_response", Status: http.StatusBadGateway, Message: "upstream stream ended without an answer"})
 			return
 		}
-		released = true
+		if !queue(frames) {
+			reportFault(&upstreamStreamFault{Code: "upstream_error", Status: http.StatusBadGateway, Message: "upstream sent too much metadata before answering"})
+			return
+		}
+		if !passHead() {
+			return
+		}
+		frames = pending
 	}
-
-	for _, frame := range frames {
-		if errEmit := hostStreamEmit(session.streamID, translator.hostPayload(frame)); errEmit != nil {
-			session.success()
-			return
-		}
+	if !emit(frames) {
+		return
 	}
 	session.success()
 }
@@ -785,10 +843,13 @@ type streamRenderer struct {
 	decoder    sseDecoder
 	done       bool
 	finished   bool
+	answered   bool
 	// fault records the first in-stream error envelope so the caller can fail the
 	// stream instead of closing it as a success with no content.
 	fault *upstreamStreamFault
 }
+
+func (r *streamRenderer) hasAnswer() bool { return r.answered }
 
 // streamFault returns the in-stream error envelope seen so far, if any.
 func (r *streamRenderer) streamFault() *upstreamStreamFault {
@@ -831,15 +892,21 @@ func (r *streamRenderer) feed(data []byte) [][]byte {
 	// frames destined for Anthropic. Never translate an error into empty success.
 	var out [][]byte
 	for _, frame := range r.decoder.push(data) {
-		if r.observeFault(executorStreamPayload([]byte(frame))) {
+		payload := executorStreamPayload([]byte(frame))
+		if r.observeFault(payload) {
 			break
 		}
 		if r.translator != nil {
 			if chunk, ok := parseFrame(frame); ok {
-				out = append(out, r.renderOpenAI(r.translator.translateChunk(chunk))...)
+				translated := r.translator.translateChunk(chunk)
+				for _, part := range translated {
+					r.answered = r.answered || streamFrameHasAnswer(executorStreamPayload(part))
+				}
+				out = append(out, r.renderOpenAI(translated)...)
 			}
 			continue
 		}
+		r.answered = r.answered || streamFrameHasAnswer(payload)
 		if isDoneFrame([]byte(frame)) {
 			if r.done {
 				continue
@@ -849,6 +916,31 @@ func (r *streamRenderer) feed(data []byte) [][]byte {
 		out = append(out, r.renderOpenAI([][]byte{[]byte(frame + "\n\n")})...)
 	}
 	return out
+}
+
+// Output frames such as role-only deltas, usage and [DONE] are not answers.
+func streamFrameHasAnswer(payload []byte) bool {
+	var frame struct {
+		Delta   json.RawMessage `json:"delta"`
+		Text    string          `json:"text"`
+		Choices []struct {
+			Delta   json.RawMessage `json:"delta"`
+			Message json.RawMessage `json:"message"`
+			Text    string          `json:"text"`
+		} `json:"choices"`
+	}
+	if json.Unmarshal(payload, &frame) != nil {
+		return false
+	}
+	if streamDeltaHasContent(frame.Delta) || (frame.Text != "" && frame.Text != doneSentinel) {
+		return true
+	}
+	for _, choice := range frame.Choices {
+		if streamDeltaHasContent(choice.Delta) || streamDeltaHasContent(choice.Message) || choice.Text != "" {
+			return true
+		}
+	}
+	return false
 }
 
 func (r *streamRenderer) renderOpenAI(frames [][]byte) [][]byte {

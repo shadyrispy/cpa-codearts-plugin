@@ -34,6 +34,7 @@ func TestCPAIntegration(t *testing.T) {
 	var chatCalls, loginCalls, renewCalls, benefitCatalogCalls atomic.Int32
 	var nextStatus atomic.Int32
 	var nextStreamFault atomic.Bool
+	var nextStreamMetadata atomic.Bool
 	var blockBenefit atomic.Bool
 	benefitEntered, benefitCancelled := make(chan struct{}, 1), make(chan struct{}, 1)
 	var benefitCalls atomic.Int32
@@ -232,6 +233,10 @@ func TestCPAIntegration(t *testing.T) {
 			}
 			w.Header().Set("Content-Type", "text/event-stream")
 			if nextStreamFault.Load() {
+				if nextStreamMetadata.Load() {
+					fmt.Fprint(w, "data: {\"id\":\"chatcmpl-test\",\"choices\":[{\"index\":0,\"delta\":{\"role\":\"assistant\",\"content\":\"\"},\"finish_reason\":null}]}\r\n\r\n")
+					w.(http.Flusher).Flush()
+				}
 				// HTTP 200 with an error inside the final, unterminated SSE frame.
 				fmt.Fprint(w, "data: "+quotaFaultFrame)
 				return
@@ -798,13 +803,15 @@ func TestCPAIntegration(t *testing.T) {
 		start()
 		assertModels(capturedModelIDs...)
 		nextStreamFault.Store(true)
+		nextStreamMetadata.Store(stream)
 		status, body = request("POST", "/v1/chat/completions", fmt.Sprintf(`{"model":"GLM-5.2","messages":[{"role":"user","content":"quota error"}],"stream":%t}`, stream))
 		nextStreamFault.Store(false)
+		nextStreamMetadata.Store(false)
 		if !bytes.Contains(body, []byte("insufficient quota")) || bytes.Contains(body, []byte(`"finish_reason":"stop"`)) {
 			t.Fatalf("in-stream quota error became empty success (stream=%t): %d %s", stream, status, body)
 		}
-		if !stream && status != http.StatusForbidden {
-			t.Fatalf("buffered quota status lost: %d %s", status, body)
+		if status != http.StatusForbidden {
+			t.Fatalf("quota status lost after pre-answer metadata (stream=%t): %d %s", stream, status, body)
 		}
 		assertSessionsIdle()
 	}

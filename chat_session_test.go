@@ -277,7 +277,7 @@ func TestExecutorTimeoutReleasesChatSession(t *testing.T) {
 	useModelTestConfig(t, cfg)
 	var busy, idle, upstreamCloses atomic.Int32
 	upstreamClosed := make(chan struct{})
-	clientClosed := make(chan struct{})
+	var clientCalls atomic.Int32
 	testHost(t, func(method string, request any) (json.RawMessage, error) {
 		switch method {
 		case "host.http.do":
@@ -299,9 +299,10 @@ func TestExecutorTimeoutReleasesChatSession(t *testing.T) {
 			}
 			return json.RawMessage(`{}`), nil
 		case "host.stream.emit":
+			clientCalls.Add(1)
 			return json.RawMessage(`{}`), nil
 		case "host.stream.close":
-			close(clientClosed)
+			clientCalls.Add(1)
 			return json.RawMessage(`{}`), nil
 		default:
 			t.Errorf("unexpected callback %s", method)
@@ -318,13 +319,11 @@ func TestExecutorTimeoutReleasesChatSession(t *testing.T) {
 		t.Fatal(err)
 	}
 	var result envelope
-	if json.Unmarshal(raw, &result) != nil || !result.OK {
-		t.Fatalf("stream was not accepted: %s", raw)
+	if json.Unmarshal(raw, &result) != nil || result.OK || result.Error == nil || result.Error.HTTPStatus != http.StatusGatewayTimeout {
+		t.Fatalf("silent stream did not fail before handoff: %s", raw)
 	}
-	select {
-	case <-clientClosed:
-	case <-time.After(3 * time.Second):
-		t.Fatal("timed-out chat did not close")
+	if clientCalls.Load() != 0 {
+		t.Fatal("timeout emitted or closed a stream the host never received")
 	}
 	if busy.Load() != 1 || idle.Load() != 1 || upstreamCloses.Load() != 1 {
 		t.Fatalf("timeout leaked a session: busy=%d idle=%d upstream closes=%d", busy.Load(), idle.Load(), upstreamCloses.Load())
