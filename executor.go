@@ -210,18 +210,74 @@ func executorExecuteStream(request []byte) ([]byte, error) {
 		return nil, errRegister
 	}
 	session := &executorStreamSession{streamID: req.StreamID, stop: stop}
-	handedOff = true
+	gate := newStreamGate()
 	go func() {
 		defer session.stop()
 		timer := time.AfterFunc(cfg.requestTimeout(), func() { session.fail("upstream request timed out") })
 		defer timer.Stop()
-		runUpstreamStream(cfg, req, open, session, cred)
+		runUpstreamStream(cfg, req, open, session, gate, cred)
 	}()
+	// Hand the stream over only once it is known to be answering. An upstream
+	// envelope that arrives before any content is still reportable to the host as
+	// a failed request, which is what lets it cool this account and try the next
+	// one; after the first chunk reaches the client it no longer is.
+	fault := gate.await(cfg.requestTimeout())
+	// The pump owns the upstream handle from here on, including the abort path,
+	// so its deferred stop is the single cleanup.
+	handedOff = true
+	if fault != nil {
+		return failEnvelope(fault.Code, redactUpstreamError(fault.Message, cred, false), fault.Status)
+	}
 
 	// An empty chunk list tells the host to consume the async stream bridge.
 	return okEnvelope(map[string]any{
 		"headers": http.Header{"Content-Type": []string{"text/event-stream"}},
 	})
+}
+
+// streamGate passes the executor's hand-off decision to the stream pump.
+//
+// CPA can only rotate to another credential when the plugin reports a status, and
+// this gateway signals quota and rate-limit failures inside an HTTP 200 stream, so
+// by the time those bytes are seen the response status is already committed. The
+// gate lets the pump hold its frames until the stream has either produced answer
+// traffic or failed before any answer, so a pre-answer envelope becomes an
+// ordinary failed request instead of an empty success.
+type streamGate struct {
+	// head carries exactly one value: nil once the stream produced answer
+	// traffic, or the fault that ended it before any answer arrived.
+	head chan *upstreamStreamFault
+	// verdict receives the executor's decision once: true means the client was
+	// handed the stream and frames may be emitted, false means the executor has
+	// already returned a failure and nothing may be emitted at all.
+	verdict chan bool
+}
+
+func newStreamGate() *streamGate {
+	return &streamGate{head: make(chan *upstreamStreamFault, 1), verdict: make(chan bool, 1)}
+}
+
+// reportHead tells the executor what the stream decided. It never blocks: when the
+// executor stopped waiting first, the stream continues on the ordinary path and
+// any later fault is reported through the session as before.
+func (g *streamGate) reportHead(fault *upstreamStreamFault) {
+	select {
+	case g.head <- fault:
+	default:
+	}
+}
+
+// await returns the fault the executor must report to the host, or nil to hand the
+// stream over. It waits no longer than the plugin's own request deadline, so a
+// silent upstream behaves exactly as it did before the gate existed.
+func (g *streamGate) await(wait time.Duration) *upstreamStreamFault {
+	var fault *upstreamStreamFault
+	select {
+	case fault = <-g.head:
+	case <-time.After(wait):
+	}
+	g.verdict <- fault == nil
+	return fault
 }
 
 // executorStreamSession owns the terminal transitions of one executor stream.
@@ -253,22 +309,50 @@ func (s *executorStreamSession) success() {
 
 // runUpstreamStream drives one upstream streaming request and forwards
 // translated frames to the host. Every exit path goes through the session, so
-// the upstream stream is closed exactly once.
-func runUpstreamStream(cfg *Config, req executorRequest, open *hostHTTPStreamOpen, session *executorStreamSession, credentials ...*credential) {
+// the upstream stream is closed exactly once. While the gate has not handed the
+// stream over, the first decisive thing the pump sees decides whether the client
+// gets a stream at all or a failed request the host can route around.
+func runUpstreamStream(cfg *Config, req executorRequest, open *hostHTTPStreamOpen, session *executorStreamSession, gate *streamGate, credentials ...*credential) {
 	translator := newStreamRenderer(cfg, req.Model, clientProtocol(req.Format))
 	var cred *credential
 	if len(credentials) > 0 {
 		cred = credentials[0]
 	}
+	released := gate == nil
+
+	// reportFault ends a stream that produced no answer. Before the hand-off that
+	// is still a status the host can act on; after it, the session carries the
+	// error as the only remaining channel.
+	reportFault := func(fault *upstreamStreamFault) {
+		if released {
+			session.fail(redactUpstreamError(fault.Message, cred, false))
+			return
+		}
+		gate.reportHead(fault)
+		if <-gate.verdict {
+			session.fail(redactUpstreamError(fault.Message, cred, false))
+		}
+	}
 
 	for {
 		payload, done, errRead := hostHTTPStreamRead(open.StreamID)
 		if errRead != nil {
-			session.fail("upstream stream read failed: " + errRead.Error())
+			reportFault(&upstreamStreamFault{Code: "upstream_error", Status: http.StatusBadGateway,
+				Message: "upstream stream read failed: " + errRead.Error()})
 			return
 		}
 		if len(payload) > 0 {
-			for _, frame := range translator.feed(payload) {
+			frames := translator.feed(payload)
+			if len(frames) > 0 && !released {
+				gate.reportHead(nil)
+				if !<-gate.verdict {
+					// The host already has the failure; emitting now would answer the
+					// same request twice.
+					return
+				}
+				released = true
+			}
+			for _, frame := range frames {
 				if errEmit := hostStreamEmit(session.streamID, translator.hostPayload(frame)); errEmit != nil {
 					// The client went away; stop reading upstream without reporting
 					// a second error for a request the host already abandoned.
@@ -277,8 +361,11 @@ func runUpstreamStream(cfg *Config, req executorRequest, open *hostHTTPStreamOpe
 				}
 			}
 		}
+		// This gateway signals quota and rate-limit failures inside an HTTP 200
+		// stream, so the envelope has to be checked while reading: at that point the
+		// response status is still the plugin's to choose.
 		if fault := translator.streamFault(); fault != nil {
-			session.fail(redactUpstreamError(fault.Message, cred, false))
+			reportFault(fault)
 			return
 		}
 		if done {
@@ -291,8 +378,18 @@ func runUpstreamStream(cfg *Config, req executorRequest, open *hostHTTPStreamOpe
 	// reply; failing it lets the host report and route around the condition.
 	frames := translator.finish()
 	if fault := translator.streamFault(); fault != nil {
-		session.fail(redactUpstreamError(fault.Message, cred, false))
+		reportFault(fault)
 		return
+	}
+	// The stream can also end cleanly without ever answering. The head still has
+	// to be settled then, or the executor would sit out its whole request deadline
+	// waiting for a report that never comes.
+	if !released {
+		gate.reportHead(nil)
+		if !<-gate.verdict {
+			return
+		}
+		released = true
 	}
 
 	for _, frame := range frames {
